@@ -31,6 +31,11 @@ Screens:
 Threading rules:
   - All ODrive reads/writes are executed in the worker thread via queued signals/slots
   - UI remains non-blocking
+
+Auto-reconnect:
+  - Worker thread supervises connection and reconnects automatically after disconnects or reboots.
+  - Disconnect during a run stops the RunEngine safely (no auto-resume).
+  - UI uses status text (no popup storms) for transient disconnects.
 """
 
 from __future__ import annotations
@@ -56,7 +61,6 @@ from PySide6.QtCore import (
     Slot,
     QMetaObject,
     QDateTime,
-    QPointF,
 )
 from PySide6.QtGui import QDoubleValidator, QFont, QIntValidator, QPainter
 from PySide6.QtWidgets import (
@@ -109,6 +113,11 @@ ENGINE_TICK_MS = 200  # Engine tick; countdown displayed in whole seconds
 # Data Logger polling and storage settings.
 LOG_POLL_MS = 1000  # 1 Hz
 DB_HEARTBEAT_S_DEFAULT = 60
+
+# Worker connection supervision.
+SUPERVISOR_TICK_MS = 500
+RECONNECT_PERIOD_S = 0.75  # Rate-limit reconnect attempts.
+FIND_ANY_TIMEOUT_S = 0.5   # Short discovery timeout per attempt.
 
 # Tags (SQLite schema uses generic tag TEXT).
 TAG_VBUS_V = "vbus_voltage"
@@ -437,10 +446,6 @@ class OdriveInterface:
         """Return a dict of requested tag values; keys not supported may be omitted."""
         raise NotImplementedError
 
-    def get_json_dump(self) -> str:
-        """Return a JSON string dump from the device (or simulation)."""
-        raise NotImplementedError
-
 
 class SimulatedOdrive(OdriveInterface):
     """
@@ -502,7 +507,7 @@ class SimulatedOdrive(OdriveInterface):
                 self._config[k] = v
             else:
                 missing.append(k)
-        return True, "Simulation config updated", missing
+        return True, "Simulation config saved", missing
 
     def _update_actual(self) -> None:
         now = time.monotonic()
@@ -520,7 +525,6 @@ class SimulatedOdrive(OdriveInterface):
         self._update_actual()
 
         # Simulate current roughly proportional to speed demand.
-        # This is only for visualization and does not represent real motor physics.
         rpm_mag = abs(self._actual_rpm)
         ibus = 0.2 + (rpm_mag / max(1.0, VEL_MAX_RPM)) * 2.0
 
@@ -534,14 +538,6 @@ class SimulatedOdrive(OdriveInterface):
                 out[t] = float(self._actual_rpm)
         return out
 
-    def get_json_dump(self) -> str:
-        payload = {
-            "backend": "sim",
-            "state": self._state,
-            "config": self._config,
-        }
-        return json.dumps(payload, indent=2)
-
 
 class RealOdrive(OdriveInterface):
     """
@@ -552,8 +548,7 @@ class RealOdrive(OdriveInterface):
       - On every velocity change: set general_lockin.vel then request LOCKIN_SPIN
       - stop() goes to IDLE
       - read/apply config use attribute traversal and skip unsupported fields
-      - get_tags reads a small set of monitoring attributes
-      - get_json_dump returns odrv0.get_json()
+      - apply_config persists with save_configuration(), which reboots the device
     """
 
     def __init__(self) -> None:
@@ -562,6 +557,13 @@ class RealOdrive(OdriveInterface):
         self._odrv = None
         self._axis = None
         self._AxisState = None
+
+    def _mark_disconnected(self, reason: str = "Disconnected") -> None:
+        """Clear cached device handles after a disconnect/reboot so stale objects are not reused."""
+        self._connected = False
+        self._state = reason
+        self._odrv = None
+        self._axis = None
 
     def connect(self) -> bool:
         """
@@ -575,10 +577,9 @@ class RealOdrive(OdriveInterface):
 
             self._AxisState = AxisState
             self._state = "Connecting..."
-            self._odrv = odrive.find_any(timeout=5)
+            self._odrv = odrive.find_any(timeout=FIND_ANY_TIMEOUT_S)
             if self._odrv is None:
-                self._connected = False
-                self._state = "Error: ODrive not found"
+                self._mark_disconnected("Disconnected (reconnecting)")
                 return False
 
             self._axis = self._odrv.axis0
@@ -644,8 +645,7 @@ class RealOdrive(OdriveInterface):
             return True
 
         except Exception as e:
-            self._connected = False
-            self._state = f"Error: {e}"
+            self._mark_disconnected(f"Disconnected (reconnecting)")
             return False
 
     def is_connected(self) -> bool:
@@ -725,6 +725,12 @@ class RealOdrive(OdriveInterface):
         return values, missing
 
     def apply_config(self, values: Dict[str, Any]) -> Tuple[bool, str, List[str]]:
+        """
+        Apply the provided config values and persist them.
+
+        Persistence is done via odrv.save_configuration(), which triggers a reboot.
+        The connection drop is treated as expected and the worker supervisor will reconnect.
+        """
         if not self._connected or self._odrv is None or self._axis is None or self._AxisState is None:
             raise RuntimeError("ODrive not connected")
 
@@ -740,9 +746,18 @@ class RealOdrive(OdriveInterface):
             except Exception:
                 missing.append(k)
 
-        msg = "Config applied"
+        # Persist (reboots the device).
+        msg = "Config saved (device rebooting)"
+        try:
+            self._state = "Saving config (rebooting)..."
+            self._odrv.save_configuration()
+        except Exception:
+            # save_configuration() commonly drops the link due to reboot; treat as expected.
+            pass
+
+        self._mark_disconnected("Rebooting (reconnecting)")
         if missing:
-            msg = f"Config applied with {len(missing)} unsupported field(s)"
+            msg = f"Config saved (device rebooting); {len(missing)} unsupported field(s) skipped"
         return True, msg, missing
 
     def get_tags(self, tags: Sequence[str]) -> Dict[str, float]:
@@ -760,14 +775,8 @@ class RealOdrive(OdriveInterface):
                     turns_per_s = float(getattr(self._axis, "vel_estimate"))
                     out[t] = turns_per_s * 60.0
             except Exception:
-                # Unsupported or transient read failure; omit tag.
                 pass
         return out
-
-    def get_json_dump(self) -> str:
-        if not self._connected or self._odrv is None:
-            raise RuntimeError("ODrive not connected")
-        return str(self._odrv.get_json())
 
 
 # ----------------------------
@@ -779,6 +788,9 @@ class OdriveWorker(QObject):
     Execute backend operations in a dedicated worker thread.
 
     All ODrive reads/writes are performed here to keep the UI thread responsive.
+
+    The worker also runs a connection supervisor loop that automatically reconnects after
+    disconnects (USB drop) or after save_configuration() reboot.
     """
 
     connected_changed = Signal(bool, str)   # connected, backend state string
@@ -790,7 +802,6 @@ class OdriveWorker(QObject):
     config_applied = Signal(bool, str, object)  # ok, message, missing: list
 
     tags_sample = Signal(int, object)           # ts_epoch_s, dict(tag->value)
-    json_dump_ready = Signal(str)               # device JSON dump (string)
 
     def __init__(self, backend: OdriveInterface) -> None:
         super().__init__()
@@ -799,57 +810,186 @@ class OdriveWorker(QObject):
         self._poll_timer: Optional[QTimer] = None
         self._polled_tags: List[str] = [TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM]
 
-        # Rate-limit polling errors to avoid spamming message boxes.
+        self._supervisor_timer: Optional[QTimer] = None
+        self._connecting: bool = False
+        self._last_connect_attempt_mono: float = 0.0
+
+        self._connected_cache: bool = False
+        self._state_cache: str = "Disconnected"
+
         self._last_poll_error_mono: float = 0.0
         self._poll_error_cooldown_s: float = 5.0
 
     @Slot()
-    def connect_backend(self) -> None:
+    def on_thread_started(self) -> None:
+        """Initialize timers in the worker thread context."""
+        if self._supervisor_timer is None:
+            self._supervisor_timer = QTimer(self)
+            self._supervisor_timer.setInterval(SUPERVISOR_TICK_MS)
+            self._supervisor_timer.timeout.connect(self._supervise_connection)
+            self._supervisor_timer.start()
+
+    def _is_disconnect_error(self, e: Exception) -> bool:
+        """Heuristic classifier for disconnect/reboot-related exceptions."""
+        s = str(e).lower()
+        needles = (
+            "not connected",
+            "disconnected",
+            "object lost",
+            "usb",
+            "broken pipe",
+            "timed out",
+            "timeout",
+            "channel",
+            "ioerror",
+            "oserror",
+            "device",
+            "fibre",
+            "endpoint",
+            "no such device",
+        )
+        return any(n in s for n in needles)
+
+    def _emit_state(self, state: str) -> None:
+        if state != self._state_cache:
+            self._state_cache = state
+            self.state_changed.emit(state)
+
+    def _set_connected(self, connected: bool, state: str) -> None:
+        if connected != self._connected_cache:
+            self._connected_cache = connected
+            self.connected_changed.emit(connected, state)
+        self._emit_state(state)
+
+    def _mark_disconnected(self, reason: str) -> None:
+        """Stop polling and update connection state on a disconnect."""
+        try:
+            self.stop_tag_polling()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self._backend, "_mark_disconnected"):
+                getattr(self._backend, "_mark_disconnected")(reason)
+        except Exception:
+            pass
+
+        self._set_connected(False, reason)
+
+    @Slot()
+    def _supervise_connection(self) -> None:
+        """Reconnect loop that runs entirely in the worker thread."""
+        try:
+            if self._backend.is_connected():
+                # Keep cached state aligned with backend.
+                self._set_connected(True, self._backend.get_state())
+                return
+        except Exception:
+            # If is_connected itself fails, treat as disconnected.
+            self._mark_disconnected("Disconnected (reconnecting)")
+            return
+
+        now_m = time.monotonic()
+        if self._connecting:
+            return
+        if (now_m - self._last_connect_attempt_mono) < RECONNECT_PERIOD_S:
+            return
+
+        self._connecting = True
+        self._last_connect_attempt_mono = now_m
+
         try:
             ok = self._backend.connect()
-            self.connected_changed.emit(ok, self._backend.get_state())
-            self.state_changed.emit(self._backend.get_state())
+            state = self._backend.get_state()
+            self._set_connected(bool(ok), state if state else ("Connected" if ok else "Disconnected (reconnecting)"))
+        except Exception:
+            self._mark_disconnected("Disconnected (reconnecting)")
+        finally:
+            self._connecting = False
+
+    @Slot()
+    def connect_backend(self) -> None:
+        """Request an immediate connect attempt (supervisor also runs continuously)."""
+        if self._connecting:
+            return
+        self._connecting = True
+        self._last_connect_attempt_mono = time.monotonic()
+        try:
+            ok = self._backend.connect()
+            self._set_connected(bool(ok), self._backend.get_state())
         except Exception as e:
-            self.error.emit(f"Connect failed: {e}")
-            self.connected_changed.emit(False, "Error")
-            self.state_changed.emit("Error")
+            if self._is_disconnect_error(e):
+                self._mark_disconnected("Disconnected (reconnecting)")
+            else:
+                self.error.emit(f"Connect failed: {e}")
+                self._set_connected(False, "Error")
+        finally:
+            self._connecting = False
 
     @Slot(float)
     def set_velocity_rpm(self, rpm: float) -> None:
+        if not self._backend.is_connected():
+            return
         try:
             self._backend.set_velocity_rpm(float(rpm))
             self.rpm_commanded.emit(float(rpm))
-            self.state_changed.emit(self._backend.get_state())
+            self._emit_state(self._backend.get_state())
         except Exception as e:
-            self.error.emit(f"Motor command failed: {e}")
+            if self._is_disconnect_error(e):
+                self._mark_disconnected("Disconnected (reconnecting)")
+            else:
+                self.error.emit(f"Motor command failed: {e}")
 
     @Slot()
     def stop(self) -> None:
+        if not self._backend.is_connected():
+            return
         try:
             self._backend.stop()
             self.rpm_commanded.emit(0.0)
-            self.state_changed.emit(self._backend.get_state())
+            self._emit_state(self._backend.get_state())
         except Exception as e:
-            self.error.emit(f"Stop failed: {e}")
+            if self._is_disconnect_error(e):
+                self._mark_disconnected("Disconnected (reconnecting)")
+            else:
+                self.error.emit(f"Stop failed: {e}")
 
     @Slot(object)
     def read_config(self, keys: List[str]) -> None:
+        if not self._backend.is_connected():
+            self.config_read.emit({}, list(keys))
+            return
         try:
             values, missing = self._backend.read_config(keys)
             self.config_read.emit(values, missing)
         except Exception as e:
-            self.error.emit(f"Read config failed: {e}")
-            self.config_read.emit({}, keys)
+            if self._is_disconnect_error(e):
+                self._mark_disconnected("Disconnected (reconnecting)")
+                self.config_read.emit({}, list(keys))
+            else:
+                self.error.emit(f"Read config failed: {e}")
+                self.config_read.emit({}, list(keys))
 
     @Slot(object)
     def apply_config(self, values: Dict[str, Any]) -> None:
+        if not self._backend.is_connected():
+            self.config_applied.emit(False, "ODrive not connected (reconnecting)", list(values.keys()))
+            return
         try:
             ok, msg, missing = self._backend.apply_config(values)
-            self.config_applied.emit(ok, msg, missing)
-            self.state_changed.emit(self._backend.get_state())
+            self.config_applied.emit(bool(ok), str(msg), missing)
+            # apply_config on real backend triggers reboot -> backend may be disconnected afterward.
+            if not self._backend.is_connected():
+                self._set_connected(False, self._backend.get_state())
+            else:
+                self._emit_state(self._backend.get_state())
         except Exception as e:
-            self.error.emit(f"Apply config failed: {e}")
-            self.config_applied.emit(False, str(e), list(values.keys()))
+            if self._is_disconnect_error(e):
+                self._mark_disconnected("Disconnected (reconnecting)")
+                self.config_applied.emit(False, "ODrive disconnected during save (reconnecting)", list(values.keys()))
+            else:
+                self.error.emit(f"Apply config failed: {e}")
+                self.config_applied.emit(False, str(e), list(values.keys()))
 
     @Slot(object)
     def set_polled_tags(self, tags: List[str]) -> None:
@@ -879,23 +1019,21 @@ class OdriveWorker(QObject):
     @Slot()
     def _poll_tags(self) -> None:
         """Read requested tags from backend and emit a timestamped snapshot."""
+        if not self._backend.is_connected():
+            return
         try:
             values = self._backend.get_tags(self._polled_tags)
             self.tags_sample.emit(epoch_s(), values)
         except Exception as e:
+            if self._is_disconnect_error(e):
+                self._mark_disconnected("Disconnected (reconnecting)")
+                return
+
+            # Non-disconnect polling error: rate-limit to avoid storms.
             now_m = time.monotonic()
             if (now_m - self._last_poll_error_mono) >= self._poll_error_cooldown_s:
                 self._last_poll_error_mono = now_m
                 self.error.emit(f"Tag polling failed: {e}")
-
-    @Slot()
-    def get_device_json(self) -> None:
-        """Fetch a JSON dump from the backend in the worker thread."""
-        try:
-            s = self._backend.get_json_dump()
-            self.json_dump_ready.emit(str(s))
-        except Exception as e:
-            self.error.emit(f"Export JSON failed: {e}")
 
 
 # ----------------------------
@@ -1919,12 +2057,11 @@ class SettingRowWidget(QFrame):
 
 
 class ODriveConfigScreen(QWidget):
-    """Screen to view/edit important ODrive settings and export configuration."""
+    """Screen to view/edit important ODrive settings."""
 
     back_clicked = Signal()
     save_clicked = Signal(object)         # dict key->value
     request_refresh = Signal()
-    export_clicked = Signal()             # device JSON dump (worker thread)
     restore_defaults_clicked = Signal()
 
     def __init__(self) -> None:
@@ -1976,13 +2113,11 @@ class ODriveConfigScreen(QWidget):
         actions = QHBoxLayout()
         actions.setSpacing(12)
 
-        self.btn_restore = TouchButton("Restore Defaults", min_h=66, min_w=230)
-        self.btn_export = TouchButton("Export JSON", min_h=66, min_w=200)
-        self.btn_cancel = TouchButton("Cancel", min_h=66, min_w=180)
-        self.btn_save = TouchButton("Save", min_h=66, min_w=180)
+        self.btn_restore = TouchButton("Restore Defaults", min_h=66, min_w=260)
+        self.btn_cancel = TouchButton("Cancel", min_h=66, min_w=200)
+        self.btn_save = TouchButton("Save", min_h=66, min_w=200)
 
         actions.addWidget(self.btn_restore, 1)
-        actions.addWidget(self.btn_export, 1)
         actions.addWidget(self.btn_cancel, 1)
         actions.addWidget(self.btn_save, 1)
 
@@ -1991,7 +2126,6 @@ class ODriveConfigScreen(QWidget):
         self.btn_back.clicked.connect(self.back_clicked.emit)
         self.btn_cancel.clicked.connect(self.back_clicked.emit)
         self.btn_save.clicked.connect(self._on_save)
-        self.btn_export.clicked.connect(self.export_clicked.emit)
         self.btn_restore.clicked.connect(self.restore_defaults_clicked.emit)
         self.btn_refresh.clicked.connect(self.request_refresh.emit)
 
@@ -2080,14 +2214,12 @@ class SimplePlotWidget(QWidget):
             p.drawText(rect, Qt.AlignCenter, "No data")
             return
 
-        # Compute X range (epoch seconds)
         now_ts = epoch_s()
         x0 = now_ts - self._minutes * 60
         x1 = now_ts
         if x1 <= x0:
             x1 = x0 + 1
 
-        # Compute Y ranges per group; fallback to combined.
         y_min = float("inf")
         y_max = float("-inf")
         for t in tags:
@@ -2100,7 +2232,6 @@ class SimplePlotWidget(QWidget):
         if abs(y_max - y_min) < 1e-6:
             y_max = y_min + 1.0
 
-        # Margins and mapping.
         plot = rect.adjusted(50, 10, -10, -30)
         p.drawRect(plot)
 
@@ -2110,19 +2241,16 @@ class SimplePlotWidget(QWidget):
         def map_y(v: float) -> float:
             return plot.bottom() - (v - y_min) / (y_max - y_min) * plot.height()
 
-        # Draw axes labels.
         p.drawText(rect.left() + 6, plot.top() + 14, f"{y_max:.3g}")
         p.drawText(rect.left() + 6, plot.bottom(), f"{y_min:.3g}")
         p.drawText(plot.left(), rect.bottom() - 6, f"-{self._minutes} min")
         p.drawText(plot.right() - 60, rect.bottom() - 6, "now")
 
-        # Series colors (simple rotation).
         colors = [
             Qt.cyan, Qt.yellow, Qt.green, Qt.magenta, Qt.red,
             Qt.blue, Qt.gray, Qt.white
         ]
 
-        # Draw series.
         for i, t in enumerate(tags):
             pts = self._data.get(t, [])
             if len(pts) < 2:
@@ -2140,7 +2268,6 @@ class SimplePlotWidget(QWidget):
                     p.drawLine(last[0], last[1], x, y)
                 last = (x, y)
 
-        # Legend.
         p.setPen(self.palette().text().color())
         legend = "  ".join([f"{TAG_LABELS.get(t, t)}" for t in tags])
         p.drawText(rect.adjusted(0, 0, 0, -rect.height() + 20), Qt.AlignLeft | Qt.AlignVCenter, legend)
@@ -2187,12 +2314,10 @@ class QtChartsPlot(QWidget):
         self._minutes = int(minutes)
         self._tags = list(tags)
 
-        # Remove old series.
         for s in list(self._series.values()):
             self._chart.removeSeries(s)
         self._series.clear()
 
-        # Add new series.
         for tag in self._tags:
             series = QLineSeries()
             series.setName(TAG_LABELS.get(tag, tag))
@@ -2210,7 +2335,6 @@ class QtChartsPlot(QWidget):
         self._minutes = int(minutes)
         self._tags = list(tags)
 
-        # Ensure series exist for selected tags.
         existing = set(self._series.keys())
         for tag in self._tags:
             if tag in existing:
@@ -2222,25 +2346,21 @@ class QtChartsPlot(QWidget):
             series.attachAxis(self._axis_for_tag(tag))
             self._series[tag] = series
 
-        # Remove series that are no longer selected.
         for tag in list(self._series.keys()):
             if tag not in self._tags:
                 s = self._series.pop(tag)
                 self._chart.removeSeries(s)
 
-        # Append points.
         cutoff_ms = (epoch_s() - self._minutes * 60) * 1000.0
         for tag, ts, val in points:
             if tag not in self._series:
                 continue
             self._series[tag].append(float(ts) * 1000.0, float(val))
 
-        # Prune old points.
         for s in self._series.values():
             n = s.count()
             if n <= 0:
                 continue
-            # Find first index within window.
             idx = 0
             while idx < n:
                 if s.at(idx).x() >= cutoff_ms:
@@ -2258,7 +2378,6 @@ class QtChartsPlot(QWidget):
         self._rescale_axes_from_series()
 
     def _rescale_axes_from_series(self) -> None:
-        # Compute min/max per group from current series points.
         rpm_vals: List[float] = []
         other_vals: List[float] = []
 
@@ -2346,7 +2465,6 @@ class DataLoggerScreen(QWidget):
         body = QHBoxLayout()
         body.setSpacing(12)
 
-        # Left panel: tag selection + window control.
         left = QVBoxLayout()
         left.setSpacing(12)
 
@@ -2388,7 +2506,6 @@ class DataLoggerScreen(QWidget):
 
         body.addLayout(left, 1)
 
-        # Right panel: plot
         self.plot = make_plot_widget()
         body.addWidget(self.plot, 2)
 
@@ -2558,30 +2675,24 @@ class HomeScreen(QWidget):
         """
         self.footer.set_running_ui(running)
 
-        # RPM control is not editable while running.
         self.rpm_ctl.set_enabled(not running)
 
         if running:
             if run_mode == "single":
-                # Allow +/- adjustment while running, but prevent editing the text field.
-                self.time_ctl.set_adjust_callback(None)  # callback is configured by controller; don't clear here.
+                self.time_ctl.set_adjust_callback(None)
                 self.time_ctl.set_buttons_enabled(True)
                 self.time_ctl.set_edit_enabled(False)
             else:
-                # Recipe mode: timer controls stay locked.
                 self.time_ctl.set_adjust_callback(None)
                 self.time_ctl.set_enabled(False)
         else:
-            # Idle: timer control depends on whether a recipe is selected.
             self.time_ctl.set_adjust_callback(None)
             self.time_ctl.set_enabled(not recipe_selected)
 
-        # Navigation rules while running.
         self.btn_builder.setEnabled(not running)
         self.btn_config.setEnabled(not running)
         self.btn_datalogger.setEnabled(True)
 
-        # Recipe selection remains locked during runs.
         self.recipes_area.setEnabled(not running)
 
     def set_status(
@@ -2608,7 +2719,7 @@ class AppController(QObject):
       - Drives RunEngine and sends motor commands to OdriveWorker
       - Manages screens (ODrive config and Data Logger)
       - Logs selected tags to SQLite with compression and provides plot/export
-      - Ensures safe shutdown by stopping the motor when exiting
+      - Auto-reconnect and safe stop on disconnect during runs
     """
 
     request_connect = Signal()
@@ -2617,7 +2728,6 @@ class AppController(QObject):
     request_set_polled_tags = Signal(object)     # list[str]
     request_start_poll = Signal()
     request_stop_poll = Signal()
-    request_get_json = Signal()
 
     def __init__(
         self,
@@ -2641,46 +2751,38 @@ class AppController(QObject):
         self.connected: bool = False
         self.backend_state: str = "Disconnected"
 
-        # UI state shown in status bars (commanded RPM and remaining reflect engine state).
         self._ui_state = "Idle"
         self._ui_rpm = 0.0
         self._ui_remaining = 0
         self._ui_step_info = ""
-        self._run_mode = "idle"  # idle|single|recipe
+        self._run_mode = "idle"
 
-        # Track commanded RPM robustly (used for logging even if tag polling fails).
         self._cmd_rpm: float = 0.0
 
-        # Data Logger selection and window.
         self._dlog_minutes = 10
         self._dlog_selected_tags: List[str] = list(DEFAULT_ENABLED_TAGS)
 
-        # Historian store (SQLite in config dir).
         self.history_db = HistoryDB(app_config_dir() / "history.sqlite")
 
-        # Backend + worker thread.
         backend: OdriveInterface = SimulatedOdrive() if BACKEND == "sim" else RealOdrive()
         self.worker_thread = QThread()
         self.worker = OdriveWorker(backend)
         self.worker.moveToThread(self.worker_thread)
 
-        # Run engine.
+        self.worker_thread.started.connect(self.worker.on_thread_started)
+
         self.engine = RunEngine()
 
-        # Engine -> worker.
         self.engine.request_set_rpm.connect(self.worker.set_velocity_rpm)
         self.engine.request_stop.connect(self.worker.stop)
 
-        # Controller -> worker (queued).
         self.request_connect.connect(self.worker.connect_backend)
         self.request_read_config.connect(self.worker.read_config)
         self.request_apply_config.connect(self.worker.apply_config)
         self.request_set_polled_tags.connect(self.worker.set_polled_tags)
         self.request_start_poll.connect(self.worker.start_tag_polling)
         self.request_stop_poll.connect(self.worker.stop_tag_polling)
-        self.request_get_json.connect(self.worker.get_device_json)
 
-        # Worker -> controller/UI.
         self.worker.connected_changed.connect(self._on_connected)
         self.worker.state_changed.connect(self._on_backend_state)
         self.worker.rpm_commanded.connect(self._on_worker_rpm_commanded)
@@ -2688,16 +2790,13 @@ class AppController(QObject):
         self.worker.config_read.connect(self._on_config_read)
         self.worker.config_applied.connect(self._on_config_applied)
         self.worker.tags_sample.connect(self._on_tags_sample)
-        self.worker.json_dump_ready.connect(self._on_json_dump_ready)
 
-        # Engine -> UI.
         self.engine.status_changed.connect(self._on_engine_status)
         self.engine.run_mode_changed.connect(self._on_engine_mode)
         self.engine.active_rpm_changed.connect(self._on_engine_rpm)
         self.engine.remaining_changed.connect(self._on_engine_remaining)
         self.engine.step_info_changed.connect(self._on_step_info)
 
-        # Home UI -> controller.
         self.home.start_clicked.connect(self.on_start)
         self.home.stop_clicked.connect(self.on_stop)
         self.home.open_builder_clicked.connect(self.on_open_builder_new)
@@ -2706,19 +2805,15 @@ class AppController(QObject):
         self.home.open_config_clicked.connect(self.on_open_config)
         self.home.open_datalogger_clicked.connect(self.on_open_datalogger)
 
-        # Builder UI -> controller.
         self.builder.back_clicked.connect(self.on_back_home)
         self.builder.cancel_clicked.connect(self.on_back_home)
         self.builder.save_clicked.connect(self.on_builder_save)
 
-        # Config UI -> controller.
         self.cfg.back_clicked.connect(self.on_back_home)
         self.cfg.request_refresh.connect(self._refresh_odrive_config)
         self.cfg.save_clicked.connect(self._save_odrive_config)
         self.cfg.restore_defaults_clicked.connect(self._restore_odrive_defaults)
-        self.cfg.export_clicked.connect(self._export_device_json)
 
-        # Data Logger UI -> controller.
         self.dlog.back_clicked.connect(self.on_back_home)
         self.dlog.start_clicked.connect(self.on_start)
         self.dlog.stop_clicked.connect(self.on_stop)
@@ -2726,23 +2821,21 @@ class AppController(QObject):
         self.dlog.tags_changed.connect(self._on_dlog_tags_changed)
         self.dlog.export_clicked.connect(self._export_datalogger_csv)
 
-        # On screen change: refresh plot when Data Logger is entered.
         self.stack.currentChanged.connect(self._on_screen_changed)
 
-        # Periodic logging of commanded RPM even if ODrive tag polling fails.
         self._cmd_log_timer = QTimer(self)
         self._cmd_log_timer.setInterval(LOG_POLL_MS)
         self._cmd_log_timer.timeout.connect(self._log_cmd_rpm)
         self._cmd_log_timer.start()
 
-        # Start worker thread and connect backend.
+        self._last_modal_error_mono: float = 0.0
+        self._modal_error_cooldown_s: float = 8.0
+
         self.worker_thread.start()
         self.request_connect.emit()
 
-        # Configure polled tags (raw).
         self.request_set_polled_tags.emit([TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM])
 
-        # Initial UI build.
         self._refresh_recipes()
         self._refresh_status_all()
         self._apply_home_controls()
@@ -2770,7 +2863,13 @@ class AppController(QObject):
         except Exception:
             pass
 
-    # ---- Internal helpers ----
+    def _show_modal_error(self, parent: QWidget, title: str, msg: str) -> None:
+        """Rate-limited modal error dialog helper to prevent popup storms."""
+        now_m = time.monotonic()
+        if (now_m - self._last_modal_error_mono) < self._modal_error_cooldown_s:
+            return
+        self._last_modal_error_mono = now_m
+        QMessageBox.critical(parent, title, msg)
 
     def _recipes(self) -> List[Recipe]:
         return self.store.recipes()
@@ -2811,9 +2910,7 @@ class AppController(QObject):
         recipe_selected = self._selected_recipe() is not None
         running = self.engine.is_running()
 
-        # Configure manual timer behavior for single-timer mode while running.
         if running and self._run_mode == "single" and not recipe_selected:
-            # +/- buttons adjust engine remaining time; clamp handled in engine.
             self.home.time_ctl.set_adjust_callback(self._adjust_time_from_home)
             self.home.time_ctl.set_buttons_enabled(True)
             self.home.time_ctl.set_edit_enabled(False)
@@ -2824,10 +2921,6 @@ class AppController(QObject):
         self.dlog.set_running_ui(running=running)
 
     def _adjust_time_from_home(self, delta_s: int) -> int:
-        """
-        Callback used by Home timer +/- buttons while running in single-timer mode.
-        Returns the updated remaining time in seconds for display.
-        """
         if self._run_mode != "single":
             return self._ui_remaining
         self.engine.adjust_single_remaining(int(delta_s))
@@ -2837,22 +2930,22 @@ class AppController(QObject):
 
     @Slot(bool, str)
     def _on_connected(self, connected: bool, state: str) -> None:
-        self.connected = connected
+        self.connected = bool(connected)
         self.backend_state = state
 
-        # Start polling after successful connect (or always for sim).
         if connected:
             self.request_start_poll.emit()
+            # If config screen is visible after reconnect, refresh values automatically.
+            if self.stack.currentWidget() is self.cfg:
+                self._refresh_odrive_config()
         else:
             self.request_stop_poll.emit()
-
-        if BACKEND == "real" and not connected:
-            QMessageBox.critical(
-                self.home,
-                "ODrive Connection",
-                "ODrive is not connected.\n\n"
-                "Check power/USB and ensure the odrive Python package is installed.",
-            )
+            # Disconnect during run: stop safely and do not auto-resume.
+            if self.engine.is_running():
+                self.engine.stop(user_initiated=True)
+            # Update config status if visible.
+            if self.stack.currentWidget() is self.cfg:
+                self.cfg.set_loading("Disconnected (reconnecting…)")
 
         self._refresh_status_all()
         self._apply_home_controls()
@@ -2864,21 +2957,14 @@ class AppController(QObject):
 
     @Slot(float)
     def _on_worker_rpm_commanded(self, rpm: float) -> None:
-        # Keep a redundant tracking source.
         self._cmd_rpm = float(rpm)
 
     @Slot(str)
     def _on_worker_error(self, msg: str) -> None:
-        """
-        Any worker error is surfaced to the user. If a run is active, stop the motor safely.
-        """
+        # Worker error is modal but rate-limited to avoid popup storms.
         if self.engine.is_running():
             self.engine.stop(user_initiated=True)
-            try:
-                QMetaObject.invokeMethod(self.worker, "stop", Qt.BlockingQueuedConnection)
-            except Exception:
-                pass
-        QMessageBox.critical(self.stack.currentWidget(), "ODrive Error", msg)
+        self._show_modal_error(self.stack.currentWidget(), "ODrive Error", msg)
         self._refresh_status_all()
         self._apply_home_controls()
 
@@ -2900,16 +2986,10 @@ class AppController(QObject):
             )
             self.on_back_home()
         else:
-            QMessageBox.critical(self.cfg, "Configuration", message)
+            self._show_modal_error(self.cfg, "Configuration", message)
 
     @Slot(int, object)
     def _on_tags_sample(self, ts: int, values_obj: Any) -> None:
-        """
-        Handle polled tags:
-          - Compute p_w = vbus_voltage * ibus
-          - Store selected and raw signals in SQLite using per-tag compression
-          - Stream inserted samples to the Data Logger plot when visible
-        """
         values: Dict[str, float] = {str(k): safe_float(v) for k, v in dict(values_obj or {}).items()}
 
         vbus = values.get(TAG_VBUS_V, float("nan"))
@@ -2917,10 +2997,8 @@ class AppController(QObject):
         if math.isfinite(vbus) and math.isfinite(ibus):
             values[TAG_PWR_W] = float(vbus * ibus)
 
-        # Always include commanded RPM in the snapshot for aligned timestamps (also logged independently).
         values[TAG_CMD_RPM] = float(self._cmd_rpm)
 
-        # Prepare inserts for known tags that are present in snapshot.
         samples: List[Tuple[str, float, float, int]] = []
         for tag in [TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM, TAG_PWR_W, TAG_CMD_RPM]:
             if tag in values and math.isfinite(values[tag]):
@@ -2936,10 +3014,9 @@ class AppController(QObject):
         try:
             inserted = self.history_db.insert_many_if_needed(ts=ts, samples=samples)
         except Exception as e:
-            QMessageBox.critical(self.dlog, "Data Logger DB", f"Failed to write sample(s): {e}")
+            self._show_modal_error(self.dlog, "Data Logger DB", f"Failed to write sample(s): {e}")
             return
 
-        # Stream only inserted samples for selected tags to the plot.
         if self.stack.currentWidget() is self.dlog and inserted:
             selected = set(self._dlog_selected_tags)
             points: List[Tuple[str, int, float]] = []
@@ -2948,17 +3025,6 @@ class AppController(QObject):
                     points.append((tag, ts, float(values[tag])))
             if points:
                 self.dlog.append_points(points, tags=self._dlog_selected_tags, minutes=self._dlog_minutes)
-
-    @Slot(str)
-    def _on_json_dump_ready(self, cfg_json: str) -> None:
-        out = downloads_dir() / f"odrive_device_dump_{time.strftime('%Y%m%d_%H%M%S')}.json"
-        try:
-            out.write_text(str(cfg_json), encoding="utf-8")
-            QMessageBox.information(self.cfg, "Export JSON", f"Exported device JSON to:\n{out}")
-            self.cfg.set_loading("Export complete")
-        except Exception as e:
-            QMessageBox.critical(self.cfg, "Export JSON", f"Failed to save JSON:\n{e}")
-            self.cfg.set_loading("Export failed")
 
     # ---- Engine callbacks ----
 
@@ -2985,7 +3051,6 @@ class AppController(QObject):
         self._ui_remaining = int(seconds)
         self._refresh_status_all()
 
-        # While running in single mode, keep the timer display updated with remaining time.
         if self.engine.is_running() and self._run_mode == "single":
             try:
                 self.home.time_ctl.set_seconds(int(clamp(self._ui_remaining, 0, TIME_MAX_S)))
@@ -3002,7 +3067,6 @@ class AppController(QObject):
     @Slot(int)
     def _on_screen_changed(self, _idx: int) -> None:
         if self.stack.currentWidget() is self.dlog:
-            # Sync Data Logger controls and refresh plot for current selection/window.
             self._dlog_minutes = self.dlog.minutes_window()
             self._dlog_selected_tags = self.dlog.selected_tags() or list(DEFAULT_ENABLED_TAGS)
             self._refresh_datalogger_plot()
@@ -3025,7 +3089,6 @@ class AppController(QObject):
             if duration <= 0:
                 QMessageBox.information(self.home, "Start", "Set a timer or select a recipe.")
                 return
-            # Seed the timer display at start.
             self.home.time_ctl.set_seconds(int(clamp(duration, 0, TIME_MAX_S)))
             self.engine.start_single(rpm, duration)
             return
@@ -3056,7 +3119,6 @@ class AppController(QObject):
 
     @Slot()
     def on_open_datalogger(self) -> None:
-        # Must be accessible while running.
         self.stack.setCurrentWidget(self.dlog)
         self._dlog_minutes = self.dlog.minutes_window()
         self._dlog_selected_tags = self.dlog.selected_tags() or list(DEFAULT_ENABLED_TAGS)
@@ -3099,12 +3161,11 @@ class AppController(QObject):
     # ---- ODrive Config actions ----
 
     def _refresh_odrive_config(self) -> None:
-        """Request a config read in the worker thread and populate the config screen."""
         keys = [s.key for s in IMPORTANT_SETTINGS]
         self.cfg.set_loading("Loading from device…")
         if BACKEND == "real" and not self.connected:
             self.cfg.apply_values(DEFAULT_CONFIG_MAP, keys)
-            self.cfg.set_loading("Not connected (showing defaults)")
+            self.cfg.set_loading("Not connected (reconnecting…) — showing defaults")
             return
         self.request_read_config.emit(keys)
 
@@ -3118,16 +3179,8 @@ class AppController(QObject):
         if BACKEND == "real" and not self.connected:
             QMessageBox.critical(self.cfg, "Configuration", "Cannot save: ODrive is not connected.")
             return
-        self.cfg.set_loading("Applying config…")
+        self.cfg.set_loading("Applying & saving config (device will reboot)…")
         self.request_apply_config.emit(values)
-
-    @Slot()
-    def _export_device_json(self) -> None:
-        if BACKEND == "real" and not self.connected:
-            QMessageBox.critical(self.cfg, "Export JSON", "Cannot export: ODrive is not connected.")
-            return
-        self.cfg.set_loading("Exporting device JSON…")
-        self.request_get_json.emit()
 
     # ---- Data Logger actions ----
 
@@ -3151,16 +3204,12 @@ class AppController(QObject):
         try:
             data = self.history_db.query_window_multi(now_ts, tags, minutes)
         except Exception as e:
-            QMessageBox.critical(self.dlog, "Data Logger DB", f"Failed to load window:\n{e}")
+            self._show_modal_error(self.dlog, "Data Logger DB", f"Failed to load window:\n{e}")
             data = {t: [] for t in tags}
         self.dlog.set_series_data(data, tags=tags, minutes=minutes)
 
     @Slot()
     def _log_cmd_rpm(self) -> None:
-        """
-        Independently log commanded RPM at 1 Hz so it continues even if ODrive polling fails.
-        Compression rules are applied by the historian.
-        """
         ts = epoch_s()
         try:
             self.history_db.insert_if_needed(
@@ -3171,7 +3220,6 @@ class AppController(QObject):
                 heartbeat_s=int(TAG_HEARTBEAT_S.get(TAG_CMD_RPM, DB_HEARTBEAT_S_DEFAULT)),
             )
         except Exception:
-            # Avoid popping modal dialogs at 1 Hz; DB write errors are handled on poll inserts.
             pass
 
     @Slot(int, object)
@@ -3186,7 +3234,7 @@ class AppController(QObject):
             n = self.history_db.export_window_csv_multi(out, epoch_s(), tags, minutes)
             QMessageBox.information(self.dlog, "Export", f"Exported {n} row(s) to:\n{out}")
         except Exception as e:
-            QMessageBox.critical(self.dlog, "Export", f"Failed to export CSV:\n{e}")
+            self._show_modal_error(self.dlog, "Export", f"Failed to export CSV:\n{e}")
 
 
 # ----------------------------
