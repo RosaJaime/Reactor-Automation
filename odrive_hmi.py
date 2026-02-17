@@ -1,13 +1,13 @@
 """
 Touch-Friendly ODrive Reactor Agitator HMI (PySide6)
 
-Run (simulation default):
+Run:
   pip install PySide6
   python odrive_hmi.py
 
-Switch to real ODrive backend:
-  - Set BACKEND = "real"
-  - Ensure the `odrive` Python package is installed and accessible on the target device
+Backends:
+  - BACKEND = "real" (default)
+  - BACKEND = "sim"  (available for testing)
 
 Real backend (open-loop LOCKIN_SPIN):
   - UI uses RPM; backend converts to turns/s = rpm / 60
@@ -16,14 +16,17 @@ Real backend (open-loop LOCKIN_SPIN):
       axis.requested_state = AxisState.LOCKIN_SPIN
     (firmware latches vel only on re-entry)
   - connect() applies a safe baseline once:
-      IDLE, disable startup calibrations/closed-loop flags, current limits,
-      and a general_lockin profile (current/ramp_time/ramp_distance/accel, finish_* False if available)
+      IDLE, disable startup calibrations and closed-loop flags (when present),
+      conservative current limits, and a general_lockin profile (current/ramp_time/ramp_distance/accel,
+      finish_* False if available)
   - stop() transitions to IDLE
   - Backend methods do not sleep; timing is handled by the QTimer-driven run engine
 
-Added screens:
-  - ODrive Configuration: view/edit important settings, restore defaults, save to device (worker thread), export to JSON
-  - Velocity History: poll velocity at 1 Hz (worker thread), store compressed samples in SQLite, live table view, export window to CSV
+Screens:
+  - Home
+  - Recipe Builder
+  - ODrive Configuration
+  - Data Logger (renamed from Velocity History)
 
 Threading rules:
   - All ODrive reads/writes are executed in the worker thread via queued signals/slots
@@ -34,18 +37,31 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import sqlite3
 import sys
 import time
 import uuid
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, QStandardPaths, Signal, Slot, QMetaObject
-from PySide6.QtGui import QDoubleValidator, QFont, QIntValidator
+from PySide6.QtCore import (
+    QObject,
+    Qt,
+    QThread,
+    QTimer,
+    QStandardPaths,
+    Signal,
+    Slot,
+    QMetaObject,
+    QDateTime,
+    QPointF,
+)
+from PySide6.QtGui import QDoubleValidator, QFont, QIntValidator, QPainter
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -56,17 +72,25 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+
+# QtCharts is preferred for a lightweight responsive plot. If unavailable, a simple custom plot widget is used.
+QTCHARTS_AVAILABLE = False
+try:
+    from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis, QDateTimeAxis  # type: ignore
+
+    QTCHARTS_AVAILABLE = True
+except Exception:
+    QTCHARTS_AVAILABLE = False
+
 
 # ----------------------------
 # App Configuration
 # ----------------------------
 
-BACKEND = "real"  # "sim" (default) or "real"
+BACKEND = "real"  # "sim" or "real"
 
 WINDOW_W = 1280
 WINDOW_H = 800
@@ -82,16 +106,67 @@ TIME_MAX_S = 24 * 60 * 60  # 24h cap
 
 ENGINE_TICK_MS = 200  # Engine tick; countdown displayed in whole seconds
 
-# Velocity polling for historian.
-VEL_POLL_MS = 1000
-HIST_TAG = "axis0.vel_estimate_rpm"
-HIST_DEADBAND_RPM = 2.0
-HIST_HEARTBEAT_S = 60
+# Data Logger polling and storage settings.
+LOG_POLL_MS = 1000  # 1 Hz
+DB_HEARTBEAT_S_DEFAULT = 60
+
+# Tags (SQLite schema uses generic tag TEXT).
+TAG_VBUS_V = "vbus_voltage"
+TAG_IBUS_A = "ibus"
+TAG_PWR_W = "p_w"  # computed: vbus_voltage * ibus
+TAG_CMD_RPM = "cmd_rpm"  # commanded RPM tracked from engine
+TAG_VEL_RPM = "vel_rpm"  # actual velocity estimate in RPM
+
+DEFAULT_ENABLED_TAGS = [TAG_PWR_W, TAG_CMD_RPM]
+
+# Per-tag deadbands for historian compression.
+TAG_DEADBAND: Dict[str, float] = {
+    TAG_VBUS_V: 0.1,   # V
+    TAG_IBUS_A: 0.05,  # A
+    TAG_PWR_W: 2.0,    # W
+    TAG_CMD_RPM: 0.5,  # rpm
+    TAG_VEL_RPM: 2.0,  # rpm
+}
+
+TAG_HEARTBEAT_S: Dict[str, int] = {
+    TAG_VBUS_V: DB_HEARTBEAT_S_DEFAULT,
+    TAG_IBUS_A: DB_HEARTBEAT_S_DEFAULT,
+    TAG_PWR_W: DB_HEARTBEAT_S_DEFAULT,
+    TAG_CMD_RPM: DB_HEARTBEAT_S_DEFAULT,
+    TAG_VEL_RPM: DB_HEARTBEAT_S_DEFAULT,
+}
+
+TAG_LABELS: Dict[str, str] = {
+    TAG_PWR_W: "Electrical input power (W)",
+    TAG_CMD_RPM: "Commanded RPM",
+    TAG_VEL_RPM: "Actual velocity RPM",
+    TAG_VBUS_V: "Bus voltage (V)",
+    TAG_IBUS_A: "Bus current (A)",
+}
+
+TAG_UNITS: Dict[str, str] = {
+    TAG_PWR_W: "W",
+    TAG_CMD_RPM: "rpm",
+    TAG_VEL_RPM: "rpm",
+    TAG_VBUS_V: "V",
+    TAG_IBUS_A: "A",
+}
+
+# Plot grouping for dual-axis display.
+PLOT_GROUP_RPM = "rpm"
+PLOT_GROUP_OTHER = "other"
+TAG_PLOT_GROUP: Dict[str, str] = {
+    TAG_CMD_RPM: PLOT_GROUP_RPM,
+    TAG_VEL_RPM: PLOT_GROUP_RPM,
+    TAG_PWR_W: PLOT_GROUP_OTHER,
+    TAG_VBUS_V: PLOT_GROUP_OTHER,
+    TAG_IBUS_A: PLOT_GROUP_OTHER,
+}
+
 
 # ----------------------------
 # Utilities
 # ----------------------------
-
 
 def clamp(v: float, lo: float, hi: float) -> float:
     """Clamp v into [lo, hi]."""
@@ -156,12 +231,14 @@ def app_config_dir() -> Path:
 def downloads_dir() -> Path:
     """
     Return the per-user Downloads directory (created if missing).
-    Falls back to ~/Output when the platform location is unavailable.
+    Falls back to ~/Downloads then ~/Output when the platform location is unavailable.
     """
     base = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation)
     if not base:
-        base = str(Path.home() / "Output")
+        base = str(Path.home() / "Downloads")
     d = Path(base)
+    if not d.exists():
+        d = Path.home() / "Output"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -169,6 +246,14 @@ def downloads_dir() -> Path:
 def epoch_s() -> int:
     """Return current epoch time in seconds."""
     return int(time.time())
+
+
+def safe_float(x: Any, default: float = 0.0) -> float:
+    """Convert x to float, returning default on failure."""
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
 
 
 # ----------------------------
@@ -348,7 +433,12 @@ class OdriveInterface:
     def apply_config(self, values: Dict[str, Any]) -> Tuple[bool, str, List[str]]:
         raise NotImplementedError
 
-    def get_velocity_rpm(self) -> float:
+    def get_tags(self, tags: Sequence[str]) -> Dict[str, float]:
+        """Return a dict of requested tag values; keys not supported may be omitted."""
+        raise NotImplementedError
+
+    def get_json_dump(self) -> str:
+        """Return a JSON string dump from the device (or simulation)."""
         raise NotImplementedError
 
 
@@ -369,6 +459,9 @@ class SimulatedOdrive(OdriveInterface):
         self._actual_rpm = 0.0
         self._last_update = time.monotonic()
         self._config: Dict[str, Any] = dict(DEFAULT_CONFIG_MAP)
+
+        # Simulated electrical.
+        self._vbus = 24.0
 
     def connect(self) -> bool:
         self._connected = True
@@ -411,21 +504,43 @@ class SimulatedOdrive(OdriveInterface):
                 missing.append(k)
         return True, "Simulation config updated", missing
 
-    def get_velocity_rpm(self) -> float:
+    def _update_actual(self) -> None:
         now = time.monotonic()
         dt = max(0.0, now - self._last_update)
         self._last_update = now
 
         # First-order lag to emulate a controller response.
         tau = 0.5  # seconds
-        alpha = 1.0 - pow(2.718281828, -dt / max(1e-6, tau))
+        alpha = 1.0 - math.exp(-dt / max(1e-6, tau))
         self._actual_rpm += (self._target_rpm - self._actual_rpm) * alpha
-
-        # A small deadzone near zero to reduce tiny floating noise.
         if abs(self._actual_rpm) < 0.2:
             self._actual_rpm = 0.0
 
-        return float(self._actual_rpm)
+    def get_tags(self, tags: Sequence[str]) -> Dict[str, float]:
+        self._update_actual()
+
+        # Simulate current roughly proportional to speed demand.
+        # This is only for visualization and does not represent real motor physics.
+        rpm_mag = abs(self._actual_rpm)
+        ibus = 0.2 + (rpm_mag / max(1.0, VEL_MAX_RPM)) * 2.0
+
+        out: Dict[str, float] = {}
+        for t in tags:
+            if t == TAG_VBUS_V:
+                out[t] = float(self._vbus)
+            elif t == TAG_IBUS_A:
+                out[t] = float(ibus)
+            elif t == TAG_VEL_RPM:
+                out[t] = float(self._actual_rpm)
+        return out
+
+    def get_json_dump(self) -> str:
+        payload = {
+            "backend": "sim",
+            "state": self._state,
+            "config": self._config,
+        }
+        return json.dumps(payload, indent=2)
 
 
 class RealOdrive(OdriveInterface):
@@ -437,6 +552,8 @@ class RealOdrive(OdriveInterface):
       - On every velocity change: set general_lockin.vel then request LOCKIN_SPIN
       - stop() goes to IDLE
       - read/apply config use attribute traversal and skip unsupported fields
+      - get_tags reads a small set of monitoring attributes
+      - get_json_dump returns odrv0.get_json()
     """
 
     def __init__(self) -> None:
@@ -482,15 +599,33 @@ class RealOdrive(OdriveInterface):
                     pass
 
             # Conservative current limits.
-            self._axis.config.motor.current_soft_max = 5.0
-            self._axis.config.motor.current_hard_max = 8.0
+            try:
+                self._axis.config.motor.current_soft_max = 5.0
+            except Exception:
+                pass
+            try:
+                self._axis.config.motor.current_hard_max = 8.0
+            except Exception:
+                pass
 
             # Configure open-loop lock-in profile.
             gl = self._axis.config.general_lockin
-            gl.current = 2.0
-            gl.ramp_time = 1.0
-            gl.ramp_distance = 1.0
-            gl.accel = 10.0
+            try:
+                gl.current = 2.0
+            except Exception:
+                pass
+            try:
+                gl.ramp_time = 1.0
+            except Exception:
+                pass
+            try:
+                gl.ramp_distance = 1.0
+            except Exception:
+                pass
+            try:
+                gl.accel = 10.0
+            except Exception:
+                pass
 
             # Some firmware variants may not expose these fields.
             for name, value in (("finish_on_vel", False), ("finish_on_distance", False)):
@@ -595,7 +730,6 @@ class RealOdrive(OdriveInterface):
 
         missing: List[str] = []
         try:
-            # Apply config from a safe IDLE state.
             self._axis.requested_state = self._AxisState.IDLE
         except Exception:
             pass
@@ -611,19 +745,29 @@ class RealOdrive(OdriveInterface):
             msg = f"Config applied with {len(missing)} unsupported field(s)"
         return True, msg, missing
 
-    def get_velocity_rpm(self) -> float:
-        """
-        Read axis0.vel_estimate and convert to RPM.
-
-        vel_estimate is commonly turns/s on ODrive firmware; RPM = turns/s * 60.
-        """
-        if not self._connected or self._axis is None:
+    def get_tags(self, tags: Sequence[str]) -> Dict[str, float]:
+        if not self._connected or self._odrv is None or self._axis is None:
             raise RuntimeError("ODrive not connected")
-        try:
-            turns_per_s = float(getattr(self._axis, "vel_estimate"))
-            return turns_per_s * 60.0
-        except Exception:
-            return 0.0
+
+        out: Dict[str, float] = {}
+        for t in tags:
+            try:
+                if t == TAG_VBUS_V:
+                    out[t] = float(getattr(self._odrv, "vbus_voltage"))
+                elif t == TAG_IBUS_A:
+                    out[t] = float(getattr(self._odrv, "ibus"))
+                elif t == TAG_VEL_RPM:
+                    turns_per_s = float(getattr(self._axis, "vel_estimate"))
+                    out[t] = turns_per_s * 60.0
+            except Exception:
+                # Unsupported or transient read failure; omit tag.
+                pass
+        return out
+
+    def get_json_dump(self) -> str:
+        if not self._connected or self._odrv is None:
+            raise RuntimeError("ODrive not connected")
+        return str(self._odrv.get_json())
 
 
 # ----------------------------
@@ -642,15 +786,22 @@ class OdriveWorker(QObject):
     rpm_commanded = Signal(float)           # last commanded RPM
     error = Signal(str)
 
-    config_read = Signal(object, object)    # values: dict, missing: list
+    config_read = Signal(object, object)        # values: dict, missing: list
     config_applied = Signal(bool, str, object)  # ok, message, missing: list
 
-    velocity_sample = Signal(int, float)    # ts_epoch_s, rpm
+    tags_sample = Signal(int, object)           # ts_epoch_s, dict(tag->value)
+    json_dump_ready = Signal(str)               # device JSON dump (string)
 
     def __init__(self, backend: OdriveInterface) -> None:
         super().__init__()
         self._backend = backend
+
         self._poll_timer: Optional[QTimer] = None
+        self._polled_tags: List[str] = [TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM]
+
+        # Rate-limit polling errors to avoid spamming message boxes.
+        self._last_poll_error_mono: float = 0.0
+        self._poll_error_cooldown_s: float = 5.0
 
     @Slot()
     def connect_backend(self) -> None:
@@ -700,34 +851,51 @@ class OdriveWorker(QObject):
             self.error.emit(f"Apply config failed: {e}")
             self.config_applied.emit(False, str(e), list(values.keys()))
 
+    @Slot(object)
+    def set_polled_tags(self, tags: List[str]) -> None:
+        """Set the raw tags polled at 1 Hz in the worker thread."""
+        self._polled_tags = list(tags)
+
     @Slot()
-    def start_velocity_polling(self) -> None:
+    def start_tag_polling(self) -> None:
         """
-        Start 1 Hz velocity polling in the worker thread.
+        Start 1 Hz tag polling in the worker thread.
 
         A QTimer is created lazily so it is constructed in the worker thread context.
         """
         if self._poll_timer is None:
             self._poll_timer = QTimer(self)
-            self._poll_timer.setInterval(VEL_POLL_MS)
-            self._poll_timer.timeout.connect(self._poll_velocity)
+            self._poll_timer.setInterval(LOG_POLL_MS)
+            self._poll_timer.timeout.connect(self._poll_tags)
         if not self._poll_timer.isActive():
             self._poll_timer.start()
 
     @Slot()
-    def stop_velocity_polling(self) -> None:
-        """Stop velocity polling if it is active."""
+    def stop_tag_polling(self) -> None:
+        """Stop tag polling if it is active."""
         if self._poll_timer and self._poll_timer.isActive():
             self._poll_timer.stop()
 
     @Slot()
-    def _poll_velocity(self) -> None:
-        """Read velocity from backend and emit a timestamped sample."""
+    def _poll_tags(self) -> None:
+        """Read requested tags from backend and emit a timestamped snapshot."""
         try:
-            rpm = float(self._backend.get_velocity_rpm())
-            self.velocity_sample.emit(epoch_s(), rpm)
+            values = self._backend.get_tags(self._polled_tags)
+            self.tags_sample.emit(epoch_s(), values)
         except Exception as e:
-            self.error.emit(f"Velocity poll failed: {e}")
+            now_m = time.monotonic()
+            if (now_m - self._last_poll_error_mono) >= self._poll_error_cooldown_s:
+                self._last_poll_error_mono = now_m
+                self.error.emit(f"Tag polling failed: {e}")
+
+    @Slot()
+    def get_device_json(self) -> None:
+        """Fetch a JSON dump from the backend in the worker thread."""
+        try:
+            s = self._backend.get_json_dump()
+            self.json_dump_ready.emit(str(s))
+        except Exception as e:
+            self.error.emit(f"Export JSON failed: {e}")
 
 
 # ----------------------------
@@ -743,10 +911,11 @@ class RunEngine(QObject):
     Motor commands are emitted as signals and executed by the worker thread.
     """
 
-    status_changed = Signal(str)                 # "Idle", "Running", "Stopped"
+    status_changed = Signal(str)             # "Idle", "Running", "Stopped"
+    run_mode_changed = Signal(str)           # "idle" | "single" | "recipe"
     active_rpm_changed = Signal(float)
-    remaining_changed = Signal(int)              # seconds remaining in current segment
-    step_info_changed = Signal(str)              # step info for recipe mode
+    remaining_changed = Signal(int)          # seconds remaining in current segment
+    step_info_changed = Signal(str)          # step info for recipe mode
 
     request_set_rpm = Signal(float)
     request_stop = Signal()
@@ -757,7 +926,7 @@ class RunEngine(QObject):
         self._timer.setInterval(ENGINE_TICK_MS)
         self._timer.timeout.connect(self._tick)
 
-        self._mode: str = "idle"                 # "idle" | "single" | "recipe"
+        self._mode: str = "idle"             # "idle" | "single" | "recipe"
         self._status: str = "Idle"
         self._active_rpm: float = 0.0
 
@@ -770,16 +939,28 @@ class RunEngine(QObject):
     def is_running(self) -> bool:
         return self._mode in ("single", "recipe")
 
+    def run_mode(self) -> str:
+        return self._mode
+
     def _set_status(self, status: str) -> None:
         if status != self._status:
             self._status = status
             self.status_changed.emit(status)
 
+    def _set_mode(self, mode: str) -> None:
+        if mode != self._mode:
+            self._mode = mode
+            self.run_mode_changed.emit(mode)
+
+    def _current_remaining_single(self, now: Optional[float] = None) -> int:
+        now = time.monotonic() if now is None else now
+        return int(round(self._single_end_t - now))
+
     @Slot(float, int)
     def start_single(self, rpm: float, duration_s: int) -> None:
         """Start a single timed run; duration must be > 0."""
         self.stop(user_initiated=False)
-        self._mode = "single"
+        self._set_mode("single")
         self._active_rpm = float(rpm)
 
         now = time.monotonic()
@@ -797,7 +978,7 @@ class RunEngine(QObject):
     def start_recipe(self, recipe: Recipe) -> None:
         """Start a multi-step recipe run."""
         self.stop(user_initiated=False)
-        self._mode = "recipe"
+        self._set_mode("recipe")
         self._recipe = recipe
         self._step_idx = 0
 
@@ -821,6 +1002,22 @@ class RunEngine(QObject):
         info = f"Step {self._step_idx + 1}/{len(self._recipe.steps)} • {step.velocity_rpm:g} rpm • {format_mmss(step.duration_s)}"
         self.step_info_changed.emit(info)
 
+    @Slot(int)
+    def adjust_single_remaining(self, delta_s: int) -> None:
+        """
+        Adjust remaining time for SINGLE-TIMER mode only.
+
+        The adjustment is applied to the current remaining time and clamped to [0, TIME_MAX_S].
+        If remaining reaches 0, the run stops as normal.
+        """
+        if self._mode != "single":
+            return
+        now = time.monotonic()
+        remaining = self._current_remaining_single(now)
+        new_remaining = int(clamp(remaining + int(delta_s), 0, TIME_MAX_S))
+        self._single_end_t = now + new_remaining
+        self._tick()
+
     @Slot(bool)
     def stop(self, user_initiated: bool = True) -> None:
         """
@@ -835,7 +1032,7 @@ class RunEngine(QObject):
         if self._mode != "idle":
             self.request_stop.emit()
 
-        self._mode = "idle"
+        self._set_mode("idle")
         self._recipe = None
         self._step_idx = -1
         self._active_rpm = 0.0
@@ -854,7 +1051,7 @@ class RunEngine(QObject):
             remaining = int(round(self._single_end_t - now))
             if remaining <= 0:
                 self.request_stop.emit()
-                self._mode = "idle"
+                self._set_mode("idle")
                 self._active_rpm = 0.0
                 self.active_rpm_changed.emit(0.0)
                 self.remaining_changed.emit(0)
@@ -874,7 +1071,7 @@ class RunEngine(QObject):
                 self._step_idx += 1
                 if self._step_idx >= len(self._recipe.steps):
                     self.request_stop.emit()
-                    self._mode = "idle"
+                    self._set_mode("idle")
                     self._active_rpm = 0.0
                     self.active_rpm_changed.emit(0.0)
                     self.remaining_changed.emit(0)
@@ -900,6 +1097,10 @@ class HistoryDB:
     """
     SQLite storage for time series samples.
 
+    Schema:
+      samples(ts INTEGER epoch_s, tag TEXT, value REAL)
+      index(tag, ts)
+
     Compression:
       - Insert a new row only when value changes beyond a deadband OR a heartbeat interval is exceeded.
     """
@@ -914,6 +1115,7 @@ class HistoryDB:
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_samples_tag_ts ON samples(tag, ts)")
         self._conn.commit()
 
+        # Cache of last written sample per tag: (ts, value)
         self._last: Dict[str, Tuple[int, float]] = {}
 
     def close(self) -> None:
@@ -941,6 +1143,41 @@ class HistoryDB:
 
         return False
 
+    def insert_many_if_needed(
+        self,
+        ts: int,
+        samples: Sequence[Tuple[str, float, float, int]],
+    ) -> List[str]:
+        """
+        Insert multiple tag samples under one commit.
+
+        Each tuple is (tag, value, deadband, heartbeat_s).
+        Returns the list of tags that were inserted.
+        """
+        inserted_tags: List[str] = []
+        to_insert: List[Tuple[int, str, float]] = []
+
+        for tag, value, deadband, heartbeat_s in samples:
+            prev = self._last.get(tag)
+            v = float(value)
+            if prev is None:
+                to_insert.append((ts, tag, v))
+                inserted_tags.append(tag)
+                self._last[tag] = (ts, v)
+                continue
+
+            prev_ts, prev_val = prev
+            if abs(v - prev_val) >= float(deadband) or (ts - prev_ts) >= int(heartbeat_s):
+                to_insert.append((ts, tag, v))
+                inserted_tags.append(tag)
+                self._last[tag] = (ts, v)
+
+        if to_insert:
+            self._conn.executemany("INSERT INTO samples(ts, tag, value) VALUES(?, ?, ?)", to_insert)
+            self._conn.commit()
+
+        return inserted_tags
+
     def query_window(self, now_ts: int, tag: str, minutes: int) -> List[Tuple[int, float]]:
         """Return samples for the given tag within the last N minutes."""
         minutes = max(1, int(minutes))
@@ -951,14 +1188,43 @@ class HistoryDB:
         )
         return [(int(r[0]), float(r[1])) for r in cur.fetchall()]
 
-    def export_window_csv(self, out_path: Path, now_ts: int, tag: str, minutes: int) -> int:
-        """Export the last N minutes to CSV and return the number of exported rows."""
-        rows = self.query_window(now_ts, tag, minutes)
+    def query_window_multi(self, now_ts: int, tags: Sequence[str], minutes: int) -> Dict[str, List[Tuple[int, float]]]:
+        """Return samples for each requested tag within the last N minutes."""
+        out: Dict[str, List[Tuple[int, float]]] = {t: [] for t in tags}
+        for t in tags:
+            out[t] = self.query_window(now_ts, t, minutes)
+        return out
+
+    def export_window_csv_multi(self, out_path: Path, now_ts: int, tags: Sequence[str], minutes: int) -> int:
+        """
+        Export the last N minutes for selected tags to CSV and return number of exported rows.
+
+        CSV format is "long" (one row per sample):
+          ts_epoch_s, ts_iso, tag, value, unit
+        """
+        minutes = max(1, int(minutes))
+        start_ts = now_ts - minutes * 60
+        tags = list(tags)
+        if not tags:
+            out_path.write_text("ts_epoch_s,ts_iso,tag,value,unit\n", encoding="utf-8")
+            return 0
+
+        placeholders = ",".join(["?"] * len(tags))
+        q = (
+            f"SELECT ts, tag, value FROM samples "
+            f"WHERE tag IN ({placeholders}) AND ts>=? AND ts<=? "
+            f"ORDER BY ts ASC, tag ASC"
+        )
+        cur = self._conn.execute(q, (*tags, start_ts, now_ts))
+        rows = [(int(r[0]), str(r[1]), float(r[2])) for r in cur.fetchall()]
+
         with out_path.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["ts_epoch_s", "tag", "value_rpm"])
-            for ts, val in rows:
-                w.writerow([ts, tag, val])
+            w.writerow(["ts_epoch_s", "ts_iso", "tag", "value", "unit"])
+            for ts, tag, val in rows:
+                ts_iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+                w.writerow([ts, ts_iso, tag, f"{val:.6g}", TAG_UNITS.get(tag, "")])
+
         return len(rows)
 
 
@@ -1076,13 +1342,17 @@ class TimeControl(QWidget):
     """
     Time control displayed as mm:ss with +/- step buttons.
 
-    Accepts mm:ss or raw seconds; clamps to [0, TIME_MAX_S].
+    Accepted input: mm:ss or raw seconds; clamps to [0, TIME_MAX_S].
+
+    Supports an optional external adjustment callback used while running in single-timer mode.
     """
+
     value_changed = Signal(int)
 
     def __init__(self, title: str, step_s: int, compact: bool = False) -> None:
         super().__init__()
         self._step_s = int(step_s)
+        self._adjust_cb: Optional[Callable[[int], int]] = None
 
         min_h = 70 if not compact else 58
         btn_w = 110 if not compact else 90
@@ -1126,6 +1396,10 @@ class TimeControl(QWidget):
 
         self._emit_if_valid()
 
+    def set_adjust_callback(self, cb: Optional[Callable[[int], int]]) -> None:
+        """Set a callback for +/- buttons: cb(delta_s) -> new_seconds."""
+        self._adjust_cb = cb
+
     def seconds(self) -> int:
         s = self._parse()
         return int(s if s is not None else 0)
@@ -1136,8 +1410,14 @@ class TimeControl(QWidget):
         self.value_changed.emit(s)
 
     def set_enabled(self, enabled: bool) -> None:
+        self.set_buttons_enabled(enabled)
+        self.set_edit_enabled(enabled)
+
+    def set_buttons_enabled(self, enabled: bool) -> None:
         self.btn_minus.setEnabled(enabled)
         self.btn_plus.setEnabled(enabled)
+
+    def set_edit_enabled(self, enabled: bool) -> None:
         self.edit.setEnabled(enabled)
 
     def _parse(self) -> Optional[int]:
@@ -1156,11 +1436,97 @@ class TimeControl(QWidget):
 
     @Slot()
     def _dec(self) -> None:
+        if self._adjust_cb is not None:
+            new_s = int(self._adjust_cb(-self._step_s))
+            self.set_seconds(new_s)
+            return
         self.set_seconds(self.seconds() - self._step_s)
 
     @Slot()
     def _inc(self) -> None:
+        if self._adjust_cb is not None:
+            new_s = int(self._adjust_cb(+self._step_s))
+            self.set_seconds(new_s)
+            return
         self.set_seconds(self.seconds() + self._step_s)
+
+
+# ----------------------------
+# Shared Status Header + Footer
+# ----------------------------
+
+class StatusHeader(QFrame):
+    """Reusable status header bar shown on Home and Data Logger screens."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("StatusBar")
+        sb = QHBoxLayout(self)
+        sb.setContentsMargins(14, 10, 14, 10)
+        sb.setSpacing(14)
+
+        self.lbl_state = QLabel("State: Idle")
+        self.lbl_vel = QLabel("Velocity: 0 rpm")
+        self.lbl_rem = QLabel("Remaining: 00:00")
+        self.lbl_recipe = QLabel("Recipe: (none)")
+        self.lbl_step = QLabel("")
+        self.lbl_backend = QLabel("")
+
+        for w in (self.lbl_state, self.lbl_vel, self.lbl_rem, self.lbl_recipe):
+            w.setObjectName("StatusLabel")
+        self.lbl_step.setObjectName("StatusStep")
+        self.lbl_backend.setObjectName("StatusBackend")
+
+        sb.addWidget(self.lbl_state)
+        sb.addWidget(self.lbl_vel)
+        sb.addWidget(self.lbl_rem)
+        sb.addWidget(self.lbl_recipe, 1)
+        sb.addWidget(self.lbl_step, 2)
+        sb.addWidget(self.lbl_backend, 1)
+
+    def set_status(
+        self,
+        ui_state: str,
+        rpm: float,
+        remaining_s: int,
+        recipe_name: str,
+        step_info: str,
+        backend_state: str,
+    ) -> None:
+        self.lbl_state.setText(f"State: {ui_state}")
+        self.lbl_vel.setText(f"Velocity: {rpm:g} rpm")
+        self.lbl_rem.setText(f"Remaining: {format_mmss(remaining_s)}")
+        self.lbl_recipe.setText(f"Recipe: {recipe_name}")
+        self.lbl_step.setText(step_info)
+        self.lbl_backend.setText(backend_state)
+
+
+class StartStopFooter(QWidget):
+    """Reusable Start/Stop footer shown on Home and Data Logger screens."""
+
+    start_clicked = Signal()
+    stop_clicked = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        bottom = QHBoxLayout(self)
+        bottom.setContentsMargins(0, 0, 0, 0)
+        bottom.setSpacing(14)
+
+        self.btn_start = TouchButton("Start", min_h=76, min_w=240)
+        self.btn_stop = TouchButton("Stop", min_h=76, min_w=240)
+        self.btn_start.setObjectName("StartButton")
+        self.btn_stop.setObjectName("StopButton")
+
+        bottom.addWidget(self.btn_start, 1)
+        bottom.addWidget(self.btn_stop, 1)
+
+        self.btn_start.clicked.connect(self.start_clicked.emit)
+        self.btn_stop.clicked.connect(self.stop_clicked.emit)
+
+    def set_running_ui(self, running: bool) -> None:
+        self.btn_start.setEnabled(not running)
+        self.btn_stop.setEnabled(running)
 
 
 # ----------------------------
@@ -1521,7 +1887,8 @@ class SettingRowWidget(QFrame):
         else:
             le = self.editor  # type: ignore[assignment]
             assert isinstance(le, QLineEdit)
-            le.setText(f"{float(value):g}")
+            self.editor.setEnabled(True)
+            le.setText(f"{safe_float(value, float(self.spec.default)):g}")
 
     def set_missing(self, missing: bool) -> None:
         """Disable editing and show an unsupported note."""
@@ -1555,9 +1922,9 @@ class ODriveConfigScreen(QWidget):
     """Screen to view/edit important ODrive settings and export configuration."""
 
     back_clicked = Signal()
-    save_clicked = Signal(object)     # dict key->value
+    save_clicked = Signal(object)         # dict key->value
     request_refresh = Signal()
-    export_clicked = Signal(object)   # dict key->value
+    export_clicked = Signal()             # device JSON dump (worker thread)
     restore_defaults_clicked = Signal()
 
     def __init__(self) -> None:
@@ -1624,7 +1991,7 @@ class ODriveConfigScreen(QWidget):
         self.btn_back.clicked.connect(self.back_clicked.emit)
         self.btn_cancel.clicked.connect(self.back_clicked.emit)
         self.btn_save.clicked.connect(self._on_save)
-        self.btn_export.clicked.connect(self._on_export)
+        self.btn_export.clicked.connect(self.export_clicked.emit)
         self.btn_restore.clicked.connect(self.restore_defaults_clicked.emit)
         self.btn_refresh.clicked.connect(self.request_refresh.emit)
 
@@ -1666,22 +2033,290 @@ class ODriveConfigScreen(QWidget):
     def _on_save(self) -> None:
         self.save_clicked.emit(self.gather_values())
 
-    @Slot()
-    def _on_export(self) -> None:
-        self.export_clicked.emit(self.gather_values())
+
+# ----------------------------
+# Data Logger Plot Widgets
+# ----------------------------
+
+class SimplePlotWidget(QWidget):
+    """
+    Fallback lightweight plot widget when QtCharts is not available.
+
+    Draws multiple time-series lines over the last N minutes.
+    """
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumHeight(360)
+        self._data: Dict[str, List[Tuple[int, float]]] = {}
+        self._tags: List[str] = []
+        self._minutes: int = 10
+
+    def set_series_data(self, data: Dict[str, List[Tuple[int, float]]], tags: List[str], minutes: int) -> None:
+        self._data = {k: list(v) for k, v in data.items()}
+        self._tags = list(tags)
+        self._minutes = int(minutes)
+        self.update()
+
+    def append_points(self, points: List[Tuple[str, int, float]], tags: List[str], minutes: int) -> None:
+        self._tags = list(tags)
+        self._minutes = int(minutes)
+        for tag, ts, val in points:
+            self._data.setdefault(tag, []).append((ts, val))
+        cutoff = epoch_s() - self._minutes * 60
+        for t in list(self._data.keys()):
+            self._data[t] = [(ts, v) for ts, v in self._data[t] if ts >= cutoff]
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        rect = self.rect().adjusted(10, 10, -10, -10)
+        p.drawRect(rect)
+
+        tags = [t for t in self._tags if t in self._data]
+        if not tags:
+            p.drawText(rect, Qt.AlignCenter, "No data")
+            return
+
+        # Compute X range (epoch seconds)
+        now_ts = epoch_s()
+        x0 = now_ts - self._minutes * 60
+        x1 = now_ts
+        if x1 <= x0:
+            x1 = x0 + 1
+
+        # Compute Y ranges per group; fallback to combined.
+        y_min = float("inf")
+        y_max = float("-inf")
+        for t in tags:
+            for _, v in self._data.get(t, []):
+                y_min = min(y_min, v)
+                y_max = max(y_max, v)
+        if not math.isfinite(y_min) or not math.isfinite(y_max):
+            p.drawText(rect, Qt.AlignCenter, "No data")
+            return
+        if abs(y_max - y_min) < 1e-6:
+            y_max = y_min + 1.0
+
+        # Margins and mapping.
+        plot = rect.adjusted(50, 10, -10, -30)
+        p.drawRect(plot)
+
+        def map_x(ts: int) -> float:
+            return plot.left() + (ts - x0) / (x1 - x0) * plot.width()
+
+        def map_y(v: float) -> float:
+            return plot.bottom() - (v - y_min) / (y_max - y_min) * plot.height()
+
+        # Draw axes labels.
+        p.drawText(rect.left() + 6, plot.top() + 14, f"{y_max:.3g}")
+        p.drawText(rect.left() + 6, plot.bottom(), f"{y_min:.3g}")
+        p.drawText(plot.left(), rect.bottom() - 6, f"-{self._minutes} min")
+        p.drawText(plot.right() - 60, rect.bottom() - 6, "now")
+
+        # Series colors (simple rotation).
+        colors = [
+            Qt.cyan, Qt.yellow, Qt.green, Qt.magenta, Qt.red,
+            Qt.blue, Qt.gray, Qt.white
+        ]
+
+        # Draw series.
+        for i, t in enumerate(tags):
+            pts = self._data.get(t, [])
+            if len(pts) < 2:
+                continue
+            pen = p.pen()
+            pen.setWidth(2)
+            pen.setColor(colors[i % len(colors)])
+            p.setPen(pen)
+
+            last = None
+            for ts, v in pts:
+                x = map_x(ts)
+                y = map_y(v)
+                if last is not None:
+                    p.drawLine(last[0], last[1], x, y)
+                last = (x, y)
+
+        # Legend.
+        p.setPen(self.palette().text().color())
+        legend = "  ".join([f"{TAG_LABELS.get(t, t)}" for t in tags])
+        p.drawText(rect.adjusted(0, 0, 0, -rect.height() + 20), Qt.AlignLeft | Qt.AlignVCenter, legend)
+
+
+class QtChartsPlot(QWidget):
+    """QtCharts-based plot widget with dual Y axes (RPM vs Other)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._chart = QChart()
+        self._chart.legend().setVisible(True)
+        self._chart.legend().setAlignment(Qt.AlignBottom)
+
+        self._view = QChartView(self._chart)
+        self._view.setRenderHint(QPainter.Antialiasing)
+        self._view.setMinimumHeight(360)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self._view)
+
+        self._series: Dict[str, QLineSeries] = {}
+        self._minutes: int = 10
+        self._tags: List[str] = []
+
+        self._x = QDateTimeAxis()
+        self._x.setFormat("HH:mm:ss")
+        self._x.setTitleText("Time")
+        self._chart.addAxis(self._x, Qt.AlignBottom)
+
+        self._y_rpm = QValueAxis()
+        self._y_rpm.setTitleText("RPM")
+        self._chart.addAxis(self._y_rpm, Qt.AlignLeft)
+
+        self._y_other = QValueAxis()
+        self._y_other.setTitleText("Value")
+        self._chart.addAxis(self._y_other, Qt.AlignRight)
+
+    def _axis_for_tag(self, tag: str) -> QValueAxis:
+        return self._y_rpm if TAG_PLOT_GROUP.get(tag) == PLOT_GROUP_RPM else self._y_other
+
+    def set_series_data(self, data: Dict[str, List[Tuple[int, float]]], tags: List[str], minutes: int) -> None:
+        self._minutes = int(minutes)
+        self._tags = list(tags)
+
+        # Remove old series.
+        for s in list(self._series.values()):
+            self._chart.removeSeries(s)
+        self._series.clear()
+
+        # Add new series.
+        for tag in self._tags:
+            series = QLineSeries()
+            series.setName(TAG_LABELS.get(tag, tag))
+            pts = data.get(tag, [])
+            for ts, val in pts:
+                series.append(float(ts) * 1000.0, float(val))
+            self._chart.addSeries(series)
+            series.attachAxis(self._x)
+            series.attachAxis(self._axis_for_tag(tag))
+            self._series[tag] = series
+
+        self._rescale_axes_from_data()
+
+    def append_points(self, points: List[Tuple[str, int, float]], tags: List[str], minutes: int) -> None:
+        self._minutes = int(minutes)
+        self._tags = list(tags)
+
+        # Ensure series exist for selected tags.
+        existing = set(self._series.keys())
+        for tag in self._tags:
+            if tag in existing:
+                continue
+            series = QLineSeries()
+            series.setName(TAG_LABELS.get(tag, tag))
+            self._chart.addSeries(series)
+            series.attachAxis(self._x)
+            series.attachAxis(self._axis_for_tag(tag))
+            self._series[tag] = series
+
+        # Remove series that are no longer selected.
+        for tag in list(self._series.keys()):
+            if tag not in self._tags:
+                s = self._series.pop(tag)
+                self._chart.removeSeries(s)
+
+        # Append points.
+        cutoff_ms = (epoch_s() - self._minutes * 60) * 1000.0
+        for tag, ts, val in points:
+            if tag not in self._series:
+                continue
+            self._series[tag].append(float(ts) * 1000.0, float(val))
+
+        # Prune old points.
+        for s in self._series.values():
+            n = s.count()
+            if n <= 0:
+                continue
+            # Find first index within window.
+            idx = 0
+            while idx < n:
+                if s.at(idx).x() >= cutoff_ms:
+                    break
+                idx += 1
+            if idx > 0:
+                s.removePoints(0, idx)
+
+        self._rescale_axes_from_series()
+
+    def _rescale_axes_from_data(self) -> None:
+        now_ts = epoch_s()
+        start_ts = now_ts - self._minutes * 60
+        self._x.setRange(QDateTime.fromSecsSinceEpoch(start_ts), QDateTime.fromSecsSinceEpoch(now_ts))
+        self._rescale_axes_from_series()
+
+    def _rescale_axes_from_series(self) -> None:
+        # Compute min/max per group from current series points.
+        rpm_vals: List[float] = []
+        other_vals: List[float] = []
+
+        for tag, s in self._series.items():
+            pts = s.pointsVector()
+            if not pts:
+                continue
+            group = TAG_PLOT_GROUP.get(tag, PLOT_GROUP_OTHER)
+            for pt in pts:
+                if group == PLOT_GROUP_RPM:
+                    rpm_vals.append(float(pt.y()))
+                else:
+                    other_vals.append(float(pt.y()))
+
+        def apply_axis(axis: QValueAxis, vals: List[float]) -> None:
+            if not vals:
+                axis.setRange(0.0, 1.0)
+                return
+            vmin = min(vals)
+            vmax = max(vals)
+            if abs(vmax - vmin) < 1e-9:
+                vmax = vmin + 1.0
+            pad = 0.05 * (vmax - vmin)
+            axis.setRange(vmin - pad, vmax + pad)
+
+        apply_axis(self._y_rpm, rpm_vals)
+        apply_axis(self._y_other, other_vals)
+
+
+def make_plot_widget() -> QWidget:
+    if QTCHARTS_AVAILABLE:
+        return QtChartsPlot()
+    return SimplePlotWidget()
 
 
 # ----------------------------
-# Velocity History Screen
+# Data Logger Screen
 # ----------------------------
 
-class VelocityHistoryScreen(QWidget):
-    """Screen to view and export velocity history stored in SQLite."""
+class DataLoggerScreen(QWidget):
+    """
+    Screen to view and export time-series data stored in SQLite.
+
+    Requirements:
+      - Can be entered while running
+      - Includes same status summary header and Start/Stop footer as Home
+      - Shows live time-series line plot
+      - Selectable tags with default enabled p_w and commanded rpm
+      - Minutes window control
+      - Export displayed window to CSV in Downloads folder
+    """
 
     back_clicked = Signal()
-    export_clicked = Signal(int)            # minutes window
-    window_changed = Signal(int)            # minutes window
-    screen_visible = Signal(bool)           # True on enter, False on leave
+    start_clicked = Signal()
+    stop_clicked = Signal()
+    window_changed = Signal(int)
+    tags_changed = Signal(object)          # list[str]
+    export_clicked = Signal(int, object)   # minutes, list[str]
 
     def __init__(self) -> None:
         super().__init__()
@@ -1695,7 +2330,7 @@ class VelocityHistoryScreen(QWidget):
         top.setSpacing(12)
 
         self.btn_back = TouchButton("Back", min_h=66, min_w=170)
-        self.title = QLabel("Velocity History")
+        self.title = QLabel("Data Logger")
         self.title.setObjectName("ScreenTitle")
 
         self.btn_export = TouchButton("Export CSV", min_h=66, min_w=200)
@@ -1705,12 +2340,38 @@ class VelocityHistoryScreen(QWidget):
         top.addWidget(self.btn_export)
         root.addLayout(top)
 
-        controls = QHBoxLayout()
-        controls.setSpacing(12)
+        self.status = StatusHeader()
+        root.addWidget(self.status)
 
-        lbl = QLabel("Window (min)")
-        lbl.setObjectName("FieldLabel")
-        lbl.setMinimumWidth(180)
+        body = QHBoxLayout()
+        body.setSpacing(12)
+
+        # Left panel: tag selection + window control.
+        left = QVBoxLayout()
+        left.setSpacing(12)
+
+        lbl_tags = QLabel("Tags")
+        lbl_tags.setObjectName("SectionTitle")
+        left.addWidget(lbl_tags)
+
+        self._tag_checks: Dict[str, QCheckBox] = {}
+        tags_order = [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_VBUS_V, TAG_IBUS_A]
+        for tag in tags_order:
+            cb = QCheckBox(TAG_LABELS.get(tag, tag))
+            cb.setChecked(tag in DEFAULT_ENABLED_TAGS)
+            cb.setMinimumHeight(44)
+            cb.stateChanged.connect(self._on_tags_changed)
+            self._tag_checks[tag] = cb
+            left.addWidget(cb)
+
+        left.addStretch(1)
+
+        win_row = QHBoxLayout()
+        win_row.setSpacing(12)
+
+        lbl_win = QLabel("Minutes to display")
+        lbl_win.setObjectName("FieldLabel")
+        lbl_win.setMinimumWidth(260)
 
         self.edit_min = QLineEdit()
         self.edit_min.setMinimumHeight(66)
@@ -1720,94 +2381,59 @@ class VelocityHistoryScreen(QWidget):
 
         self.btn_apply = TouchButton("Apply", min_h=66, min_w=170)
 
-        self.lbl_latest = QLabel("Latest: — rpm")
-        self.lbl_latest.setObjectName("InfoLabel")
+        win_row.addWidget(lbl_win)
+        win_row.addWidget(self.edit_min, 1)
+        win_row.addWidget(self.btn_apply)
+        left.addLayout(win_row)
 
-        self.lbl_logging = QLabel("Logging: OFF")
-        self.lbl_logging.setObjectName("InfoLabel")
+        body.addLayout(left, 1)
 
-        controls.addWidget(lbl)
-        controls.addWidget(self.edit_min)
-        controls.addWidget(self.btn_apply)
-        controls.addStretch(1)
-        controls.addWidget(self.lbl_latest)
-        controls.addWidget(self.lbl_logging)
+        # Right panel: plot
+        self.plot = make_plot_widget()
+        body.addWidget(self.plot, 2)
 
-        root.addLayout(controls)
+        root.addLayout(body, 1)
 
-        self.table = QTableWidget()
-        self.table.setColumnCount(2)
-        self.table.setHorizontalHeaderLabels(["Time", "Velocity (rpm)"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SingleSelection)
-        self.table.setAlternatingRowColors(True)
-        self.table.setObjectName("HistoryTable")
-        self.table.horizontalHeader().setStretchLastSection(True)
-
-        root.addWidget(self.table, 1)
+        self.footer = StartStopFooter()
+        root.addWidget(self.footer)
 
         self.btn_back.clicked.connect(self.back_clicked.emit)
-        self.btn_export.clicked.connect(self._on_export)
+        self.footer.start_clicked.connect(self.start_clicked.emit)
+        self.footer.stop_clicked.connect(self.stop_clicked.emit)
         self.btn_apply.clicked.connect(self._on_apply)
         self.edit_min.editingFinished.connect(self._on_apply)
+        self.btn_export.clicked.connect(self._on_export)
 
-    def set_logging_active(self, active: bool) -> None:
-        """Update status label when polling/logging is active."""
-        self.lbl_logging.setText("Logging: ON" if active else "Logging: OFF")
+    def set_status(
+        self,
+        ui_state: str,
+        rpm: float,
+        remaining_s: int,
+        recipe_name: str,
+        step_info: str,
+        backend_state: str,
+    ) -> None:
+        self.status.set_status(ui_state, rpm, remaining_s, recipe_name, step_info, backend_state)
 
-    def set_latest_rpm(self, rpm: float) -> None:
-        """Update the latest value label with the most recently polled RPM."""
-        self.lbl_latest.setText(f"Latest: {rpm:.1f} rpm")
+    def set_running_ui(self, running: bool) -> None:
+        self.footer.set_running_ui(running)
 
     def minutes_window(self) -> int:
-        """Return current minutes window."""
         try:
             return max(1, int(self.edit_min.text()))
         except Exception:
             return 10
 
-    def load_rows(self, rows: List[Tuple[int, float]]) -> None:
-        """Replace the table contents with the provided rows."""
-        self.table.setRowCount(0)
-        for ts, val in rows:
-            self._append_row(ts, val)
-        self._scroll_to_bottom()
+    def selected_tags(self) -> List[str]:
+        return [t for t, cb in self._tag_checks.items() if cb.isChecked()]
 
-    def append_row(self, ts: int, val: float) -> None:
-        """Append a row to the table."""
-        self._append_row(ts, val)
-        self._scroll_to_bottom()
+    def set_series_data(self, data: Dict[str, List[Tuple[int, float]]], tags: List[str], minutes: int) -> None:
+        if isinstance(self.plot, QtChartsPlot) or isinstance(self.plot, SimplePlotWidget):
+            self.plot.set_series_data(data, tags, minutes)  # type: ignore[attr-defined]
 
-    def prune_older_than(self, cutoff_ts: int) -> None:
-        """Remove table rows older than cutoff_ts."""
-        # Rows are sorted by time ascending; remove from top until within window.
-        while self.table.rowCount() > 0:
-            item = self.table.item(0, 0)
-            if item is None:
-                break
-            ts = int(item.data(Qt.UserRole) or 0)
-            if ts >= cutoff_ts:
-                break
-            self.table.removeRow(0)
-
-    def _append_row(self, ts: int, val: float) -> None:
-        r = self.table.rowCount()
-        self.table.insertRow(r)
-
-        t_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
-        it0 = QTableWidgetItem(t_str)
-        it0.setData(Qt.UserRole, ts)
-
-        it1 = QTableWidgetItem(f"{val:.2f}")
-
-        self.table.setItem(r, 0, it0)
-        self.table.setItem(r, 1, it1)
-
-    def _scroll_to_bottom(self) -> None:
-        if self.table.rowCount() > 0:
-            self.table.scrollToBottom()
+    def append_points(self, points: List[Tuple[str, int, float]], tags: List[str], minutes: int) -> None:
+        if isinstance(self.plot, QtChartsPlot) or isinstance(self.plot, SimplePlotWidget):
+            self.plot.append_points(points, tags, minutes)  # type: ignore[attr-defined]
 
     @Slot()
     def _on_apply(self) -> None:
@@ -1815,8 +2441,13 @@ class VelocityHistoryScreen(QWidget):
         self.window_changed.emit(mins)
 
     @Slot()
+    def _on_tags_changed(self) -> None:
+        self.tags_changed.emit(self.selected_tags())
+
+    @Slot()
     def _on_export(self) -> None:
-        self.export_clicked.emit(self.minutes_window())
+        mins = self.minutes_window()
+        self.export_clicked.emit(mins, self.selected_tags())
 
 
 # ----------------------------
@@ -1829,11 +2460,10 @@ class HomeScreen(QWidget):
     start_clicked = Signal()
     stop_clicked = Signal()
     open_builder_clicked = Signal()
-    clear_selection_clicked = Signal()
     recipe_select_clicked = Signal(str)
     recipe_edit_clicked = Signal(str)
     open_config_clicked = Signal()
-    open_history_clicked = Signal()
+    open_datalogger_clicked = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -1841,31 +2471,7 @@ class HomeScreen(QWidget):
         root.setContentsMargins(16, 14, 16, 14)
         root.setSpacing(12)
 
-        self.status_bar = QFrame()
-        self.status_bar.setObjectName("StatusBar")
-        sb = QHBoxLayout(self.status_bar)
-        sb.setContentsMargins(14, 10, 14, 10)
-        sb.setSpacing(14)
-
-        self.lbl_state = QLabel("State: Idle")
-        self.lbl_vel = QLabel("Velocity: 0 rpm")
-        self.lbl_rem = QLabel("Remaining: 00:00")
-        self.lbl_recipe = QLabel("Recipe: (none)")
-        self.lbl_step = QLabel("")
-        self.lbl_backend = QLabel("")
-
-        for w in (self.lbl_state, self.lbl_vel, self.lbl_rem, self.lbl_recipe):
-            w.setObjectName("StatusLabel")
-        self.lbl_step.setObjectName("StatusStep")
-        self.lbl_backend.setObjectName("StatusBackend")
-
-        sb.addWidget(self.lbl_state)
-        sb.addWidget(self.lbl_vel)
-        sb.addWidget(self.lbl_rem)
-        sb.addWidget(self.lbl_recipe, 1)
-        sb.addWidget(self.lbl_step, 2)
-        sb.addWidget(self.lbl_backend, 1)
-
+        self.status_bar = StatusHeader()
         root.addWidget(self.status_bar)
 
         mid = QHBoxLayout()
@@ -1879,15 +2485,13 @@ class HomeScreen(QWidget):
 
         self.btn_builder = TouchButton("Recipe Builder", min_h=70, min_w=240)
         self.btn_config = TouchButton("ODrive Configuration", min_h=70, min_w=240)
-        self.btn_history = TouchButton("Velocity History", min_h=70, min_w=240)
-        self.btn_clear = TouchButton("Clear Selection", min_h=70, min_w=240)
+        self.btn_datalogger = TouchButton("Data Logger", min_h=70, min_w=240)
 
         left.addWidget(self.rpm_ctl)
         left.addWidget(self.time_ctl)
         left.addWidget(self.btn_builder)
         left.addWidget(self.btn_config)
-        left.addWidget(self.btn_history)
-        left.addWidget(self.btn_clear)
+        left.addWidget(self.btn_datalogger)
         left.addStretch(1)
 
         mid.addLayout(left, 1)
@@ -1915,24 +2519,14 @@ class HomeScreen(QWidget):
         mid.addLayout(recipes_col, 2)
         root.addLayout(mid, 1)
 
-        bottom = QHBoxLayout()
-        bottom.setSpacing(14)
+        self.footer = StartStopFooter()
+        root.addWidget(self.footer)
 
-        self.btn_start = TouchButton("Start", min_h=76, min_w=240)
-        self.btn_stop = TouchButton("Stop", min_h=76, min_w=240)
-        self.btn_start.setObjectName("StartButton")
-        self.btn_stop.setObjectName("StopButton")
-
-        bottom.addWidget(self.btn_start, 1)
-        bottom.addWidget(self.btn_stop, 1)
-        root.addLayout(bottom)
-
-        self.btn_start.clicked.connect(self.start_clicked.emit)
-        self.btn_stop.clicked.connect(self.stop_clicked.emit)
+        self.footer.start_clicked.connect(self.start_clicked.emit)
+        self.footer.stop_clicked.connect(self.stop_clicked.emit)
         self.btn_builder.clicked.connect(self.open_builder_clicked.emit)
-        self.btn_clear.clicked.connect(self.clear_selection_clicked.emit)
         self.btn_config.clicked.connect(self.open_config_clicked.emit)
-        self.btn_history.clicked.connect(self.open_history_clicked.emit)
+        self.btn_datalogger.clicked.connect(self.open_datalogger_clicked.emit)
 
     def set_recipe_cards(self, recipes: List[Recipe], selected_id: Optional[str]) -> None:
         """Rebuild the recipe card list."""
@@ -1949,28 +2543,46 @@ class HomeScreen(QWidget):
             card.edit_clicked.connect(self.recipe_edit_clicked.emit)
             self.recipes_layout.insertWidget(self.recipes_layout.count() - 1, card)
 
-    def set_running_ui(self, running: bool) -> None:
+    def set_timer_enabled_for_recipe_selection(self, enabled: bool) -> None:
+        """Disable the manual timer input when a recipe is selected (idle state)."""
+        self.time_ctl.set_enabled(enabled)
+
+    def set_running_ui(self, running: bool, run_mode: str, recipe_selected: bool) -> None:
         """
         Enforce key home-screen behaviors:
           - Start disabled while running
           - Stop enabled only while running
-          - Lock inputs and navigation while running
+          - Lock recipe selection and most navigation while running
+          - Allow entering Data Logger during runs
+          - In single-timer mode: keep +/- enabled while running, but keep text field disabled
         """
-        self.btn_start.setEnabled(not running)
-        self.btn_stop.setEnabled(running)
+        self.footer.set_running_ui(running)
 
+        # RPM control is not editable while running.
         self.rpm_ctl.set_enabled(not running)
-        self.time_ctl.set_enabled(not running)
 
+        if running:
+            if run_mode == "single":
+                # Allow +/- adjustment while running, but prevent editing the text field.
+                self.time_ctl.set_adjust_callback(None)  # callback is configured by controller; don't clear here.
+                self.time_ctl.set_buttons_enabled(True)
+                self.time_ctl.set_edit_enabled(False)
+            else:
+                # Recipe mode: timer controls stay locked.
+                self.time_ctl.set_adjust_callback(None)
+                self.time_ctl.set_enabled(False)
+        else:
+            # Idle: timer control depends on whether a recipe is selected.
+            self.time_ctl.set_adjust_callback(None)
+            self.time_ctl.set_enabled(not recipe_selected)
+
+        # Navigation rules while running.
         self.btn_builder.setEnabled(not running)
         self.btn_config.setEnabled(not running)
-        self.btn_history.setEnabled(not running)
-        self.btn_clear.setEnabled(not running)
-        self.recipes_area.setEnabled(not running)
+        self.btn_datalogger.setEnabled(True)
 
-    def set_timer_enabled(self, enabled: bool) -> None:
-        """Disable the manual timer input when a recipe is selected."""
-        self.time_ctl.set_enabled(enabled)
+        # Recipe selection remains locked during runs.
+        self.recipes_area.setEnabled(not running)
 
     def set_status(
         self,
@@ -1981,12 +2593,7 @@ class HomeScreen(QWidget):
         step_info: str,
         backend_state: str,
     ) -> None:
-        self.lbl_state.setText(f"State: {ui_state}")
-        self.lbl_vel.setText(f"Velocity: {rpm:g} rpm")
-        self.lbl_rem.setText(f"Remaining: {format_mmss(remaining_s)}")
-        self.lbl_recipe.setText(f"Recipe: {recipe_name}")
-        self.lbl_step.setText(step_info)
-        self.lbl_backend.setText(backend_state)
+        self.status_bar.set_status(ui_state, rpm, remaining_s, recipe_name, step_info, backend_state)
 
 
 # ----------------------------
@@ -1999,15 +2606,18 @@ class AppController(QObject):
       - Manages selection state and start/stop rules
       - Persists recipes via RecipeStore
       - Drives RunEngine and sends motor commands to OdriveWorker
-      - Manages additional screens (ODrive config and velocity historian)
+      - Manages screens (ODrive config and Data Logger)
+      - Logs selected tags to SQLite with compression and provides plot/export
       - Ensures safe shutdown by stopping the motor when exiting
     """
 
     request_connect = Signal()
-    request_read_config = Signal(object)     # list[str]
-    request_apply_config = Signal(object)    # dict
+    request_read_config = Signal(object)         # list[str]
+    request_apply_config = Signal(object)        # dict
+    request_set_polled_tags = Signal(object)     # list[str]
     request_start_poll = Signal()
     request_stop_poll = Signal()
+    request_get_json = Signal()
 
     def __init__(
         self,
@@ -2015,14 +2625,14 @@ class AppController(QObject):
         home: HomeScreen,
         builder: RecipeBuilderScreen,
         cfg: ODriveConfigScreen,
-        hist: VelocityHistoryScreen,
+        dlog: DataLoggerScreen,
     ) -> None:
         super().__init__()
         self.stack = stack
         self.home = home
         self.builder = builder
         self.cfg = cfg
-        self.hist = hist
+        self.dlog = dlog
 
         self.store = RecipeStore()
         self.store.load()
@@ -2031,15 +2641,22 @@ class AppController(QObject):
         self.connected: bool = False
         self.backend_state: str = "Disconnected"
 
+        # UI state shown in status bars (commanded RPM and remaining reflect engine state).
         self._ui_state = "Idle"
         self._ui_rpm = 0.0
         self._ui_remaining = 0
         self._ui_step_info = ""
+        self._run_mode = "idle"  # idle|single|recipe
+
+        # Track commanded RPM robustly (used for logging even if tag polling fails).
+        self._cmd_rpm: float = 0.0
+
+        # Data Logger selection and window.
+        self._dlog_minutes = 10
+        self._dlog_selected_tags: List[str] = list(DEFAULT_ENABLED_TAGS)
 
         # Historian store (SQLite in config dir).
         self.history_db = HistoryDB(app_config_dir() / "history.sqlite")
-        self._history_window_min = 10
-        self._history_active = False
 
         # Backend + worker thread.
         backend: OdriveInterface = SimulatedOdrive() if BACKEND == "sim" else RealOdrive()
@@ -2058,19 +2675,24 @@ class AppController(QObject):
         self.request_connect.connect(self.worker.connect_backend)
         self.request_read_config.connect(self.worker.read_config)
         self.request_apply_config.connect(self.worker.apply_config)
-        self.request_start_poll.connect(self.worker.start_velocity_polling)
-        self.request_stop_poll.connect(self.worker.stop_velocity_polling)
+        self.request_set_polled_tags.connect(self.worker.set_polled_tags)
+        self.request_start_poll.connect(self.worker.start_tag_polling)
+        self.request_stop_poll.connect(self.worker.stop_tag_polling)
+        self.request_get_json.connect(self.worker.get_device_json)
 
         # Worker -> controller/UI.
         self.worker.connected_changed.connect(self._on_connected)
         self.worker.state_changed.connect(self._on_backend_state)
+        self.worker.rpm_commanded.connect(self._on_worker_rpm_commanded)
         self.worker.error.connect(self._on_worker_error)
         self.worker.config_read.connect(self._on_config_read)
         self.worker.config_applied.connect(self._on_config_applied)
-        self.worker.velocity_sample.connect(self._on_velocity_sample)
+        self.worker.tags_sample.connect(self._on_tags_sample)
+        self.worker.json_dump_ready.connect(self._on_json_dump_ready)
 
         # Engine -> UI.
         self.engine.status_changed.connect(self._on_engine_status)
+        self.engine.run_mode_changed.connect(self._on_engine_mode)
         self.engine.active_rpm_changed.connect(self._on_engine_rpm)
         self.engine.remaining_changed.connect(self._on_engine_remaining)
         self.engine.step_info_changed.connect(self._on_step_info)
@@ -2079,11 +2701,10 @@ class AppController(QObject):
         self.home.start_clicked.connect(self.on_start)
         self.home.stop_clicked.connect(self.on_stop)
         self.home.open_builder_clicked.connect(self.on_open_builder_new)
-        self.home.clear_selection_clicked.connect(self.on_clear_selection)
         self.home.recipe_select_clicked.connect(self.on_select_recipe)
         self.home.recipe_edit_clicked.connect(self.on_edit_recipe)
         self.home.open_config_clicked.connect(self.on_open_config)
-        self.home.open_history_clicked.connect(self.on_open_history)
+        self.home.open_datalogger_clicked.connect(self.on_open_datalogger)
 
         # Builder UI -> controller.
         self.builder.back_clicked.connect(self.on_back_home)
@@ -2095,27 +2716,40 @@ class AppController(QObject):
         self.cfg.request_refresh.connect(self._refresh_odrive_config)
         self.cfg.save_clicked.connect(self._save_odrive_config)
         self.cfg.restore_defaults_clicked.connect(self._restore_odrive_defaults)
-        self.cfg.export_clicked.connect(self._export_odrive_config)
+        self.cfg.export_clicked.connect(self._export_device_json)
 
-        # History UI -> controller.
-        self.hist.back_clicked.connect(self.on_back_home)
-        self.hist.window_changed.connect(self._on_history_window_changed)
-        self.hist.export_clicked.connect(self._export_history_csv)
+        # Data Logger UI -> controller.
+        self.dlog.back_clicked.connect(self.on_back_home)
+        self.dlog.start_clicked.connect(self.on_start)
+        self.dlog.stop_clicked.connect(self.on_stop)
+        self.dlog.window_changed.connect(self._on_dlog_window_changed)
+        self.dlog.tags_changed.connect(self._on_dlog_tags_changed)
+        self.dlog.export_clicked.connect(self._export_datalogger_csv)
 
-        # Track screen changes to start/stop polling automatically.
+        # On screen change: refresh plot when Data Logger is entered.
         self.stack.currentChanged.connect(self._on_screen_changed)
+
+        # Periodic logging of commanded RPM even if ODrive tag polling fails.
+        self._cmd_log_timer = QTimer(self)
+        self._cmd_log_timer.setInterval(LOG_POLL_MS)
+        self._cmd_log_timer.timeout.connect(self._log_cmd_rpm)
+        self._cmd_log_timer.start()
 
         # Start worker thread and connect backend.
         self.worker_thread.start()
         self.request_connect.emit()
 
+        # Configure polled tags (raw).
+        self.request_set_polled_tags.emit([TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM])
+
         # Initial UI build.
         self._refresh_recipes()
-        self._refresh_home()
+        self._refresh_status_all()
+        self._apply_home_controls()
 
     def shutdown(self) -> None:
         """
-        Stop the motor safely if running, stop historian polling, and shut down the worker thread.
+        Stop the motor safely if running, stop tag polling, and shut down the worker thread.
         """
         try:
             self.request_stop_poll.emit()
@@ -2151,9 +2785,9 @@ class AppController(QObject):
 
     def _refresh_recipes(self) -> None:
         self.home.set_recipe_cards(self._recipes(), self.selected_recipe_id)
-        self.home.set_timer_enabled(enabled=(self._selected_recipe() is None))
+        self.home.set_timer_enabled_for_recipe_selection(enabled=(self._selected_recipe() is None))
 
-    def _refresh_home(self) -> None:
+    def _refresh_status_all(self) -> None:
         selected = self._selected_recipe()
         recipe_name = selected.name if selected else "(none)"
         self.home.set_status(
@@ -2164,7 +2798,40 @@ class AppController(QObject):
             step_info=self._ui_step_info,
             backend_state=self.backend_state,
         )
-        self.home.set_running_ui(self.engine.is_running())
+        self.dlog.set_status(
+            ui_state=self._ui_state,
+            rpm=self._ui_rpm,
+            remaining_s=self._ui_remaining,
+            recipe_name=recipe_name,
+            step_info=self._ui_step_info,
+            backend_state=self.backend_state,
+        )
+
+    def _apply_home_controls(self) -> None:
+        recipe_selected = self._selected_recipe() is not None
+        running = self.engine.is_running()
+
+        # Configure manual timer behavior for single-timer mode while running.
+        if running and self._run_mode == "single" and not recipe_selected:
+            # +/- buttons adjust engine remaining time; clamp handled in engine.
+            self.home.time_ctl.set_adjust_callback(self._adjust_time_from_home)
+            self.home.time_ctl.set_buttons_enabled(True)
+            self.home.time_ctl.set_edit_enabled(False)
+        else:
+            self.home.time_ctl.set_adjust_callback(None)
+
+        self.home.set_running_ui(running=running, run_mode=self._run_mode, recipe_selected=recipe_selected)
+        self.dlog.set_running_ui(running=running)
+
+    def _adjust_time_from_home(self, delta_s: int) -> int:
+        """
+        Callback used by Home timer +/- buttons while running in single-timer mode.
+        Returns the updated remaining time in seconds for display.
+        """
+        if self._run_mode != "single":
+            return self._ui_remaining
+        self.engine.adjust_single_remaining(int(delta_s))
+        return int(clamp(self._ui_remaining, 0, TIME_MAX_S))
 
     # ---- Worker callbacks ----
 
@@ -2172,6 +2839,13 @@ class AppController(QObject):
     def _on_connected(self, connected: bool, state: str) -> None:
         self.connected = connected
         self.backend_state = state
+
+        # Start polling after successful connect (or always for sim).
+        if connected:
+            self.request_start_poll.emit()
+        else:
+            self.request_stop_poll.emit()
+
         if BACKEND == "real" and not connected:
             QMessageBox.critical(
                 self.home,
@@ -2179,12 +2853,19 @@ class AppController(QObject):
                 "ODrive is not connected.\n\n"
                 "Check power/USB and ensure the odrive Python package is installed.",
             )
-        self._refresh_home()
+
+        self._refresh_status_all()
+        self._apply_home_controls()
 
     @Slot(str)
     def _on_backend_state(self, state: str) -> None:
         self.backend_state = state
-        self._refresh_home()
+        self._refresh_status_all()
+
+    @Slot(float)
+    def _on_worker_rpm_commanded(self, rpm: float) -> None:
+        # Keep a redundant tracking source.
+        self._cmd_rpm = float(rpm)
 
     @Slot(str)
     def _on_worker_error(self, msg: str) -> None:
@@ -2193,8 +2874,13 @@ class AppController(QObject):
         """
         if self.engine.is_running():
             self.engine.stop(user_initiated=True)
+            try:
+                QMetaObject.invokeMethod(self.worker, "stop", Qt.BlockingQueuedConnection)
+            except Exception:
+                pass
         QMessageBox.critical(self.stack.currentWidget(), "ODrive Error", msg)
-        self._refresh_home()
+        self._refresh_status_all()
+        self._apply_home_controls()
 
     @Slot(object, object)
     def _on_config_read(self, values_obj: Any, missing_obj: Any) -> None:
@@ -2216,91 +2902,110 @@ class AppController(QObject):
         else:
             QMessageBox.critical(self.cfg, "Configuration", message)
 
-    @Slot(int, float)
-    def _on_velocity_sample(self, ts: int, rpm: float) -> None:
+    @Slot(int, object)
+    def _on_tags_sample(self, ts: int, values_obj: Any) -> None:
         """
-        Handle polled velocity:
-          - Update live label
-          - Store in SQLite using compression
-          - Update table when a stored point is added
+        Handle polled tags:
+          - Compute p_w = vbus_voltage * ibus
+          - Store selected and raw signals in SQLite using per-tag compression
+          - Stream inserted samples to the Data Logger plot when visible
         """
-        if self.stack.currentWidget() is self.hist:
-            self.hist.set_latest_rpm(rpm)
+        values: Dict[str, float] = {str(k): safe_float(v) for k, v in dict(values_obj or {}).items()}
 
-        inserted = False
+        vbus = values.get(TAG_VBUS_V, float("nan"))
+        ibus = values.get(TAG_IBUS_A, float("nan"))
+        if math.isfinite(vbus) and math.isfinite(ibus):
+            values[TAG_PWR_W] = float(vbus * ibus)
+
+        # Always include commanded RPM in the snapshot for aligned timestamps (also logged independently).
+        values[TAG_CMD_RPM] = float(self._cmd_rpm)
+
+        # Prepare inserts for known tags that are present in snapshot.
+        samples: List[Tuple[str, float, float, int]] = []
+        for tag in [TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM, TAG_PWR_W, TAG_CMD_RPM]:
+            if tag in values and math.isfinite(values[tag]):
+                samples.append(
+                    (
+                        tag,
+                        float(values[tag]),
+                        float(TAG_DEADBAND.get(tag, 0.0)),
+                        int(TAG_HEARTBEAT_S.get(tag, DB_HEARTBEAT_S_DEFAULT)),
+                    )
+                )
+
         try:
-            inserted = self.history_db.insert_if_needed(
-                ts=ts,
-                tag=HIST_TAG,
-                value=rpm,
-                deadband=HIST_DEADBAND_RPM,
-                heartbeat_s=HIST_HEARTBEAT_S,
-            )
+            inserted = self.history_db.insert_many_if_needed(ts=ts, samples=samples)
         except Exception as e:
-            QMessageBox.critical(self.hist, "History DB", f"Failed to write sample: {e}")
+            QMessageBox.critical(self.dlog, "Data Logger DB", f"Failed to write sample(s): {e}")
             return
 
-        if self.stack.currentWidget() is self.hist and inserted:
-            cutoff = ts - self._history_window_min * 60
-            self.hist.append_row(ts, rpm)
-            self.hist.prune_older_than(cutoff)
+        # Stream only inserted samples for selected tags to the plot.
+        if self.stack.currentWidget() is self.dlog and inserted:
+            selected = set(self._dlog_selected_tags)
+            points: List[Tuple[str, int, float]] = []
+            for tag in inserted:
+                if tag in selected:
+                    points.append((tag, ts, float(values[tag])))
+            if points:
+                self.dlog.append_points(points, tags=self._dlog_selected_tags, minutes=self._dlog_minutes)
+
+    @Slot(str)
+    def _on_json_dump_ready(self, cfg_json: str) -> None:
+        out = downloads_dir() / f"odrive_device_dump_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        try:
+            out.write_text(str(cfg_json), encoding="utf-8")
+            QMessageBox.information(self.cfg, "Export JSON", f"Exported device JSON to:\n{out}")
+            self.cfg.set_loading("Export complete")
+        except Exception as e:
+            QMessageBox.critical(self.cfg, "Export JSON", f"Failed to save JSON:\n{e}")
+            self.cfg.set_loading("Export failed")
 
     # ---- Engine callbacks ----
 
     @Slot(str)
     def _on_engine_status(self, status: str) -> None:
         self._ui_state = status
-        self._refresh_home()
+        self._refresh_status_all()
+        self._apply_home_controls()
+
+    @Slot(str)
+    def _on_engine_mode(self, mode: str) -> None:
+        self._run_mode = mode
+        self._apply_home_controls()
 
     @Slot(float)
     def _on_engine_rpm(self, rpm: float) -> None:
         self._ui_rpm = float(rpm)
-        self._refresh_home()
+        self._cmd_rpm = float(rpm)
+        self._refresh_status_all()
+        self._apply_home_controls()
 
     @Slot(int)
     def _on_engine_remaining(self, seconds: int) -> None:
         self._ui_remaining = int(seconds)
-        self._refresh_home()
+        self._refresh_status_all()
+
+        # While running in single mode, keep the timer display updated with remaining time.
+        if self.engine.is_running() and self._run_mode == "single":
+            try:
+                self.home.time_ctl.set_seconds(int(clamp(self._ui_remaining, 0, TIME_MAX_S)))
+            except Exception:
+                pass
 
     @Slot(str)
     def _on_step_info(self, info: str) -> None:
         self._ui_step_info = info
-        self._refresh_home()
+        self._refresh_status_all()
 
     # ---- Screen change handling ----
 
     @Slot(int)
     def _on_screen_changed(self, _idx: int) -> None:
-        """
-        Start/stop velocity polling based on whether the history screen is active.
-        """
-        if self.stack.currentWidget() is self.hist:
-            self._start_history_logging()
-        else:
-            self._stop_history_logging()
-
-    def _start_history_logging(self) -> None:
-        if self._history_active:
-            return
-        self._history_active = True
-        self.hist.set_logging_active(True)
-        self.request_start_poll.emit()
-
-        # Load current window from DB into the table.
-        self._history_window_min = self.hist.minutes_window()
-        try:
-            rows = self.history_db.query_window(epoch_s(), HIST_TAG, self._history_window_min)
-        except Exception as e:
-            QMessageBox.critical(self.hist, "History DB", f"Failed to load samples: {e}")
-            rows = []
-        self.hist.load_rows(rows)
-
-    def _stop_history_logging(self) -> None:
-        if not self._history_active:
-            return
-        self._history_active = False
-        self.hist.set_logging_active(False)
-        self.request_stop_poll.emit()
+        if self.stack.currentWidget() is self.dlog:
+            # Sync Data Logger controls and refresh plot for current selection/window.
+            self._dlog_minutes = self.dlog.minutes_window()
+            self._dlog_selected_tags = self.dlog.selected_tags() or list(DEFAULT_ENABLED_TAGS)
+            self._refresh_datalogger_plot()
 
     # ---- Home actions ----
 
@@ -2320,6 +3025,8 @@ class AppController(QObject):
             if duration <= 0:
                 QMessageBox.information(self.home, "Start", "Set a timer or select a recipe.")
                 return
+            # Seed the timer display at start.
+            self.home.time_ctl.set_seconds(int(clamp(duration, 0, TIME_MAX_S)))
             self.engine.start_single(rpm, duration)
             return
 
@@ -2348,24 +3055,19 @@ class AppController(QObject):
         self._refresh_odrive_config()
 
     @Slot()
-    def on_open_history(self) -> None:
-        if self.engine.is_running():
-            return
-        self.stack.setCurrentWidget(self.hist)
+    def on_open_datalogger(self) -> None:
+        # Must be accessible while running.
+        self.stack.setCurrentWidget(self.dlog)
+        self._dlog_minutes = self.dlog.minutes_window()
+        self._dlog_selected_tags = self.dlog.selected_tags() or list(DEFAULT_ENABLED_TAGS)
+        self._refresh_datalogger_plot()
 
     @Slot()
     def on_back_home(self) -> None:
         self.stack.setCurrentWidget(self.home)
         self._refresh_recipes()
-        self._refresh_home()
-
-    @Slot()
-    def on_clear_selection(self) -> None:
-        if self.engine.is_running():
-            return
-        self.selected_recipe_id = None
-        self._refresh_recipes()
-        self._refresh_home()
+        self._refresh_status_all()
+        self._apply_home_controls()
 
     @Slot(str)
     def on_select_recipe(self, recipe_id: str) -> None:
@@ -2373,7 +3075,8 @@ class AppController(QObject):
             return
         self.selected_recipe_id = None if self.selected_recipe_id == recipe_id else recipe_id
         self._refresh_recipes()
-        self._refresh_home()
+        self._refresh_status_all()
+        self._apply_home_controls()
 
     @Slot(str)
     def on_edit_recipe(self, recipe_id: str) -> None:
@@ -2390,7 +3093,8 @@ class AppController(QObject):
         self.store.upsert(recipe)
         self.stack.setCurrentWidget(self.home)
         self._refresh_recipes()
-        self._refresh_home()
+        self._refresh_status_all()
+        self._apply_home_controls()
 
     # ---- ODrive Config actions ----
 
@@ -2398,7 +3102,6 @@ class AppController(QObject):
         """Request a config read in the worker thread and populate the config screen."""
         keys = [s.key for s in IMPORTANT_SETTINGS]
         self.cfg.set_loading("Loading from device…")
-        # In sim mode, allow refresh without needing connection state.
         if BACKEND == "real" and not self.connected:
             self.cfg.apply_values(DEFAULT_CONFIG_MAP, keys)
             self.cfg.set_loading("Not connected (showing defaults)")
@@ -2418,43 +3121,72 @@ class AppController(QObject):
         self.cfg.set_loading("Applying config…")
         self.request_apply_config.emit(values)
 
-    @Slot(object)
-    def _export_odrive_config(self, values_obj: Any) -> None:
-        values = dict(values_obj or {})
-        out = downloads_dir() / f"odrive_config_{time.strftime('%Y%m%d_%H%M%S')}.json"
-        payload = {
-            "exported_at_epoch_s": epoch_s(),
-            "backend": BACKEND,
-            "values": values,
-        }
-        try:
-            out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            QMessageBox.information(self.cfg, "Export", f"Exported to:\n{out}")
-        except Exception as e:
-            QMessageBox.critical(self.cfg, "Export", f"Failed to export JSON:\n{e}")
-
-    # ---- Velocity History actions ----
-
-    @Slot(int)
-    def _on_history_window_changed(self, minutes: int) -> None:
-        self._history_window_min = max(1, int(minutes))
-        if self.stack.currentWidget() is not self.hist:
+    @Slot()
+    def _export_device_json(self) -> None:
+        if BACKEND == "real" and not self.connected:
+            QMessageBox.critical(self.cfg, "Export JSON", "Cannot export: ODrive is not connected.")
             return
-        try:
-            rows = self.history_db.query_window(epoch_s(), HIST_TAG, self._history_window_min)
-            self.hist.load_rows(rows)
-        except Exception as e:
-            QMessageBox.critical(self.hist, "History DB", f"Failed to load window:\n{e}")
+        self.cfg.set_loading("Exporting device JSON…")
+        self.request_get_json.emit()
+
+    # ---- Data Logger actions ----
 
     @Slot(int)
-    def _export_history_csv(self, minutes: int) -> None:
-        minutes = max(1, int(minutes))
-        out = downloads_dir() / f"velocity_history_{minutes}min_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+    def _on_dlog_window_changed(self, minutes: int) -> None:
+        self._dlog_minutes = max(1, int(minutes))
+        if self.stack.currentWidget() is self.dlog:
+            self._refresh_datalogger_plot()
+
+    @Slot(object)
+    def _on_dlog_tags_changed(self, tags_obj: Any) -> None:
+        tags = list(tags_obj or [])
+        self._dlog_selected_tags = tags if tags else list(DEFAULT_ENABLED_TAGS)
+        if self.stack.currentWidget() is self.dlog:
+            self._refresh_datalogger_plot()
+
+    def _refresh_datalogger_plot(self) -> None:
+        now_ts = epoch_s()
+        tags = self._dlog_selected_tags
+        minutes = self._dlog_minutes
         try:
-            n = self.history_db.export_window_csv(out, epoch_s(), HIST_TAG, minutes)
-            QMessageBox.information(self.hist, "Export", f"Exported {n} row(s) to:\n{out}")
+            data = self.history_db.query_window_multi(now_ts, tags, minutes)
         except Exception as e:
-            QMessageBox.critical(self.hist, "Export", f"Failed to export CSV:\n{e}")
+            QMessageBox.critical(self.dlog, "Data Logger DB", f"Failed to load window:\n{e}")
+            data = {t: [] for t in tags}
+        self.dlog.set_series_data(data, tags=tags, minutes=minutes)
+
+    @Slot()
+    def _log_cmd_rpm(self) -> None:
+        """
+        Independently log commanded RPM at 1 Hz so it continues even if ODrive polling fails.
+        Compression rules are applied by the historian.
+        """
+        ts = epoch_s()
+        try:
+            self.history_db.insert_if_needed(
+                ts=ts,
+                tag=TAG_CMD_RPM,
+                value=float(self._cmd_rpm),
+                deadband=float(TAG_DEADBAND.get(TAG_CMD_RPM, 0.0)),
+                heartbeat_s=int(TAG_HEARTBEAT_S.get(TAG_CMD_RPM, DB_HEARTBEAT_S_DEFAULT)),
+            )
+        except Exception:
+            # Avoid popping modal dialogs at 1 Hz; DB write errors are handled on poll inserts.
+            pass
+
+    @Slot(int, object)
+    def _export_datalogger_csv(self, minutes: int, tags_obj: Any) -> None:
+        minutes = max(1, int(minutes))
+        tags = list(tags_obj or [])
+        if not tags:
+            QMessageBox.information(self.dlog, "Export", "Select at least one tag to export.")
+            return
+        out = downloads_dir() / f"datalogger_{minutes}min_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        try:
+            n = self.history_db.export_window_csv_multi(out, epoch_s(), tags, minutes)
+            QMessageBox.information(self.dlog, "Export", f"Exported {n} row(s) to:\n{out}")
+        except Exception as e:
+            QMessageBox.critical(self.dlog, "Export", f"Failed to export CSV:\n{e}")
 
 
 # ----------------------------
@@ -2474,18 +3206,18 @@ class MainWindow(QWidget):
         self.home = HomeScreen()
         self.builder = RecipeBuilderScreen()
         self.cfg = ODriveConfigScreen()
-        self.hist = VelocityHistoryScreen()
+        self.dlog = DataLoggerScreen()
 
         self.stack.addWidget(self.home)
         self.stack.addWidget(self.builder)
         self.stack.addWidget(self.cfg)
-        self.stack.addWidget(self.hist)
+        self.stack.addWidget(self.dlog)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.addWidget(self.stack)
 
-        self.controller = AppController(self.stack, self.home, self.builder, self.cfg, self.hist)
+        self.controller = AppController(self.stack, self.home, self.builder, self.cfg, self.dlog)
 
     def closeEvent(self, event) -> None:
         self.controller.shutdown()
@@ -2578,6 +3310,16 @@ def apply_style(app: QApplication) -> None:
             min-height: 58px;
         }
 
+        QCheckBox {
+            spacing: 12px;
+            font-size: 20px;
+        }
+
+        QCheckBox::indicator {
+            width: 28px;
+            height: 28px;
+        }
+
         QPushButton {
             background: #2B3440;
             border: 2px solid #3A4656;
@@ -2653,22 +3395,6 @@ def apply_style(app: QApplication) -> None:
         QLabel#ConfigNote {
             font-size: 18px;
             color: #9FB0C0;
-        }
-
-        QTableWidget#HistoryTable {
-            background: #0B0F14;
-            border: 2px solid #2A313A;
-            border-radius: 14px;
-            font-size: 18px;
-            gridline-color: #2A313A;
-        }
-
-        QHeaderView::section {
-            background: #161B22;
-            border: 1px solid #2A313A;
-            padding: 8px;
-            font-size: 18px;
-            font-weight: 650;
         }
 
         QScrollArea { border: none; }
