@@ -61,6 +61,7 @@ from PySide6.QtCore import (
     Slot,
     QMetaObject,
     QDateTime,
+    QSignalBlocker,
 )
 from PySide6.QtGui import QDoubleValidator, QFont, QIntValidator, QPainter
 from PySide6.QtWidgets import (
@@ -117,7 +118,7 @@ FIND_ANY_TIMEOUT_S = 0.5
 
 TAG_VBUS_V = "vbus_voltage"
 TAG_IBUS_A = "ibus"
-TAG_PWR_W = "p_w"       # computed vbus*ibus
+TAG_PWR_W = "p_w"        # computed vbus*ibus
 TAG_CMD_RPM = "cmd_rpm"  # last commanded
 TAG_VEL_RPM = "vel_rpm"  # actual estimate
 
@@ -126,7 +127,7 @@ DEFAULT_ENABLED_TAGS = [TAG_PWR_W, TAG_CMD_RPM]
 TAG_DEADBAND: Dict[str, float] = {
     TAG_VBUS_V: 0.1,
     TAG_IBUS_A: 0.05,
-    TAG_PWR_W: 2.0,
+    TAG_PWR_W: 0.05,
     TAG_CMD_RPM: 0.5,
     TAG_VEL_RPM: 2.0,
 }
@@ -155,6 +156,13 @@ TAG_PLOT_GROUP: Dict[str, str] = {
     TAG_VBUS_V: PLOT_GROUP_OTHER,
     TAG_IBUS_A: PLOT_GROUP_OTHER,
 }
+
+# DPI/UI scaling: keep fixed window size but scale fonts/margins so content remains touch-friendly
+UI_SCALE = 1.0
+
+
+def ui(px: float) -> int:
+    return int(round(float(px) * float(UI_SCALE)))
 
 
 # ----------------------------
@@ -305,28 +313,21 @@ class RecipeStore:
 class SettingSpec:
     key: str
     label: str
-    kind: str  # "bool" or "float"
+    kind: str  # "bool" or "float" or "int"
     default: Any
     min_value: Optional[float] = None
     max_value: Optional[float] = None
 
 
-# Defaults chosen for an agitator that can see significant load:
-# - Raise current limits above the prior ultra-conservative values, but keep them moderate.
-# - Keep watchdog disabled by default (app does not feed watchdog).
-# - Encoder defaults assume a typical incremental encoder is present (8192 CPR) but can be edited.
 IMPORTANT_SETTINGS: List[SettingSpec] = [
-    # --- Startup behavior (keep off for open-loop / avoid surprise calibrations) ---
     SettingSpec("axis0.config.startup_motor_calibration", "Startup: motor calibration", "bool", False),
     SettingSpec("axis0.config.startup_encoder_offset_calibration", "Startup: encoder offset calibration", "bool", False),
     SettingSpec("axis0.config.startup_encoder_index_search", "Startup: encoder index search", "bool", False),
     SettingSpec("axis0.config.startup_closed_loop_control", "Startup: closed loop control", "bool", False),
 
-    # --- Motor torque capability (limits) ---
     SettingSpec("axis0.config.motor.current_soft_max", "Motor: current soft max (A)", "float", 20.0, 0.0, 60.0),
     SettingSpec("axis0.config.motor.current_hard_max", "Motor: current hard max (A)", "float", 30.0, 0.0, 100.0),
 
-    # --- Open-loop lock-in profile (open-loop torque & ramping) ---
     SettingSpec("axis0.config.general_lockin.current", "Lock-in: current (A)", "float", 6.0, 0.0, 60.0),
     SettingSpec("axis0.config.general_lockin.ramp_time", "Lock-in: ramp time (s)", "float", 1.0, 0.0, 30.0),
     SettingSpec("axis0.config.general_lockin.ramp_distance", "Lock-in: ramp distance (turns)", "float", 1.0, 0.0, 100.0),
@@ -334,28 +335,22 @@ IMPORTANT_SETTINGS: List[SettingSpec] = [
     SettingSpec("axis0.config.general_lockin.finish_on_vel", "Lock-in: finish on vel", "bool", False),
     SettingSpec("axis0.config.general_lockin.finish_on_distance", "Lock-in: finish on distance", "bool", False),
 
-    # --- DC bus / supply-side limiting & protection (prevents “weak under load” from supply caps) ---
     SettingSpec("config.dc_max_positive_current", "DC bus: max positive current (A)", "float", 25.0, 0.0, 120.0),
     SettingSpec("config.dc_max_negative_current", "DC bus: max regen current (A, negative)", "float", -2.0, -120.0, 0.0),
     SettingSpec("config.dc_bus_undervoltage_trip_level", "DC bus: undervoltage trip (V)", "float", 10.0, 0.0, 60.0),
     SettingSpec("config.dc_bus_overvoltage_trip_level", "DC bus: overvoltage trip (V)", "float", 30.0, 0.0, 80.0),
 
-    # --- Brake resistor / regen clamp support (optional but important for spinning loads) ---
     SettingSpec("config.enable_brake_resistor", "Brake resistor: enabled", "bool", False),
     SettingSpec("config.brake_resistance", "Brake resistor: resistance (ohm)", "float", 2.0, 0.1, 20.0),
 
-    # --- Motor model (helps torque reporting and sanity; do not change unless you know your motor) ---
     SettingSpec("axis0.config.motor.pole_pairs", "Motor: pole pairs", "int", 7, 1, 50),
     SettingSpec("axis0.config.motor.torque_constant", "Motor: torque constant (Nm/A)", "float", 0.0306, 0.0001, 1.0),
 
-    # --- Current loop tuning (torque response) ---
     SettingSpec("axis0.config.motor.current_control_bandwidth", "Motor: current control bandwidth", "float", 1000.0, 10.0, 5000.0),
 
-    # --- Encoder essentials (so vel_estimate / Actual RPM can be meaningful) ---
     SettingSpec("inc_encoder0.config.enabled", "Encoder: incremental enabled", "bool", True),
     SettingSpec("inc_encoder0.config.cpr", "Encoder: incremental CPR", "int", 8192, 1, 200000),
 
-    # --- Safety watchdog (leave disabled unless you also feed it) ---
     SettingSpec("axis0.config.enable_watchdog", "Safety: enable watchdog", "bool", False),
     SettingSpec("axis0.config.watchdog_timeout", "Safety: watchdog timeout (s)", "float", 1.0, 0.1, 10.0),
 ]
@@ -485,7 +480,6 @@ class RealOdrive(OdriveInterface):
             self._axis = self._odrv.axis0
             self._axis.requested_state = AxisState.IDLE
 
-            # Disable startup calibration/closed-loop flags when present.
             for attr in (
                 "startup_motor_calibration",
                 "startup_encoder_offset_calibration",
@@ -497,7 +491,6 @@ class RealOdrive(OdriveInterface):
                 except Exception:
                     pass
 
-            # Conservative current limits when present.
             try:
                 self._axis.config.motor.current_soft_max = 5.0
             except Exception:
@@ -507,7 +500,6 @@ class RealOdrive(OdriveInterface):
             except Exception:
                 pass
 
-            # general_lockin baseline.
             gl = self._axis.config.general_lockin
             for name, val in (
                 ("current", 2.0),
@@ -545,7 +537,6 @@ class RealOdrive(OdriveInterface):
         turns_per_s = rpm / 60.0
         gl = self._axis.config.general_lockin
         gl.vel = float(turns_per_s)
-        # Firmware latches vel on re-entry; always request LOCKIN_SPIN.
         self._axis.requested_state = self._AxisState.LOCKIN_SPIN
         self._state = f"LOCKIN_SPIN ({rpm:.0f} rpm)"
 
@@ -609,7 +600,6 @@ class RealOdrive(OdriveInterface):
             self._state = "Saving config (rebooting)..."
             self._odrv.save_configuration()
         except Exception:
-            # Expected during reboot.
             pass
         self._mark_disconnected("Rebooting (reconnecting)")
         if missing:
@@ -908,6 +898,7 @@ class RunEngine(QObject):
         self._recipe: Optional[Recipe] = None
         self._step_idx = -1
         self._step_end_t = 0.0
+        self._recipe_override_rpm: Optional[float] = None
 
     def is_running(self) -> bool:
         return self._mode in ("single", "recipe")
@@ -929,6 +920,7 @@ class RunEngine(QObject):
     def start_single(self, rpm: float, duration_s: int) -> None:
         self.stop(user_initiated=False)
         self._set_mode("single")
+        self._recipe_override_rpm = None
         self._active_rpm = float(rpm)
         now = time.monotonic()
         self._single_end_t = now + max(0, int(duration_s))
@@ -947,6 +939,7 @@ class RunEngine(QObject):
         self._set_mode("recipe")
         self._recipe = recipe
         self._step_idx = 0
+        self._recipe_override_rpm = None
         self._start_current_step(time.monotonic())
         self._set_status("Running")
 
@@ -963,6 +956,26 @@ class RunEngine(QObject):
         self._step_end_t = now + max(0, int(step.duration_s))
         info = f"Step {self._step_idx + 1}/{len(self._recipe.steps)} • {step.velocity_rpm:g} rpm • {format_mmss(step.duration_s)}"
         self.step_info_changed.emit(info)
+
+    @Slot(float)
+    def override_rpm(self, rpm: float) -> None:
+        """
+        Apply an immediate RPM change while running:
+          - SINGLE: updates active rpm immediately and persists.
+          - RECIPE: overrides step rpm until the next step boundary, then step rpm takes over.
+        """
+        if self._mode == "single":
+            self._active_rpm = float(rpm)
+            self.request_set_rpm.emit(self._active_rpm)
+            self.active_rpm_changed.emit(self._active_rpm)
+            return
+
+        if self._mode == "recipe":
+            self._recipe_override_rpm = float(rpm)
+            self._active_rpm = float(rpm)
+            self.request_set_rpm.emit(self._active_rpm)
+            self.active_rpm_changed.emit(self._active_rpm)
+            return
 
     @Slot(int)
     def adjust_single_remaining(self, delta_s: int) -> None:
@@ -985,6 +998,7 @@ class RunEngine(QObject):
         self._recipe = None
         self._step_idx = -1
         self._active_rpm = 0.0
+        self._recipe_override_rpm = None
 
         self.active_rpm_changed.emit(0.0)
         self.remaining_changed.emit(0)
@@ -1026,6 +1040,7 @@ class RunEngine(QObject):
                     self._set_status("Idle")
                     self._timer.stop()
                     return
+                self._recipe_override_rpm = None
                 self._start_current_step(now)
                 step_remaining = int(round(self._step_end_t - now))
             self.remaining_changed.emit(max(0, step_remaining))
@@ -1132,8 +1147,8 @@ class HistoryDB:
 class TouchButton(QPushButton):
     def __init__(self, text: str, min_h: int = 70, min_w: int = 140) -> None:
         super().__init__(text)
-        self.setMinimumHeight(min_h)
-        self.setMinimumWidth(min_w)
+        self.setMinimumHeight(ui(min_h))
+        self.setMinimumWidth(ui(min_w))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
 
@@ -1144,13 +1159,13 @@ class RpmControl(QWidget):
         super().__init__()
         self._vmin, self._vmax, self._step = float(vmin), float(vmax), float(step)
 
-        min_h = 70 if not compact else 58
-        btn_w = 110 if not compact else 90
-        spacing = 12 if not compact else 8
+        min_h = ui(70 if not compact else 58)
+        btn_w = ui(110 if not compact else 90)
+        spacing = ui(12 if not compact else 8)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(8 if not compact else 6)
+        root.setSpacing(ui(8 if not compact else 6))
 
         lbl = QLabel(title)
         lbl.setObjectName("SectionTitle" if not compact else "SectionTitleCompact")
@@ -1169,7 +1184,7 @@ class RpmControl(QWidget):
         self.edit.setValidator(QDoubleValidator(self._vmin, self._vmax, 2, self.edit))
 
         units = QLabel("rpm")
-        units.setMinimumWidth(70 if not compact else 60)
+        units.setMinimumWidth(ui(70 if not compact else 60))
         units.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         units.setObjectName("UnitsLabel")
 
@@ -1190,10 +1205,12 @@ class RpmControl(QWidget):
         except Exception:
             return float(self._vmin)
 
-    def set_value(self, v: float) -> None:
+    def set_value(self, v: float, emit_signal: bool = True) -> None:
         v = clamp(float(v), self._vmin, self._vmax)
-        self.edit.setText(f"{v:g}")
-        self.value_changed.emit(v)
+        if self.edit.text().strip() != f"{v:g}":
+            self.edit.setText(f"{v:g}")
+        if emit_signal:
+            self.value_changed.emit(v)
 
     def set_enabled(self, enabled: bool) -> None:
         self.btn_minus.setEnabled(enabled)
@@ -1202,7 +1219,7 @@ class RpmControl(QWidget):
 
     @Slot()
     def _emit_if_valid(self) -> None:
-        self.set_value(self.value())
+        self.set_value(self.value(), emit_signal=True)
 
 
 class TimeControl(QWidget):
@@ -1211,15 +1228,15 @@ class TimeControl(QWidget):
     def __init__(self, title: str, step_s: int, compact: bool = False) -> None:
         super().__init__()
         self._step_s = int(step_s)
-        self._adjust_cb: Optional[Callable[[int], int]] = None
+        self._adjust_cb: Optional[Callable[[int], None]] = None
 
-        min_h = 70 if not compact else 58
-        btn_w = 110 if not compact else 90
-        spacing = 12 if not compact else 8
+        min_h = ui(70 if not compact else 58)
+        btn_w = ui(110 if not compact else 90)
+        spacing = ui(12 if not compact else 8)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(8 if not compact else 6)
+        root.setSpacing(ui(8 if not compact else 6))
 
         lbl = QLabel(title)
         lbl.setObjectName("SectionTitle" if not compact else "SectionTitleCompact")
@@ -1238,7 +1255,7 @@ class TimeControl(QWidget):
         self.edit.setPlaceholderText("mm:ss")
 
         hint = QLabel("mm:ss")
-        hint.setMinimumWidth(70 if not compact else 60)
+        hint.setMinimumWidth(ui(70 if not compact else 60))
         hint.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         hint.setObjectName("UnitsLabel")
 
@@ -1253,17 +1270,29 @@ class TimeControl(QWidget):
         self.edit.editingFinished.connect(self._emit_if_valid)
         self._emit_if_valid()
 
-    def set_adjust_callback(self, cb: Optional[Callable[[int], int]]) -> None:
+    def set_adjust_callback(self, cb: Optional[Callable[[int], None]]) -> None:
         self._adjust_cb = cb
 
     def seconds(self) -> int:
         s = parse_mmss(self.edit.text())
         return int(clamp(int(s if s is not None else 0), 0, TIME_MAX_S))
 
-    def set_seconds(self, s: int) -> None:
+    def text_mmss(self) -> str:
+        return self.edit.text().strip()
+
+    def set_seconds(self, s: int, emit_signal: bool = True) -> None:
         s = int(clamp(int(s), 0, TIME_MAX_S))
-        self.edit.setText(format_mmss(s))
-        self.value_changed.emit(s)
+        txt = format_mmss(s)
+        if self.edit.text().strip() != txt:
+            self.edit.setText(txt)
+        if emit_signal:
+            self.value_changed.emit(s)
+
+    def set_text_mmss(self, text: str, emit_signal: bool = True) -> None:
+        s = parse_mmss(text)
+        if s is None:
+            s = 0
+        self.set_seconds(int(s), emit_signal=emit_signal)
 
     def set_enabled(self, enabled: bool) -> None:
         self.set_buttons_enabled(enabled)
@@ -1277,14 +1306,16 @@ class TimeControl(QWidget):
         self.edit.setEnabled(enabled)
 
     def _adjust(self, delta_s: int) -> None:
+        # During a running SINGLE run, the +/- buttons must adjust remaining time only,
+        # without updating the entry text. This is implemented by using _adjust_cb.
         if self._adjust_cb is not None:
-            self.set_seconds(int(self._adjust_cb(int(delta_s))))
-        else:
-            self.set_seconds(self.seconds() + int(delta_s))
+            self._adjust_cb(int(delta_s))
+            return
+        self.set_seconds(self.seconds() + int(delta_s), emit_signal=True)
 
     @Slot()
     def _emit_if_valid(self) -> None:
-        self.set_seconds(self.seconds())
+        self.set_seconds(self.seconds(), emit_signal=True)
 
 
 # ----------------------------
@@ -1296,8 +1327,8 @@ class StatusHeader(QFrame):
         super().__init__()
         self.setObjectName("StatusBar")
         sb = QHBoxLayout(self)
-        sb.setContentsMargins(14, 10, 14, 10)
-        sb.setSpacing(14)
+        sb.setContentsMargins(ui(16), ui(12), ui(16), ui(12))
+        sb.setSpacing(ui(14))
 
         self.lbl_state = QLabel("State: Idle")
         self.lbl_vel = QLabel("Velocity: 0 rpm")
@@ -1335,7 +1366,7 @@ class StartStopFooter(QWidget):
         super().__init__()
         bottom = QHBoxLayout(self)
         bottom.setContentsMargins(0, 0, 0, 0)
-        bottom.setSpacing(14)
+        bottom.setSpacing(ui(14))
 
         self.btn_start = TouchButton("Start", min_h=76, min_w=240)
         self.btn_stop = TouchButton("Stop", min_h=76, min_w=240)
@@ -1368,8 +1399,8 @@ class RecipeCard(QFrame):
         self.setFrameShape(QFrame.StyledPanel)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 12, 14, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(ui(14), ui(12), ui(14), ui(12))
+        root.setSpacing(ui(10))
 
         name = QLabel(recipe.name)
         name.setObjectName("RecipeName")
@@ -1377,7 +1408,7 @@ class RecipeCard(QFrame):
         summary.setObjectName("RecipeSummary")
 
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
+        btn_row.setSpacing(ui(10))
         btn_select = TouchButton("Select", min_h=64, min_w=160)
         btn_edit = TouchButton("Edit", min_h=64, min_w=160)
         btn_row.addWidget(btn_select, 1)
@@ -1412,17 +1443,17 @@ class StepRow(QFrame):
         self.setFrameShape(QFrame.StyledPanel)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 10, 12, 10)
-        root.setSpacing(8)
+        root.setContentsMargins(ui(12), ui(10), ui(12), ui(10))
+        root.setSpacing(ui(8))
 
         header = QHBoxLayout()
-        header.setSpacing(10)
+        header.setSpacing(ui(10))
 
         self.lbl = QLabel(f"Step {index + 1}")
         self.lbl.setObjectName("StepIndex")
         header.addWidget(self.lbl, 1)
 
-        btn_h, btn_w = 54, 120
+        btn_h, btn_w = ui(54), ui(120)
         self.btn_up = TouchButton("Up", min_h=btn_h, min_w=btn_w)
         self.btn_down = TouchButton("Down", min_h=btn_h, min_w=btn_w)
         self.btn_remove = TouchButton("Remove", min_h=btn_h, min_w=btn_w)
@@ -1432,11 +1463,11 @@ class StepRow(QFrame):
         root.addLayout(header)
 
         controls = QHBoxLayout()
-        controls.setSpacing(12)
+        controls.setSpacing(ui(12))
         self.vel = RpmControl("Velocity", VEL_MIN_RPM, VEL_MAX_RPM, VEL_STEP_RPM, compact=True)
         self.tim = TimeControl("Time", TIME_STEP_S, compact=True)
-        self.vel.set_value(step.velocity_rpm)
-        self.tim.set_seconds(step.duration_s)
+        self.vel.set_value(step.velocity_rpm, emit_signal=False)
+        self.tim.set_seconds(step.duration_s, emit_signal=False)
         controls.addWidget(self.vel, 1)
         controls.addWidget(self.tim, 1)
         root.addLayout(controls)
@@ -1463,11 +1494,11 @@ class RecipeBuilderScreen(QWidget):
         self._editing_id: Optional[str] = None
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 14, 16, 14)
-        root.setSpacing(12)
+        root.setContentsMargins(ui(18), ui(16), ui(18), ui(16))
+        root.setSpacing(ui(12))
 
         top = QHBoxLayout()
-        top.setSpacing(12)
+        top.setSpacing(ui(12))
         self.btn_back = TouchButton("Back", min_h=66, min_w=170)
         self.title = QLabel("Recipe Builder")
         self.title.setObjectName("ScreenTitle")
@@ -1476,12 +1507,12 @@ class RecipeBuilderScreen(QWidget):
         root.addLayout(top)
 
         name_row = QHBoxLayout()
-        name_row.setSpacing(12)
+        name_row.setSpacing(ui(12))
         lbl_name = QLabel("Name")
         lbl_name.setObjectName("FieldLabel")
-        lbl_name.setMinimumWidth(120)
+        lbl_name.setMinimumWidth(ui(120))
         self.name_edit = QLineEdit()
-        self.name_edit.setMinimumHeight(66)
+        self.name_edit.setMinimumHeight(ui(66))
         self.name_edit.setPlaceholderText("Enter recipe name")
         name_row.addWidget(lbl_name)
         name_row.addWidget(self.name_edit, 1)
@@ -1493,13 +1524,13 @@ class RecipeBuilderScreen(QWidget):
         self.steps_container = QWidget()
         self.steps_layout = QVBoxLayout(self.steps_container)
         self.steps_layout.setContentsMargins(0, 0, 0, 0)
-        self.steps_layout.setSpacing(10)
+        self.steps_layout.setSpacing(ui(10))
         self.steps_layout.addStretch(1)
         self.steps_area.setWidget(self.steps_container)
         root.addWidget(self.steps_area, 1)
 
         actions = QHBoxLayout()
-        actions.setSpacing(12)
+        actions.setSpacing(ui(12))
         self.btn_add = TouchButton("Add Step", min_h=66, min_w=220)
         self.btn_cancel = TouchButton("Cancel", min_h=66, min_w=220)
         self.btn_save = TouchButton("Save", min_h=66, min_w=220)
@@ -1625,24 +1656,36 @@ class SettingRowWidget(QFrame):
         self.setFrameShape(QFrame.StyledPanel)
 
         root = QHBoxLayout(self)
-        root.setContentsMargins(12, 10, 12, 10)
-        root.setSpacing(12)
+        root.setContentsMargins(ui(12), ui(10), ui(12), ui(10))
+        root.setSpacing(ui(12))
 
         self.lbl = QLabel(spec.label)
         self.lbl.setObjectName("ConfigLabel")
-        self.lbl.setMinimumWidth(520)
+        self.lbl.setMinimumWidth(ui(520))
 
         if spec.kind == "bool":
             self.editor: QWidget = QComboBox()
             cb = self.editor  # type: ignore[assignment]
             assert isinstance(cb, QComboBox)
-            cb.setMinimumHeight(58)
+            cb.setMinimumHeight(ui(58))
             cb.addItems(["False", "True"])
+        elif spec.kind == "int":
+            self.editor = QLineEdit()
+            le = self.editor  # type: ignore[assignment]
+            assert isinstance(le, QLineEdit)
+            le.setMinimumHeight(ui(58))
+            le.setAlignment(Qt.AlignCenter)
+            iv = QIntValidator(le)
+            if spec.min_value is not None:
+                iv.setBottom(int(spec.min_value))
+            if spec.max_value is not None:
+                iv.setTop(int(spec.max_value))
+            le.setValidator(iv)
         else:
             self.editor = QLineEdit()
             le = self.editor  # type: ignore[assignment]
             assert isinstance(le, QLineEdit)
-            le.setMinimumHeight(58)
+            le.setMinimumHeight(ui(58))
             le.setAlignment(Qt.AlignCenter)
             dv = QDoubleValidator(le)
             if spec.min_value is not None:
@@ -1654,7 +1697,7 @@ class SettingRowWidget(QFrame):
 
         self.note = QLabel("")
         self.note.setObjectName("ConfigNote")
-        self.note.setMinimumWidth(220)
+        self.note.setMinimumWidth(ui(220))
         self.note.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
 
         root.addWidget(self.lbl, 2)
@@ -1668,6 +1711,14 @@ class SettingRowWidget(QFrame):
             cb = self.editor  # type: ignore[assignment]
             assert isinstance(cb, QComboBox)
             cb.setCurrentIndex(1 if bool(value) else 0)
+        elif self.spec.kind == "int":
+            le = self.editor  # type: ignore[assignment]
+            assert isinstance(le, QLineEdit)
+            try:
+                iv = int(value)
+            except Exception:
+                iv = int(self.spec.default)
+            le.setText(str(iv))
         else:
             le = self.editor  # type: ignore[assignment]
             assert isinstance(le, QLineEdit)
@@ -1689,10 +1740,21 @@ class SettingRowWidget(QFrame):
             cb = self.editor  # type: ignore[assignment]
             assert isinstance(cb, QComboBox)
             return bool(cb.currentIndex() == 1)
+
         le = self.editor  # type: ignore[assignment]
         assert isinstance(le, QLineEdit)
         txt = le.text().strip()
-        return float(txt) if txt else float(self.spec.default)
+        if not txt:
+            return self.spec.default
+        if self.spec.kind == "int":
+            try:
+                return int(txt)
+            except Exception:
+                return int(self.spec.default)
+        try:
+            return float(txt)
+        except Exception:
+            return float(self.spec.default)
 
 
 class ODriveConfigScreen(QWidget):
@@ -1707,11 +1769,11 @@ class ODriveConfigScreen(QWidget):
         self._rows: Dict[str, SettingRowWidget] = {}
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 14, 16, 14)
-        root.setSpacing(12)
+        root.setContentsMargins(ui(18), ui(16), ui(18), ui(16))
+        root.setSpacing(ui(12))
 
         top = QHBoxLayout()
-        top.setSpacing(12)
+        top.setSpacing(ui(12))
         self.btn_back = TouchButton("Back", min_h=66, min_w=170)
         self.title = QLabel("ODrive Configuration")
         self.title.setObjectName("ScreenTitle")
@@ -1734,7 +1796,7 @@ class ODriveConfigScreen(QWidget):
         self.container = QWidget()
         self.vbox = QVBoxLayout(self.container)
         self.vbox.setContentsMargins(0, 0, 0, 0)
-        self.vbox.setSpacing(10)
+        self.vbox.setSpacing(ui(10))
         self.vbox.addStretch(1)
         self.area.setWidget(self.container)
         root.addWidget(self.area, 1)
@@ -1745,7 +1807,7 @@ class ODriveConfigScreen(QWidget):
             self.vbox.insertWidget(self.vbox.count() - 1, row)
 
         actions = QHBoxLayout()
-        actions.setSpacing(12)
+        actions.setSpacing(ui(12))
         self.btn_restore = TouchButton("Restore Defaults", min_h=66, min_w=260)
         self.btn_cancel = TouchButton("Cancel", min_h=66, min_w=200)
         self.btn_save = TouchButton("Save", min_h=66, min_w=200)
@@ -1791,7 +1853,7 @@ class ODriveConfigScreen(QWidget):
 class SimplePlotWidget(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setMinimumHeight(360)
+        self.setMinimumHeight(ui(360))
         self._data: Dict[str, List[Tuple[int, float]]] = {}
         self._tags: List[str] = []
         self._minutes = 10
@@ -1817,7 +1879,7 @@ class SimplePlotWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
 
-        rect = self.rect().adjusted(10, 10, -10, -10)
+        rect = self.rect().adjusted(ui(10), ui(10), -ui(10), -ui(10))
         p.drawRect(rect)
 
         tags = [t for t in self._tags if t in self._data]
@@ -1840,7 +1902,7 @@ class SimplePlotWidget(QWidget):
         if abs(y_max - y_min) < 1e-6:
             y_max = y_min + 1.0
 
-        plot = rect.adjusted(50, 10, -10, -30)
+        plot = rect.adjusted(ui(50), ui(10), -ui(10), -ui(30))
         p.drawRect(plot)
 
         def map_x(ts: int) -> float:
@@ -1849,10 +1911,10 @@ class SimplePlotWidget(QWidget):
         def map_y(v: float) -> float:
             return plot.bottom() - (v - y_min) / (y_max - y_min) * plot.height()
 
-        p.drawText(rect.left() + 6, plot.top() + 14, f"{y_max:.3g}")
-        p.drawText(rect.left() + 6, plot.bottom(), f"{y_min:.3g}")
-        p.drawText(plot.left(), rect.bottom() - 6, f"-{self._minutes} min")
-        p.drawText(plot.right() - 60, rect.bottom() - 6, "now")
+        p.drawText(rect.left() + ui(6), plot.top() + ui(14), f"{y_max:.3g}")
+        p.drawText(rect.left() + ui(6), plot.bottom(), f"{y_min:.3g}")
+        p.drawText(plot.left(), rect.bottom() - ui(6), f"-{self._minutes} min")
+        p.drawText(plot.right() - ui(60), rect.bottom() - ui(6), "now")
 
         colors = [Qt.cyan, Qt.yellow, Qt.green, Qt.magenta, Qt.red, Qt.blue, Qt.gray, Qt.white]
         for i, t in enumerate(tags):
@@ -1860,7 +1922,7 @@ class SimplePlotWidget(QWidget):
             if len(pts) < 2:
                 continue
             pen = p.pen()
-            pen.setWidth(2)
+            pen.setWidth(max(2, ui(2)))
             pen.setColor(colors[i % len(colors)])
             p.setPen(pen)
             last = None
@@ -1872,7 +1934,7 @@ class SimplePlotWidget(QWidget):
 
         p.setPen(self.palette().text().color())
         legend = "  ".join(TAG_LABELS.get(t, t) for t in tags)
-        p.drawText(rect.adjusted(0, 0, 0, -rect.height() + 20), Qt.AlignLeft | Qt.AlignVCenter, legend)
+        p.drawText(rect.adjusted(0, 0, 0, -rect.height() + ui(20)), Qt.AlignLeft | Qt.AlignVCenter, legend)
 
 
 class QtChartsPlot(QWidget):
@@ -1883,7 +1945,7 @@ class QtChartsPlot(QWidget):
         self._chart.legend().setAlignment(Qt.AlignBottom)
         self._view = QChartView(self._chart)
         self._view.setRenderHint(QPainter.Antialiasing)
-        self._view.setMinimumHeight(360)
+        self._view.setMinimumHeight(ui(360))
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -2015,11 +2077,11 @@ class DataLoggerScreen(QWidget):
         self._minutes = 10
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 14, 16, 14)
-        root.setSpacing(12)
+        root.setContentsMargins(ui(18), ui(16), ui(18), ui(16))
+        root.setSpacing(ui(12))
 
         top = QHBoxLayout()
-        top.setSpacing(12)
+        top.setSpacing(ui(12))
         self.btn_back = TouchButton("Back", min_h=66, min_w=170)
         self.title = QLabel("Data Logger")
         self.title.setObjectName("ScreenTitle")
@@ -2033,9 +2095,9 @@ class DataLoggerScreen(QWidget):
         root.addWidget(self.status)
 
         body = QHBoxLayout()
-        body.setSpacing(12)
+        body.setSpacing(ui(12))
         left = QVBoxLayout()
-        left.setSpacing(12)
+        left.setSpacing(ui(12))
 
         lbl_tags = QLabel("Tags")
         lbl_tags.setObjectName("SectionTitle")
@@ -2045,7 +2107,7 @@ class DataLoggerScreen(QWidget):
         for tag in [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_VBUS_V, TAG_IBUS_A]:
             cb = QCheckBox(TAG_LABELS.get(tag, tag))
             cb.setChecked(tag in DEFAULT_ENABLED_TAGS)
-            cb.setMinimumHeight(44)
+            cb.setMinimumHeight(ui(44))
             cb.stateChanged.connect(lambda _=0: self.tags_changed.emit(self.selected_tags()))
             self._tag_checks[tag] = cb
             left.addWidget(cb)
@@ -2053,12 +2115,12 @@ class DataLoggerScreen(QWidget):
         left.addStretch(1)
 
         win_row = QHBoxLayout()
-        win_row.setSpacing(12)
+        win_row.setSpacing(ui(12))
         lbl_win = QLabel("Minutes to display")
         lbl_win.setObjectName("FieldLabel")
-        lbl_win.setMinimumWidth(260)
+        lbl_win.setMinimumWidth(ui(260))
         self.edit_min = QLineEdit()
-        self.edit_min.setMinimumHeight(66)
+        self.edit_min.setMinimumHeight(ui(66))
         self.edit_min.setAlignment(Qt.AlignCenter)
         self.edit_min.setValidator(QIntValidator(1, 24 * 60, self.edit_min))
         self.edit_min.setText(str(self._minutes))
@@ -2099,6 +2161,18 @@ class DataLoggerScreen(QWidget):
     def selected_tags(self) -> List[str]:
         return [t for t, cb in self._tag_checks.items() if cb.isChecked()]
 
+    def set_selected_tags(self, tags: List[str]) -> None:
+        wanted = set(tags)
+        for t, cb in self._tag_checks.items():
+            with QSignalBlocker(cb):
+                cb.setChecked(t in wanted)
+
+    def set_minutes_window(self, minutes: int) -> None:
+        minutes = int(clamp(int(minutes), 1, 24 * 60))
+        self._minutes = minutes
+        with QSignalBlocker(self.edit_min):
+            self.edit_min.setText(str(minutes))
+
     def set_series_data(self, data: Dict[str, List[Tuple[int, float]]], tags: List[str], minutes: int) -> None:
         self.plot.set_series_data(data, tags, minutes)  # type: ignore[attr-defined]
 
@@ -2130,17 +2204,17 @@ class HomeScreen(QWidget):
     def __init__(self) -> None:
         super().__init__()
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 14, 16, 14)
-        root.setSpacing(12)
+        root.setContentsMargins(ui(18), ui(16), ui(18), ui(16))
+        root.setSpacing(ui(12))
 
         self.status_bar = StatusHeader()
         root.addWidget(self.status_bar)
 
         mid = QHBoxLayout()
-        mid.setSpacing(14)
+        mid.setSpacing(ui(14))
 
         left = QVBoxLayout()
-        left.setSpacing(12)
+        left.setSpacing(ui(12))
         self.rpm_ctl = RpmControl("Velocity", VEL_MIN_RPM, VEL_MAX_RPM, VEL_STEP_RPM, compact=False)
         self.time_ctl = TimeControl("Timer", TIME_STEP_S, compact=False)
         self.btn_builder = TouchButton("Recipe Builder", min_h=70, min_w=240)
@@ -2156,7 +2230,7 @@ class HomeScreen(QWidget):
         mid.addLayout(left, 1)
 
         recipes_col = QVBoxLayout()
-        recipes_col.setSpacing(8)
+        recipes_col.setSpacing(ui(8))
         title = QLabel("Recipes")
         title.setObjectName("SectionTitle")
         recipes_col.addWidget(title)
@@ -2167,7 +2241,7 @@ class HomeScreen(QWidget):
         self.recipes_container = QWidget()
         self.recipes_layout = QVBoxLayout(self.recipes_container)
         self.recipes_layout.setContentsMargins(0, 0, 0, 0)
-        self.recipes_layout.setSpacing(10)
+        self.recipes_layout.setSpacing(ui(10))
         self.recipes_layout.addStretch(1)
         self.recipes_area.setWidget(self.recipes_container)
         recipes_col.addWidget(self.recipes_area, 1)
@@ -2203,18 +2277,18 @@ class HomeScreen(QWidget):
 
     def set_running_ui(self, running: bool, run_mode: str, recipe_selected: bool) -> None:
         """
-        Enforce home-screen behaviors:
+        Home-screen behaviors:
           - Start disabled while running
           - Stop enabled while running
-          - RPM input disabled while running
+          - RPM control enabled while running (SINGLE + RECIPE override)
           - Recipe selection disabled while running
           - Builder/config navigation disabled while running
           - Data Logger navigation enabled during run
           - Manual timer disabled when recipe selected while idle
-          - While running SINGLE mode: timer text disabled, +/- enabled (adjust callback is set by controller)
+          - While running SINGLE mode: timer text disabled, +/- enabled (adjusts remaining)
         """
         self.footer.set_running_ui(running)
-        self.rpm_ctl.set_enabled(not running)
+        self.rpm_ctl.set_enabled(True)
 
         if running:
             if run_mode == "single":
@@ -2308,6 +2382,9 @@ class AppController(QObject):
         self.home.open_config_clicked.connect(self.on_open_config)
         self.home.open_datalogger_clicked.connect(self.on_open_datalogger)
 
+        self.home.rpm_ctl.value_changed.connect(self._on_home_rpm_changed)
+        self.home.time_ctl.value_changed.connect(self._on_home_time_changed)
+
         self.builder.back_clicked.connect(self.on_back_home)
         self.builder.cancel_clicked.connect(self.on_back_home)
         self.builder.save_clicked.connect(self.on_builder_save)
@@ -2335,6 +2412,17 @@ class AppController(QObject):
         self._last_modal_error_mono = 0.0
         self._modal_error_cooldown_s = 8.0
 
+        self._ui_state_path = app_config_dir() / "ui_state.json"
+        self._ui_state_saving = False
+        self._ui_state_debounce = QTimer(self)
+        self._ui_state_debounce.setSingleShot(True)
+        self._ui_state_debounce.setInterval(400)
+        self._ui_state_debounce.timeout.connect(self._save_ui_state_now)
+
+        self._loading_ui_state = True
+        self._load_ui_state()
+        self._loading_ui_state = False
+
         self.worker_thread.start()
         self.request_connect.emit()
         self.request_set_polled_tags.emit([TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM])
@@ -2344,6 +2432,7 @@ class AppController(QObject):
         self._apply_controls()
 
     def shutdown(self) -> None:
+        self._save_ui_state_now()
         try:
             self.request_stop_poll.emit()
         except Exception:
@@ -2351,7 +2440,7 @@ class AppController(QObject):
         try:
             if self.engine.is_running():
                 self.engine.stop(user_initiated=True)
-                QMetaObject.invokeMethod(self.worker, "stop", Qt.BlockingQueuedConnection)
+            QMetaObject.invokeMethod(self.worker, "stop", Qt.QueuedConnection)
         except Exception:
             pass
         self.worker_thread.quit()
@@ -2389,7 +2478,6 @@ class AppController(QObject):
         r_selected = self._selected_recipe() is not None
         running = self.engine.is_running()
 
-        # While running SINGLE mode, +/- must adjust remaining time immediately.
         if running and self._run_mode == "single" and not r_selected:
             self.home.time_ctl.set_adjust_callback(self._adjust_time_from_home)
         else:
@@ -2398,11 +2486,10 @@ class AppController(QObject):
         self.home.set_running_ui(running=running, run_mode=self._run_mode, recipe_selected=r_selected)
         self.dlog.set_running_ui(running=running)
 
-    def _adjust_time_from_home(self, delta_s: int) -> int:
+    def _adjust_time_from_home(self, delta_s: int) -> None:
         if self._run_mode != "single":
-            return self._ui_remaining
+            return
         self.engine.adjust_single_remaining(int(delta_s))
-        return int(clamp(self._ui_remaining, 0, TIME_MAX_S))
 
     def _set_ui(self, status: Optional[str] = None, step: Optional[str] = None) -> None:
         if status is not None:
@@ -2411,6 +2498,112 @@ class AppController(QObject):
             self._ui_step_info = step
         self._refresh_status_all()
         self._apply_controls()
+
+    # ---- UI state persistence ----
+
+    def _known_tags(self) -> List[str]:
+        return [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_VBUS_V, TAG_IBUS_A]
+
+    def _load_ui_state(self) -> None:
+        if not self._ui_state_path.exists():
+            self._apply_loaded_ui_state_defaults()
+            return
+        try:
+            raw = json.loads(self._ui_state_path.read_text(encoding="utf-8"))
+        except Exception:
+            self._apply_loaded_ui_state_defaults()
+            return
+
+        home_rpm = clamp(safe_float(raw.get("home_rpm", 120.0), 120.0), VEL_MIN_RPM, VEL_MAX_RPM)
+        home_timer = raw.get("home_timer_mmss", "00:00")
+        secs = parse_mmss(str(home_timer)) if home_timer is not None else None
+        if secs is None:
+            secs = 0
+        secs = int(clamp(int(secs), 0, TIME_MAX_S))
+        timer_mmss = format_mmss(secs)
+
+        dlog_minutes = raw.get("dlog_minutes", 10)
+        try:
+            dlog_minutes_i = int(dlog_minutes)
+        except Exception:
+            dlog_minutes_i = 10
+        dlog_minutes_i = int(clamp(dlog_minutes_i, 1, 24 * 60))
+
+        tags_raw = raw.get("dlog_tags", list(DEFAULT_ENABLED_TAGS))
+        tags_list = [str(t) for t in (tags_raw or []) if str(t) in set(self._known_tags())]
+        if not tags_list:
+            tags_list = list(DEFAULT_ENABLED_TAGS)
+
+        recipe_id = raw.get("selected_recipe_id")
+        recipe_id = str(recipe_id) if recipe_id else None
+        if recipe_id and not any(r.id == recipe_id for r in self.store.recipes()):
+            recipe_id = None
+
+        self.home.rpm_ctl.set_value(home_rpm, emit_signal=False)
+        self.home.time_ctl.set_text_mmss(timer_mmss, emit_signal=False)
+
+        self._dlog_minutes = dlog_minutes_i
+        self._dlog_selected_tags = list(tags_list)
+        self.dlog.set_minutes_window(self._dlog_minutes)
+        self.dlog.set_selected_tags(self._dlog_selected_tags)
+
+        self.selected_recipe_id = recipe_id
+
+    def _apply_loaded_ui_state_defaults(self) -> None:
+        self.home.rpm_ctl.set_value(120.0, emit_signal=False)
+        self.home.time_ctl.set_text_mmss("00:00", emit_signal=False)
+        self._dlog_minutes = 10
+        self._dlog_selected_tags = list(DEFAULT_ENABLED_TAGS)
+        self.dlog.set_minutes_window(self._dlog_minutes)
+        self.dlog.set_selected_tags(self._dlog_selected_tags)
+        self.selected_recipe_id = None
+
+    def _schedule_ui_state_save(self) -> None:
+        if self._loading_ui_state:
+            return
+        if self._ui_state_debounce.isActive():
+            self._ui_state_debounce.start()
+        else:
+            self._ui_state_debounce.start()
+
+    def _collect_ui_state(self) -> Dict[str, Any]:
+        home_rpm = clamp(self.home.rpm_ctl.value(), VEL_MIN_RPM, VEL_MAX_RPM)
+        secs = parse_mmss(self.home.time_ctl.text_mmss())
+        if secs is None:
+            secs = 0
+        secs = int(clamp(int(secs), 0, TIME_MAX_S))
+        timer_mmss = format_mmss(secs)
+
+        tags = self._dlog_selected_tags or list(DEFAULT_ENABLED_TAGS)
+        tags = [t for t in tags if t in set(self._known_tags())]
+        if not tags:
+            tags = list(DEFAULT_ENABLED_TAGS)
+
+        minutes = int(clamp(int(self._dlog_minutes), 1, 24 * 60))
+        recipe_id = self.selected_recipe_id or None
+
+        return {
+            "home_rpm": float(home_rpm),
+            "home_timer_mmss": str(timer_mmss),
+            "dlog_tags": list(tags),
+            "dlog_minutes": int(minutes),
+            "selected_recipe_id": recipe_id,
+        }
+
+    @Slot()
+    def _save_ui_state_now(self) -> None:
+        if self._ui_state_saving:
+            return
+        self._ui_state_saving = True
+        try:
+            obj = self._collect_ui_state()
+            tmp = self._ui_state_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+            tmp.replace(self._ui_state_path)
+        except Exception:
+            pass
+        finally:
+            self._ui_state_saving = False
 
     # ---- Worker callbacks ----
 
@@ -2464,8 +2657,10 @@ class AppController(QObject):
     def _on_export_json_done(self, ok: bool, msg: str) -> None:
         if ok:
             QMessageBox.information(self.cfg, "Export JSON", f"Saved:\n{msg}")
+            self.cfg.set_loading("Loaded")
         else:
             self._show_modal_error(self.cfg, "Export JSON", msg)
+            self.cfg.set_loading("Loaded")
 
     @Slot(int, object)
     def _on_tags_sample(self, ts: int, values_obj: Any) -> None:
@@ -2479,7 +2674,14 @@ class AppController(QObject):
         samples: List[Tuple[str, float, float, int]] = []
         for tag in [TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM, TAG_PWR_W, TAG_CMD_RPM]:
             if tag in values and math.isfinite(values[tag]):
-                samples.append((tag, float(values[tag]), float(TAG_DEADBAND.get(tag, 0.0)), int(TAG_HEARTBEAT_S.get(tag, DB_HEARTBEAT_S_DEFAULT))))
+                samples.append(
+                    (
+                        tag,
+                        float(values[tag]),
+                        float(TAG_DEADBAND.get(tag, 0.0)),
+                        int(TAG_HEARTBEAT_S.get(tag, DB_HEARTBEAT_S_DEFAULT)),
+                    )
+                )
 
         try:
             inserted = self.history_db.insert_many_if_needed(ts=ts, samples=samples)
@@ -2499,15 +2701,19 @@ class AppController(QObject):
     def _on_engine_rpm(self, rpm: float) -> None:
         self._ui_rpm = float(rpm)
         self._cmd_rpm = float(rpm)
+
+        # Keep the Home RPM control display aligned with the active commanded rpm without causing feedback loops.
+        if not self.home.rpm_ctl.edit.hasFocus():
+            self.home.rpm_ctl.set_value(float(rpm), emit_signal=False)
+
         self._refresh_status_all()
         self._apply_controls()
 
     @Slot(int)
     def _on_engine_remaining(self, seconds: int) -> None:
+        # Remaining countdown is shown ONLY in the status header; the home timer entry must not count down.
         self._ui_remaining = int(seconds)
         self._refresh_status_all()
-        if self.engine.is_running() and self._run_mode == "single":
-            self.home.time_ctl.set_seconds(int(clamp(self._ui_remaining, 0, TIME_MAX_S)))
 
     # ---- Screen changes ----
 
@@ -2517,6 +2723,21 @@ class AppController(QObject):
             self._dlog_minutes = self.dlog.minutes_window()
             self._dlog_selected_tags = self.dlog.selected_tags() or list(DEFAULT_ENABLED_TAGS)
             self._refresh_datalogger_plot()
+        self._schedule_ui_state_save()
+
+    # ---- Home field changes ----
+
+    @Slot(float)
+    def _on_home_rpm_changed(self, rpm: float) -> None:
+        rpm = float(clamp(float(rpm), VEL_MIN_RPM, VEL_MAX_RPM))
+        if self.engine.is_running():
+            self.engine.override_rpm(rpm)
+        self._schedule_ui_state_save()
+
+    @Slot(int)
+    def _on_home_time_changed(self, _seconds: int) -> None:
+        # Save the entry text (mm:ss) when edited while stopped. During a run, the entry is disabled.
+        self._schedule_ui_state_save()
 
     # ---- Home actions ----
 
@@ -2535,7 +2756,6 @@ class AppController(QObject):
             if duration <= 0:
                 QMessageBox.information(self.home, "Start", "Set a timer or select a recipe.")
                 return
-            self.home.time_ctl.set_seconds(int(clamp(duration, 0, TIME_MAX_S)))
             self.engine.start_single(rpm, duration)
             return
 
@@ -2584,6 +2804,7 @@ class AppController(QObject):
         self._refresh_recipes()
         self._refresh_status_all()
         self._apply_controls()
+        self._schedule_ui_state_save()
 
     @Slot(str)
     def on_edit_recipe(self, recipe_id: str) -> None:
@@ -2598,7 +2819,11 @@ class AppController(QObject):
     @Slot(Recipe)
     def on_builder_save(self, recipe: Recipe) -> None:
         self.store.upsert(recipe)
+        # If the selected recipe was edited or newly created, keep selection stable where possible
+        if self.selected_recipe_id == recipe.id or self.selected_recipe_id is None:
+            self.selected_recipe_id = recipe.id if self.selected_recipe_id == recipe.id else self.selected_recipe_id
         self.on_back_home()
+        self._schedule_ui_state_save()
 
     # ---- ODrive Config actions ----
 
@@ -2634,13 +2859,17 @@ class AppController(QObject):
         self._dlog_minutes = max(1, int(minutes))
         if self.stack.currentWidget() is self.dlog:
             self._refresh_datalogger_plot()
+        self._schedule_ui_state_save()
 
     @Slot(object)
     def _on_dlog_tags_changed(self, tags_obj: Any) -> None:
-        tags = list(tags_obj or [])
+        tags = [str(t) for t in (list(tags_obj or []))]
+        known = set(self._known_tags())
+        tags = [t for t in tags if t in known]
         self._dlog_selected_tags = tags if tags else list(DEFAULT_ENABLED_TAGS)
         if self.stack.currentWidget() is self.dlog:
             self._refresh_datalogger_plot()
+        self._schedule_ui_state_save()
 
     def _refresh_datalogger_plot(self) -> None:
         now_ts = epoch_s()
@@ -2670,7 +2899,7 @@ class AppController(QObject):
     @Slot(int, object)
     def _export_datalogger_csv(self, minutes: int, tags_obj: Any) -> None:
         minutes = max(1, int(minutes))
-        tags = list(tags_obj or [])
+        tags = [str(t) for t in (list(tags_obj or []))]
         if not tags:
             QMessageBox.information(self.dlog, "Export", "Select at least one tag to export.")
             return
@@ -2718,66 +2947,101 @@ class MainWindow(QWidget):
 # Styling
 # ----------------------------
 
+def compute_ui_scale(app: QApplication) -> float:
+    try:
+        screen = app.primaryScreen()
+        if screen is None:
+            return 1.0
+        dpi = float(screen.logicalDotsPerInch())
+        if not math.isfinite(dpi) or dpi <= 1.0:
+            return 1.0
+        # Match physical sizing when Qt styles use px values; clamp to avoid layout blowups.
+        return float(clamp(dpi / 96.0, 1.0, 1.6))
+    except Exception:
+        return 1.0
+
+
 def apply_style(app: QApplication) -> None:
     base_font = QFont()
-    base_font.setPointSize(12)
+    base_font.setPointSize(max(10, int(round(12 * UI_SCALE))))
     app.setFont(base_font)
 
+    # Scale stylesheet px sizes so fixed-size window remains comfortably touch-friendly at OS scaling (e.g., 125%).
+    fs_widget = ui(20)
+    fs_title = ui(28)
+    fs_section = ui(24)
+    fs_section_c = ui(20)
+    fs_field = ui(22)
+    fs_units = ui(18)
+    fs_info = ui(18)
+
+    fs_status = ui(20)
+    fs_step = ui(18)
+    fs_backend = ui(16)
+
+    fs_lineedit = ui(26)
+    fs_combo = ui(22)
+    fs_btn = ui(24)
+
+    indicator = ui(28)
+    border_r = ui(14)
+    border_r_btn = ui(16)
+
     app.setStyleSheet(
-        """
-        QWidget { background: #101317; color: #F2F5F7; font-size: 20px; }
+        f"""
+        QWidget {{ background: #101317; color: #F2F5F7; font-size: {fs_widget}px; }}
 
-        QLabel#ScreenTitle { font-size: 28px; font-weight: 700; }
-        QLabel#SectionTitle { font-size: 24px; font-weight: 650; }
-        QLabel#SectionTitleCompact { font-size: 20px; font-weight: 650; }
-        QLabel#FieldLabel { font-size: 22px; font-weight: 650; }
-        QLabel#UnitsLabel { font-size: 18px; color: #D0D7DE; }
-        QLabel#InfoLabel { font-size: 18px; color: #D0D7DE; }
+        QLabel#ScreenTitle {{ font-size: {fs_title}px; font-weight: 700; }}
+        QLabel#SectionTitle {{ font-size: {fs_section}px; font-weight: 650; }}
+        QLabel#SectionTitleCompact {{ font-size: {fs_section_c}px; font-weight: 650; }}
+        QLabel#FieldLabel {{ font-size: {fs_field}px; font-weight: 650; }}
+        QLabel#UnitsLabel {{ font-size: {fs_units}px; color: #D0D7DE; }}
+        QLabel#InfoLabel {{ font-size: {fs_info}px; color: #D0D7DE; }}
 
-        QFrame#StatusBar { background: #161B22; border: 2px solid #2A313A; border-radius: 14px; }
-        QLabel#StatusLabel { font-size: 20px; font-weight: 650; }
-        QLabel#StatusStep { font-size: 18px; color: #D0D7DE; }
-        QLabel#StatusBackend { font-size: 16px; color: #9FB0C0; }
+        QFrame#StatusBar {{ background: #161B22; border: 2px solid #2A313A; border-radius: {border_r}px; }}
+        QLabel#StatusLabel {{ font-size: {fs_status}px; font-weight: 650; }}
+        QLabel#StatusStep {{ font-size: {fs_step}px; color: #D0D7DE; }}
+        QLabel#StatusBackend {{ font-size: {fs_backend}px; color: #9FB0C0; }}
 
-        QLineEdit {
-            background: #0B0F14; border: 2px solid #2A313A; border-radius: 14px;
-            padding: 8px 12px; font-size: 26px;
-        }
+        QLineEdit {{
+            background: #0B0F14; border: 2px solid #2A313A; border-radius: {border_r}px;
+            padding: {ui(8)}px {ui(12)}px; font-size: {fs_lineedit}px;
+        }}
 
-        QComboBox {
-            background: #0B0F14; border: 2px solid #2A313A; border-radius: 14px;
-            padding: 8px 12px; font-size: 22px; min-height: 58px;
-        }
+        QComboBox {{
+            background: #0B0F14; border: 2px solid #2A313A; border-radius: {border_r}px;
+            padding: {ui(8)}px {ui(12)}px; font-size: {fs_combo}px; min-height: {ui(58)}px;
+        }}
 
-        QCheckBox { spacing: 12px; font-size: 20px; }
-        QCheckBox::indicator { width: 28px; height: 28px; }
+        QCheckBox {{ spacing: {ui(12)}px; font-size: {fs_widget}px; }}
+        QCheckBox::indicator {{ width: {indicator}px; height: {indicator}px; }}
 
-        QPushButton {
-            background: #2B3440; border: 2px solid #3A4656; border-radius: 16px;
-            padding: 10px 14px; font-size: 24px; font-weight: 650;
-        }
-        QPushButton:hover { background: #354152; }
-        QPushButton:pressed { background: #202733; }
-        QPushButton:disabled { background: #1C222B; border: 2px solid #2A313A; color: #7A8794; }
+        QPushButton {{
+            background: #2B3440; border: 2px solid #3A4656; border-radius: {border_r_btn}px;
+            padding: {ui(10)}px {ui(14)}px; font-size: {fs_btn}px; font-weight: 650;
+        }}
+        QPushButton:hover {{ background: #354152; }}
+        QPushButton:pressed {{ background: #202733; }}
+        QPushButton:disabled {{ background: #1C222B; border: 2px solid #2A313A; color: #7A8794; }}
 
-        QPushButton#StartButton { background: #1E5F3C; border: 2px solid #2D7B52; }
-        QPushButton#StartButton:hover { background: #21704A; }
-        QPushButton#StopButton { background: #6B1E1E; border: 2px solid #8B2A2A; }
-        QPushButton#StopButton:hover { background: #7A2424; }
+        QPushButton#StartButton {{ background: #1E5F3C; border: 2px solid #2D7B52; }}
+        QPushButton#StartButton:hover {{ background: #21704A; }}
+        QPushButton#StopButton {{ background: #6B1E1E; border: 2px solid #8B2A2A; }}
+        QPushButton#StopButton:hover {{ background: #7A2424; }}
 
-        QFrame#RecipeCard { background: #161B22; border: 2px solid #2A313A; border-radius: 16px; }
-        QFrame#RecipeCard[selected="true"] { border: 4px solid #2F81F7; }
-        QLabel#RecipeName { font-size: 24px; font-weight: 700; }
-        QLabel#RecipeSummary { font-size: 18px; color: #D0D7DE; }
+        QFrame#RecipeCard {{ background: #161B22; border: 2px solid #2A313A; border-radius: {border_r_btn}px; }}
+        QFrame#RecipeCard[selected="true"] {{ border: 4px solid #2F81F7; }}
+        QLabel#RecipeName {{ font-size: {ui(24)}px; font-weight: 700; }}
+        QLabel#RecipeSummary {{ font-size: {ui(18)}px; color: #D0D7DE; }}
 
-        QFrame#StepRow { background: #161B22; border: 2px solid #2A313A; border-radius: 16px; }
-        QLabel#StepIndex { font-size: 20px; font-weight: 700; }
+        QFrame#StepRow {{ background: #161B22; border: 2px solid #2A313A; border-radius: {border_r_btn}px; }}
+        QLabel#StepIndex {{ font-size: {ui(20)}px; font-weight: 700; }}
 
-        QFrame#ConfigRow { background: #161B22; border: 2px solid #2A313A; border-radius: 16px; }
-        QLabel#ConfigLabel { font-size: 20px; font-weight: 650; }
-        QLabel#ConfigNote { font-size: 18px; color: #9FB0C0; }
+        QFrame#ConfigRow {{ background: #161B22; border: 2px solid #2A313A; border-radius: {border_r_btn}px; }}
+        QLabel#ConfigLabel {{ font-size: {ui(20)}px; font-weight: 650; }}
+        QLabel#ConfigNote {{ font-size: {ui(18)}px; color: #9FB0C0; }}
 
-        QScrollArea { border: none; }
+        QScrollArea {{ border: none; }}
         """
     )
 
@@ -2788,6 +3052,10 @@ def apply_style(app: QApplication) -> None:
 
 def main() -> int:
     app = QApplication(sys.argv)
+
+    global UI_SCALE
+    UI_SCALE = compute_ui_scale(app)
+
     apply_style(app)
     w = MainWindow()
     w.show()
