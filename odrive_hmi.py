@@ -1,44 +1,36 @@
 """
 Touch-Friendly ODrive Reactor Agitator HMI (PySide6)
 
-How to run (simulation default):
+Run (simulation default):
   pip install PySide6
   python odrive_hmi.py
 
-How to switch to real ODrive later:
-  1) Set BACKEND = "real" near the top of this file.
-  2) Implement RealOdrive.connect(), set_velocity_rpm(), stop() using the odrive library calls
-     shown as comments inside RealOdrive (stub).
-  3) Ensure any ODrive configuration (control mode, input mode, etc.) is applied in connect().
+Switch to real ODrive backend:
+  - Set BACKEND = "real"
+  - Ensure the `odrive` Python package is installed and accessible on the target device.
 
-Design goals:
-  - Fixed 1280x800 layout, large fonts, large buttons, wide spacing for finger use.
-  - Recipes persisted to a JSON file in a per-user config directory.
-  - Non-blocking UI: motor commands run in a dedicated worker thread; timing uses a QTimer state machine.
+Real backend behavior (open-loop):
+  - Uses AxisState.LOCKIN_SPIN and axis.config.general_lockin
+  - UI uses RPM; backend converts to turns/s = rpm / 60
+  - Firmware latches general_lockin.vel only when re-entering LOCKIN_SPIN:
+      On EVERY velocity change: set gl.vel, then request_state = LOCKIN_SPIN
+  - connect() applies a safe baseline configuration once:
+      IDLE, disable startup calibrations/closed-loop, conservative current limits,
+      and a stable general_lockin profile
 """
 
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 import uuid
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
-from PySide6.QtCore import (
-    QObject,
-    Qt,
-    QThread,
-    QTimer,
-    QStandardPaths,
-    Signal,
-    Slot,
-    QMetaObject,
-)
-from PySide6.QtGui import QDoubleValidator, QFont, QIntValidator
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, QStandardPaths, Signal, Slot, QMetaObject
+from PySide6.QtGui import QDoubleValidator, QFont
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -50,33 +42,30 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSpacerItem,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
-
 # ----------------------------
-# Configuration / Safety Limits
+# App Configuration
 # ----------------------------
 
-BACKEND = "sim"  # "sim" (default) or "real"
+BACKEND = "real"  # "sim" (default) or "real"
 
 WINDOW_W = 1280
 WINDOW_H = 800
 
-# UI uses RPM consistently.
+# UI units are RPM everywhere.
 VEL_MIN_RPM = 0.0
 VEL_MAX_RPM = 2000.0
 VEL_STEP_RPM = 1.0
 
-# Timer UI uses mm:ss, stored internally as seconds.
+# Timer UI uses mm:ss; internal storage uses seconds.
 TIME_STEP_S = 10
-TIME_MAX_S = 24 * 60 * 60  # 24h cap to avoid absurd values
+TIME_MAX_S = 24 * 60 * 60  # 24h cap
 
-# QTimer tick rate for run engine. The display updates about 5 Hz; countdown rounds to seconds.
-ENGINE_TICK_MS = 200
+ENGINE_TICK_MS = 200  # Engine tick; countdown is displayed in whole seconds
 
 
 # ----------------------------
@@ -84,14 +73,13 @@ ENGINE_TICK_MS = 200
 # ----------------------------
 
 def clamp(v: float, lo: float, hi: float) -> float:
-    """Clamp a numeric value to [lo, hi]."""
+    """Clamp v into [lo, hi]."""
     return max(lo, min(hi, v))
 
 
 def format_mmss(seconds: int) -> str:
-    """Format seconds as mm:ss (minutes can exceed 59 for long runs)."""
-    if seconds < 0:
-        seconds = 0
+    """Format seconds into mm:ss (minutes may exceed 59)."""
+    seconds = max(0, int(seconds))
     m = seconds // 60
     s = seconds % 60
     return f"{m:02d}:{s:02d}"
@@ -99,18 +87,17 @@ def format_mmss(seconds: int) -> str:
 
 def parse_mmss(text: str) -> Optional[int]:
     """
-    Parse "mm:ss" into seconds.
-    Accepts:
-      - "m:ss" or "mm:ss" or "mmm:ss"
+    Parse mm:ss or plain seconds into an integer number of seconds.
+
+    Accepted forms:
+      - "mm:ss" or "m:ss" or "mmm:ss"
       - "ss" (treated as seconds)
-    Returns None on invalid input.
+    Returns None for invalid input.
     """
     t = text.strip()
     if not t:
         return None
-
     if ":" not in t:
-        # Pure seconds input (e.g., "90").
         if not t.isdigit():
             return None
         return int(t)
@@ -152,15 +139,14 @@ class Recipe:
 
 
 def recipe_total_seconds(r: Recipe) -> int:
-    """Compute total duration of a recipe in seconds."""
-    return sum(max(0, s.duration_s) for s in r.steps)
+    """Compute total duration of a recipe."""
+    return sum(max(0, int(s.duration_s)) for s in r.steps)
 
 
 def recipe_summary(r: Recipe) -> str:
-    """Generate a user-facing one-line recipe summary."""
+    """Create a compact summary string for display on the home screen."""
     n = len(r.steps)
-    total = recipe_total_seconds(r)
-    return f"{n} step{'s' if n != 1 else ''} • {format_mmss(total)} total"
+    return f"{n} step{'s' if n != 1 else ''} • {format_mmss(recipe_total_seconds(r))} total"
 
 
 # ----------------------------
@@ -169,9 +155,9 @@ def recipe_summary(r: Recipe) -> str:
 
 class RecipeStore:
     """
-    Loads/saves recipes to JSON in a per-user config directory.
+    Persist recipes to a JSON file stored in a per-user config directory.
 
-    Storage format is intentionally simple:
+    File format:
       {
         "recipes": [
           {"id": "...", "name": "...", "steps": [{"velocity_rpm": 100.0, "duration_s": 30}, ...]},
@@ -181,8 +167,8 @@ class RecipeStore:
     """
 
     def __init__(self) -> None:
-        self._recipes: List[Recipe] = []
         self._path = self._default_path()
+        self._recipes: List[Recipe] = []
 
     @staticmethod
     def _default_path() -> Path:
@@ -198,12 +184,13 @@ class RecipeStore:
         return self._path
 
     def recipes(self) -> List[Recipe]:
-        # Return a shallow copy to avoid accidental in-place mutation without saving.
+        """Return a shallow copy of recipes."""
         return list(self._recipes)
 
     def load(self) -> None:
+        """Load recipes from disk; seed defaults if file is missing or corrupted."""
         if not self._path.exists():
-            self._recipes = self._default_seed_recipes()
+            self._recipes = self._seed_recipes()
             self.save()
             return
 
@@ -215,16 +202,17 @@ class RecipeStore:
                 out.append(Recipe(id=str(rj["id"]), name=str(rj["name"]), steps=steps))
             self._recipes = out
         except Exception:
-            # If the file is corrupted, preserve it and start fresh.
+            # Preserve the corrupted file and recreate a default.
             bad = self._path.with_suffix(".corrupt.json")
             try:
                 self._path.replace(bad)
             except Exception:
                 pass
-            self._recipes = self._default_seed_recipes()
+            self._recipes = self._seed_recipes()
             self.save()
 
     def save(self) -> None:
+        """Write recipes to disk."""
         obj = {
             "recipes": [
                 {"id": r.id, "name": r.name, "steps": [asdict(s) for s in r.steps]}
@@ -234,6 +222,7 @@ class RecipeStore:
         self._path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
     def upsert(self, recipe: Recipe) -> None:
+        """Insert or update a recipe by ID."""
         for i, r in enumerate(self._recipes):
             if r.id == recipe.id:
                 self._recipes[i] = recipe
@@ -242,13 +231,9 @@ class RecipeStore:
         self._recipes.append(recipe)
         self.save()
 
-    def delete(self, recipe_id: str) -> None:
-        self._recipes = [r for r in self._recipes if r.id != recipe_id]
-        self.save()
-
     @staticmethod
-    def _default_seed_recipes() -> List[Recipe]:
-        # A small default recipe so the UI isn't empty on first boot.
+    def _seed_recipes() -> List[Recipe]:
+        """Provide a small default recipe for first boot."""
         return [
             Recipe(
                 id=str(uuid.uuid4()),
@@ -263,15 +248,11 @@ class RecipeStore:
 
 
 # ----------------------------
-# ODrive Interface and Implementations
+# ODrive Interface + Backends
 # ----------------------------
 
 class OdriveInterface:
-    """
-    Abstract ODrive interface used by the worker thread.
-
-    The UI speaks in RPM. The backend may convert to turns/s depending on actual ODrive API usage.
-    """
+    """Backend interface used by the worker thread."""
 
     def connect(self) -> bool:
         raise NotImplementedError
@@ -291,9 +272,9 @@ class OdriveInterface:
 
 class SimulatedOdrive(OdriveInterface):
     """
-    Simulation backend that never blocks and provides deterministic behavior.
+    Simulation backend that never blocks and tracks a simple state string.
 
-    This class keeps an internal velocity and a simple state string suitable for UI display.
+    This backend is used by default so the application runs without hardware.
     """
 
     def __init__(self) -> None:
@@ -303,6 +284,7 @@ class SimulatedOdrive(OdriveInterface):
 
     def connect(self) -> bool:
         self._connected = True
+        self._rpm = 0.0
         self._state = "Idle"
         return True
 
@@ -323,79 +305,161 @@ class SimulatedOdrive(OdriveInterface):
 
 class RealOdrive(OdriveInterface):
     """
-    Real backend stub.
+    Real backend using open-loop LOCKIN_SPIN.
 
-    Implementations must avoid long blocking calls in set_velocity_rpm()/stop().
-    All methods run in the OdriveWorker thread, not the UI thread.
-
-    Suggested ODrive concepts (for later implementation):
-      - odrive.find_any() to connect
-      - Configure axis controller for velocity control
-      - Convert RPM -> turns/s: turns_per_sec = rpm / 60.0
-      - Set input velocity and ensure safe stop on errors
+    Key behavior:
+      - UI uses RPM; convert to turns/s = rpm / 60
+      - Firmware latches general_lockin.vel only when re-entering LOCKIN_SPIN
+        so set_velocity_rpm() always:
+          gl.vel = turns_per_s
+          axis.requested_state = AxisState.LOCKIN_SPIN
+      - stop() moves to IDLE
     """
 
     def __init__(self) -> None:
         self._connected = False
         self._state = "Disconnected"
         self._rpm = 0.0
+
         self._odrv = None
+        self._axis = None
+        self._AxisState = None  # imported from odrive.enums during connect()
 
     def connect(self) -> bool:
-        # Example outline (do not use as-is, implement for your hardware and firmware):
-        #   import odrive
-        #   from odrive.enums import AxisState, ControlMode, InputMode
-        #   self._odrv = odrive.find_any(timeout=5)
-        #   axis = self._odrv.axis0
-        #   axis.controller.config.control_mode = ControlMode.VELOCITY_CONTROL
-        #   axis.controller.config.input_mode = InputMode.PASSTHROUGH
-        #   axis.requested_state = AxisState.CLOSED_LOOP_CONTROL
-        #   self._connected = True
-        #   self._state = "Idle"
-        #   return True
-        self._state = "Error: Real backend not implemented"
-        self._connected = False
-        return False
+        """
+        Connect to ODrive and apply a safe open-loop baseline configuration.
+
+        This method runs in the worker thread; it is allowed to block briefly during discovery.
+        """
+        try:
+            import odrive  # Imported only when real backend is enabled.
+            from odrive.enums import AxisState  # Enums are stored for later non-blocking calls.
+
+            self._AxisState = AxisState
+            self._state = "Connecting..."
+            self._odrv = odrive.find_any(timeout=5)
+            if self._odrv is None:
+                self._state = "Error: ODrive not found"
+                self._connected = False
+                return False
+
+            self._axis = self._odrv.axis0
+
+            # Safety: start from IDLE.
+            self._axis.requested_state = AxisState.IDLE
+
+            # Disable automatic startup procedures that would attempt calibration or closed-loop.
+            try:
+                self._axis.config.startup_motor_calibration = False
+                self._axis.config.startup_encoder_offset_calibration = False
+                self._axis.config.startup_encoder_index_search = False
+                self._axis.config.startup_closed_loop_control = False
+            except Exception:
+                # Some firmware variants may not expose all flags; missing flags should not prevent open-loop use.
+                pass
+
+            # Conservative current limits for open-loop testing.
+            self._axis.config.motor.current_soft_max = 5.0
+            self._axis.config.motor.current_hard_max = 8.0
+
+            # Configure open-loop lock-in profile.
+            gl = self._axis.config.general_lockin
+            gl.current = 2.0
+            gl.ramp_time = 1.0
+            gl.ramp_distance = 1.0
+            gl.accel = 10.0
+
+            # Some firmware fields vary by version; apply when present.
+            for name, value in (
+                ("finish_on_vel", False),
+                ("finish_on_distance", False),
+            ):
+                try:
+                    setattr(gl, name, value)
+                except Exception:
+                    pass
+
+            try:
+                gl.vel = 0.0
+            except Exception:
+                pass
+
+            self._connected = True
+            self._rpm = 0.0
+            self._state = "Idle (LOCKIN ready)"
+            return True
+
+        except Exception as e:
+            self._connected = False
+            self._state = f"Error: {e}"
+            return False
 
     def is_connected(self) -> bool:
         return self._connected
 
     def set_velocity_rpm(self, rpm: float) -> None:
-        # Example outline:
-        #   axis = self._odrv.axis0
-        #   axis.controller.input_vel = float(rpm) / 60.0  # turns/s
-        self._rpm = float(rpm)
-        if not self._connected:
+        """
+        Apply a new open-loop velocity.
+
+        This call is intentionally non-blocking; timing is handled by the run engine.
+        Firmware requirement:
+          - Update gl.vel, then re-request LOCKIN_SPIN so the new velocity is latched.
+        """
+        if not self._connected or self._axis is None or self._AxisState is None:
             raise RuntimeError("ODrive not connected")
 
-    def stop(self) -> None:
-        # Example outline:
-        #   axis = self._odrv.axis0
-        #   axis.controller.input_vel = 0.0
-        #   axis.requested_state = AxisState.IDLE
-        self._rpm = 0.0
-        if not self._connected:
+        rpm = float(rpm)
+        self._rpm = rpm
+
+        if abs(rpm) < 1e-6:
+            self.stop()
             return
+
+        turns_per_s = rpm / 60.0
+        gl = self._axis.config.general_lockin
+        gl.vel = float(turns_per_s)
+
+        # Re-enter LOCKIN_SPIN so the firmware applies the updated gl.vel.
+        self._axis.requested_state = self._AxisState.LOCKIN_SPIN
+        self._state = f"LOCKIN_SPIN ({rpm:.0f} rpm)"
+
+    def stop(self) -> None:
+        """Safely stop motion by transitioning to IDLE."""
+        if not self._connected or self._axis is None or self._AxisState is None:
+            self._rpm = 0.0
+            self._state = "Disconnected"
+            return
+
+        self._rpm = 0.0
+        try:
+            # Setting gl.vel to 0 is optional; IDLE ensures commutation stops.
+            try:
+                self._axis.config.general_lockin.vel = 0.0
+            except Exception:
+                pass
+            self._axis.requested_state = self._AxisState.IDLE
+        finally:
+            self._state = "Idle"
 
     def get_state(self) -> str:
         return self._state
 
 
 # ----------------------------
-# ODrive Worker (threaded motor command execution)
+# Worker Thread for Motor Commands
 # ----------------------------
 
 class OdriveWorker(QObject):
     """
-    Runs ODrive backend calls in its own thread.
+    Execute backend operations in a dedicated worker thread.
 
-    The UI and engine communicate with this worker via queued signals/slots, ensuring
-    that any real hardware calls do not block the UI thread.
+    The UI and run engine communicate via queued signals/slots to avoid any hardware I/O
+    on the UI thread.
     """
 
-    connected_changed = Signal(bool, str)  # connected, backend_state
+    connected_changed = Signal(bool, str)  # connected, state string
+    state_changed = Signal(str)            # backend state string
     rpm_changed = Signal(float)            # last commanded rpm
-    backend_state_changed = Signal(str)    # backend-provided state string
     error = Signal(str)
 
     def __init__(self, backend: OdriveInterface) -> None:
@@ -407,18 +471,18 @@ class OdriveWorker(QObject):
         try:
             ok = self._backend.connect()
             self.connected_changed.emit(ok, self._backend.get_state())
-            self.backend_state_changed.emit(self._backend.get_state())
+            self.state_changed.emit(self._backend.get_state())
         except Exception as e:
             self.error.emit(f"Connect failed: {e}")
             self.connected_changed.emit(False, "Error")
-            self.backend_state_changed.emit("Error")
+            self.state_changed.emit("Error")
 
     @Slot(float)
     def set_velocity_rpm(self, rpm: float) -> None:
         try:
-            self._backend.set_velocity_rpm(rpm)
+            self._backend.set_velocity_rpm(float(rpm))
             self.rpm_changed.emit(float(rpm))
-            self.backend_state_changed.emit(self._backend.get_state())
+            self.state_changed.emit(self._backend.get_state())
         except Exception as e:
             self.error.emit(f"Motor command failed: {e}")
 
@@ -427,13 +491,12 @@ class OdriveWorker(QObject):
         try:
             self._backend.stop()
             self.rpm_changed.emit(0.0)
-            self.backend_state_changed.emit(self._backend.get_state())
+            self.state_changed.emit(self._backend.get_state())
         except Exception as e:
             self.error.emit(f"Stop failed: {e}")
 
     def is_connected(self) -> bool:
-        # This method is read-only and used only for cached state checks.
-        # For real backends, prefer emitting connected_changed from connect_backend() and tracking it in the controller.
+        """Read-only convenience; controller should treat signals as authoritative."""
         return self._backend.is_connected()
 
 
@@ -443,17 +506,19 @@ class OdriveWorker(QObject):
 
 class RunEngine(QObject):
     """
-    Drives timed single runs and multi-step recipe runs.
+    Drive either:
+      - Single timed run (rpm + duration)
+      - Multi-step recipe run (sequence of rpm/duration steps)
 
-    The engine tracks its own state and emits signals for UI updates.
-    Motor commands are sent via signals to the OdriveWorker (thread-safe queued delivery).
+    Motor commands are emitted as signals and executed by the worker thread.
     """
 
-    status_changed = Signal(str)  # "Idle", "Running", "Stopped", "Error"
+    status_changed = Signal(str)           # "Idle", "Running", "Stopped", "Error"
     active_rpm_changed = Signal(float)
-    recipe_step_changed = Signal(str)      # user-facing step info
-    time_remaining_changed = Signal(int)   # seconds remaining for current mode
-    total_remaining_changed = Signal(int)  # seconds remaining overall (recipe)
+    remaining_changed = Signal(int)        # seconds remaining in current segment
+
+    step_info_changed = Signal(str)        # user-facing step info for recipe mode
+    recipe_total_remaining_changed = Signal(int)  # seconds remaining overall for recipe mode
 
     request_set_rpm = Signal(float)
     request_stop = Signal()
@@ -466,13 +531,12 @@ class RunEngine(QObject):
 
         self._mode: str = "idle"  # "idle" | "single" | "recipe"
         self._status: str = "Idle"
-
         self._active_rpm: float = 0.0
 
-        # Single run fields
+        # Single-run timing
         self._single_end_t: float = 0.0
 
-        # Recipe run fields
+        # Recipe timing
         self._recipe: Optional[Recipe] = None
         self._step_idx: int = -1
         self._step_end_t: float = 0.0
@@ -481,9 +545,6 @@ class RunEngine(QObject):
     def is_running(self) -> bool:
         return self._mode in ("single", "recipe")
 
-    def status(self) -> str:
-        return self._status
-
     def _set_status(self, status: str) -> None:
         if status != self._status:
             self._status = status
@@ -491,20 +552,19 @@ class RunEngine(QObject):
 
     @Slot(float, int)
     def start_single(self, rpm: float, duration_s: int) -> None:
-        """
-        Start a single timed run. Duration must be > 0.
-        """
-        self.stop()  # Ensures a clean state transition.
+        """Start a single timed run; duration must be > 0."""
+        self.stop(user_initiated=False)
         self._mode = "single"
         self._active_rpm = float(rpm)
+
         now = time.monotonic()
         self._single_end_t = now + max(0, int(duration_s))
 
+        self.step_info_changed.emit("")
+        self.recipe_total_remaining_changed.emit(int(duration_s))
+
         self.request_set_rpm.emit(self._active_rpm)
         self.active_rpm_changed.emit(self._active_rpm)
-
-        self.recipe_step_changed.emit("")
-        self.total_remaining_changed.emit(int(duration_s))
         self._set_status("Running")
 
         self._timer.start()
@@ -512,10 +572,8 @@ class RunEngine(QObject):
 
     @Slot(object)
     def start_recipe(self, recipe: Recipe) -> None:
-        """
-        Start a multi-step recipe run.
-        """
-        self.stop()
+        """Start a multi-step recipe run."""
+        self.stop(user_initiated=False)
         self._mode = "recipe"
         self._recipe = recipe
         self._step_idx = 0
@@ -524,7 +582,6 @@ class RunEngine(QObject):
         total_s = recipe_total_seconds(recipe)
         self._recipe_end_t = now + total_s
 
-        # Prime first step.
         self._start_current_step(now)
         self._set_status("Running")
 
@@ -532,21 +589,26 @@ class RunEngine(QObject):
         self._tick()
 
     def _start_current_step(self, now: float) -> None:
+        """Issue motor command and timing for the current recipe step."""
         assert self._recipe is not None
         step = self._recipe.steps[self._step_idx]
+
         self._active_rpm = float(step.velocity_rpm)
         self.request_set_rpm.emit(self._active_rpm)
         self.active_rpm_changed.emit(self._active_rpm)
 
         self._step_end_t = now + max(0, int(step.duration_s))
 
-        step_label = f"Step {self._step_idx + 1}/{len(self._recipe.steps)} • {step.velocity_rpm:g} rpm • {format_mmss(step.duration_s)}"
-        self.recipe_step_changed.emit(step_label)
+        info = f"Step {self._step_idx + 1}/{len(self._recipe.steps)} • {step.velocity_rpm:g} rpm • {format_mmss(step.duration_s)}"
+        self.step_info_changed.emit(info)
 
-    @Slot()
-    def stop(self) -> None:
+    @Slot(bool)
+    def stop(self, user_initiated: bool = True) -> None:
         """
-        Stop any running mode immediately and return to Idle.
+        Stop any active run.
+
+        user_initiated=True keeps the UI status at "Stopped" until the next start.
+        user_initiated=False is used for automatic transitions (e.g., before starting a new run).
         """
         if self._timer.isActive():
             self._timer.stop()
@@ -560,19 +622,15 @@ class RunEngine(QObject):
         self._active_rpm = 0.0
 
         self.active_rpm_changed.emit(0.0)
-        self.recipe_step_changed.emit("")
-        self.time_remaining_changed.emit(0)
-        self.total_remaining_changed.emit(0)
-        self._set_status("Idle")
+        self.remaining_changed.emit(0)
+        self.step_info_changed.emit("")
+        self.recipe_total_remaining_changed.emit(0)
+
+        self._set_status("Stopped" if user_initiated else "Idle")
 
     @Slot()
     def _tick(self) -> None:
-        """
-        Periodic tick that updates countdowns and advances recipe steps.
-
-        The engine computes remaining time using monotonic time and rounds up/down to
-        whole seconds for display.
-        """
+        """Timer tick that advances countdown and recipe steps using monotonic time."""
         now = time.monotonic()
 
         if self._mode == "single":
@@ -582,35 +640,34 @@ class RunEngine(QObject):
                 self._mode = "idle"
                 self._active_rpm = 0.0
                 self.active_rpm_changed.emit(0.0)
-                self.time_remaining_changed.emit(0)
-                self.total_remaining_changed.emit(0)
+                self.remaining_changed.emit(0)
+                self.recipe_total_remaining_changed.emit(0)
                 self._set_status("Idle")
                 self._timer.stop()
                 return
 
-            self.time_remaining_changed.emit(remaining)
-            self.total_remaining_changed.emit(remaining)
+            self.remaining_changed.emit(remaining)
+            self.recipe_total_remaining_changed.emit(remaining)
             return
 
         if self._mode == "recipe":
             if not self._recipe:
-                self.stop()
+                self.stop(user_initiated=False)
                 return
 
             step_remaining = int(round(self._step_end_t - now))
             total_remaining = int(round(self._recipe_end_t - now))
 
             if step_remaining <= 0:
-                # Advance to next step or finish.
                 self._step_idx += 1
                 if self._step_idx >= len(self._recipe.steps):
                     self.request_stop.emit()
                     self._mode = "idle"
                     self._active_rpm = 0.0
                     self.active_rpm_changed.emit(0.0)
-                    self.recipe_step_changed.emit("")
-                    self.time_remaining_changed.emit(0)
-                    self.total_remaining_changed.emit(0)
+                    self.remaining_changed.emit(0)
+                    self.step_info_changed.emit("")
+                    self.recipe_total_remaining_changed.emit(0)
                     self._set_status("Idle")
                     self._timer.stop()
                     return
@@ -618,72 +675,83 @@ class RunEngine(QObject):
                 self._start_current_step(now)
                 step_remaining = int(round(self._step_end_t - now))
 
-            # Clamp negatives that can appear due to rounding.
-            self.time_remaining_changed.emit(max(0, step_remaining))
-            self.total_remaining_changed.emit(max(0, total_remaining))
+            self.remaining_changed.emit(max(0, step_remaining))
+            self.recipe_total_remaining_changed.emit(max(0, total_remaining))
             return
 
-        # Idle mode
-        self.time_remaining_changed.emit(0)
-        self.total_remaining_changed.emit(0)
+        # Idle
+        self.remaining_changed.emit(0)
+        self.recipe_total_remaining_changed.emit(0)
 
 
 # ----------------------------
-# Touch-friendly input widgets
+# Touch-friendly Controls
 # ----------------------------
 
-class BigButton(QPushButton):
-    """A QPushButton with touch-friendly sizing."""
-    def __init__(self, text: str) -> None:
+class TouchButton(QPushButton):
+    """Push button with a minimum hit target suitable for finger use."""
+
+    def __init__(self, text: str, min_h: int = 70, min_w: int = 140) -> None:
         super().__init__(text)
-        self.setMinimumHeight(70)
-        self.setMinimumWidth(160)
+        self.setMinimumHeight(min_h)
+        self.setMinimumWidth(min_w)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
 
-class VelocityAdjust(QWidget):
+class RpmControl(QWidget):
     """
-    Touch-friendly RPM control with +/- buttons and a numeric entry.
+    Numeric RPM control with +/- buttons and validation.
 
-    This widget stores and emits float values, while restricting input to safe bounds.
+    This widget emits clamped float values.
     """
+
     value_changed = Signal(float)
 
-    def __init__(self, label: str, units: str, vmin: float, vmax: float, step: float) -> None:
+    def __init__(
+        self,
+        title: str,
+        vmin: float,
+        vmax: float,
+        step: float,
+        compact: bool = False,
+    ) -> None:
         super().__init__()
         self._vmin = float(vmin)
         self._vmax = float(vmax)
         self._step = float(step)
 
+        min_h = 70 if not compact else 58
+        btn_w = 110 if not compact else 90
+        spacing = 12 if not compact else 8
+
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(10)
+        root.setSpacing(8 if not compact else 6)
 
-        title = QLabel(label)
-        title.setObjectName("SectionTitle")
-        root.addWidget(title)
+        lbl = QLabel(title)
+        lbl.setObjectName("SectionTitle" if not compact else "SectionTitleCompact")
+        root.addWidget(lbl)
 
         row = QHBoxLayout()
-        row.setSpacing(12)
+        row.setSpacing(spacing)
 
-        self.btn_minus = BigButton("−")
-        self.btn_minus.setMinimumWidth(110)
-        self.btn_plus = BigButton("+")
-        self.btn_plus.setMinimumWidth(110)
+        self.btn_minus = TouchButton("−", min_h=min_h, min_w=btn_w)
+        self.btn_plus = TouchButton("+", min_h=min_h, min_w=btn_w)
 
         self.edit = QLineEdit()
-        self.edit.setMinimumHeight(70)
+        self.edit.setMinimumHeight(min_h)
         self.edit.setAlignment(Qt.AlignCenter)
         self.edit.setText("120")
         self.edit.setValidator(QDoubleValidator(self._vmin, self._vmax, 2, self.edit))
 
-        units_lbl = QLabel(units)
-        units_lbl.setMinimumWidth(90)
-        units_lbl.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        units = QLabel("rpm")
+        units.setMinimumWidth(70 if not compact else 60)
+        units.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        units.setObjectName("UnitsLabel")
 
         row.addWidget(self.btn_minus)
         row.addWidget(self.edit, 1)
-        row.addWidget(units_lbl)
+        row.addWidget(units)
         row.addWidget(self.btn_plus)
 
         root.addLayout(row)
@@ -692,7 +760,6 @@ class VelocityAdjust(QWidget):
         self.btn_plus.clicked.connect(self._inc)
         self.edit.editingFinished.connect(self._emit_if_valid)
 
-        # Emit initial value so the controller has a known starting state.
         self._emit_if_valid()
 
     def value(self) -> float:
@@ -704,7 +771,7 @@ class VelocityAdjust(QWidget):
         self.edit.setText(f"{v:g}")
         self.value_changed.emit(v)
 
-    def set_enabled_adjustment(self, enabled: bool) -> None:
+    def set_enabled(self, enabled: bool) -> None:
         self.btn_minus.setEnabled(enabled)
         self.btn_plus.setEnabled(enabled)
         self.edit.setEnabled(enabled)
@@ -735,42 +802,47 @@ class VelocityAdjust(QWidget):
         self.set_value(self.value() + self._step)
 
 
-class TimeAdjust(QWidget):
+class TimeControl(QWidget):
     """
-    Touch-friendly time control displayed as mm:ss with +/- step buttons.
+    Time control displayed as mm:ss with +/- step buttons.
 
-    The line edit accepts mm:ss or a raw seconds integer. The widget clamps to [0, TIME_MAX_S].
+    The line edit accepts mm:ss or raw seconds; values are clamped to [0, TIME_MAX_S].
     """
+
     value_changed = Signal(int)
 
-    def __init__(self, label: str, step_s: int) -> None:
+    def __init__(self, title: str, step_s: int, compact: bool = False) -> None:
         super().__init__()
         self._step_s = int(step_s)
 
+        min_h = 70 if not compact else 58
+        btn_w = 110 if not compact else 90
+        spacing = 12 if not compact else 8
+
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(10)
+        root.setSpacing(8 if not compact else 6)
 
-        title = QLabel(label)
-        title.setObjectName("SectionTitle")
-        root.addWidget(title)
+        lbl = QLabel(title)
+        lbl.setObjectName("SectionTitle" if not compact else "SectionTitleCompact")
+        root.addWidget(lbl)
 
         row = QHBoxLayout()
-        row.setSpacing(12)
+        row.setSpacing(spacing)
 
-        self.btn_minus = BigButton("−")
-        self.btn_minus.setMinimumWidth(110)
-        self.btn_plus = BigButton("+")
-        self.btn_plus.setMinimumWidth(110)
+        self.btn_minus = TouchButton("−", min_h=min_h, min_w=btn_w)
+        self.btn_plus = TouchButton("+", min_h=min_h, min_w=btn_w)
 
         self.edit = QLineEdit()
-        self.edit.setMinimumHeight(70)
+        self.edit.setMinimumHeight(min_h)
         self.edit.setAlignment(Qt.AlignCenter)
         self.edit.setText("00:00")
+        self.edit.setPlaceholderText("mm:ss")
 
         hint = QLabel("mm:ss")
-        hint.setMinimumWidth(90)
+        hint.setMinimumWidth(70 if not compact else 60)
         hint.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        hint.setObjectName("UnitsLabel")
 
         row.addWidget(self.btn_minus)
         row.addWidget(self.edit, 1)
@@ -794,14 +866,13 @@ class TimeAdjust(QWidget):
         self.edit.setText(format_mmss(s))
         self.value_changed.emit(s)
 
-    def set_enabled_adjustment(self, enabled: bool) -> None:
+    def set_enabled(self, enabled: bool) -> None:
         self.btn_minus.setEnabled(enabled)
         self.btn_plus.setEnabled(enabled)
         self.edit.setEnabled(enabled)
 
     def _parse(self) -> Optional[int]:
-        t = self.edit.text().strip()
-        s = parse_mmss(t)
+        s = parse_mmss(self.edit.text())
         if s is None:
             return None
         return int(clamp(int(s), 0, TIME_MAX_S))
@@ -824,175 +895,178 @@ class TimeAdjust(QWidget):
 
 
 # ----------------------------
-# Recipe Card Widgets (Home screen list)
+# Home Screen Recipe Cards
 # ----------------------------
 
 class RecipeCard(QFrame):
-    """
-    Touch-friendly recipe card with Select and Edit actions.
-    """
-    select_clicked = Signal(str)  # recipe_id
-    edit_clicked = Signal(str)    # recipe_id
+    """Touch-friendly recipe card with Select and Edit actions."""
+
+    select_clicked = Signal(str)
+    edit_clicked = Signal(str)
 
     def __init__(self, recipe: Recipe) -> None:
         super().__init__()
         self.recipe = recipe
         self.setObjectName("RecipeCard")
         self.setFrameShape(QFrame.StyledPanel)
-        self.setFrameShadow(QFrame.Raised)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 14, 16, 14)
+        root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(10)
 
-        self.lbl_name = QLabel(recipe.name)
-        self.lbl_name.setObjectName("RecipeName")
-        self.lbl_summary = QLabel(recipe_summary(recipe))
-        self.lbl_summary.setObjectName("RecipeSummary")
+        name = QLabel(recipe.name)
+        name.setObjectName("RecipeName")
 
-        root.addWidget(self.lbl_name)
-        root.addWidget(self.lbl_summary)
+        summary = QLabel(recipe_summary(recipe))
+        summary.setObjectName("RecipeSummary")
 
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(12)
+        btn_row.setSpacing(10)
 
-        self.btn_select = BigButton("Select")
-        self.btn_edit = BigButton("Edit")
+        btn_select = TouchButton("Select", min_h=64, min_w=160)
+        btn_edit = TouchButton("Edit", min_h=64, min_w=160)
 
-        btn_row.addWidget(self.btn_select, 1)
-        btn_row.addWidget(self.btn_edit, 1)
+        btn_row.addWidget(btn_select, 1)
+        btn_row.addWidget(btn_edit, 1)
 
+        root.addWidget(name)
+        root.addWidget(summary)
         root.addLayout(btn_row)
 
-        self.btn_select.clicked.connect(lambda: self.select_clicked.emit(self.recipe.id))
-        self.btn_edit.clicked.connect(lambda: self.edit_clicked.emit(self.recipe.id))
+        btn_select.clicked.connect(lambda: self.select_clicked.emit(self.recipe.id))
+        btn_edit.clicked.connect(lambda: self.edit_clicked.emit(self.recipe.id))
 
     def set_selected(self, selected: bool) -> None:
-        # The visual highlight is driven by a dynamic property used in the stylesheet.
+        """Update highlight by toggling a dynamic property used by the stylesheet."""
         self.setProperty("selected", "true" if selected else "false")
         self.style().unpolish(self)
         self.style().polish(self)
 
 
 # ----------------------------
-# Recipe Builder Widgets
+# Recipe Builder Step Row (compact, touch-usable)
 # ----------------------------
 
 class StepRow(QFrame):
     """
-    One step editor row (velocity + duration with +/- controls, remove, reorder).
+    Compact step editor row:
+      - Header: Step label + Up/Down/Remove
+      - Controls: Velocity and Duration on one line
     """
-    remove_clicked = Signal(int)  # index
+
+    remove_clicked = Signal(int)
     move_up_clicked = Signal(int)
     move_down_clicked = Signal(int)
-    changed = Signal()
 
     def __init__(self, index: int, step: Step) -> None:
         super().__init__()
-        self.setObjectName("StepRow")
         self._index = index
-
+        self.setObjectName("StepRow")
         self.setFrameShape(QFrame.StyledPanel)
-        self.setFrameShadow(QFrame.Raised)
 
-        root = QGridLayout(self)
-        root.setContentsMargins(14, 12, 14, 12)
-        root.setHorizontalSpacing(14)
-        root.setVerticalSpacing(10)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(8)
 
-        self.lbl_idx = QLabel(f"Step {index + 1}")
-        self.lbl_idx.setObjectName("StepIndex")
+        # Header row
+        header = QHBoxLayout()
+        header.setSpacing(10)
 
-        self.vel = VelocityAdjust("Velocity", "rpm", VEL_MIN_RPM, VEL_MAX_RPM, VEL_STEP_RPM)
+        self.lbl = QLabel(f"Step {index + 1}")
+        self.lbl.setObjectName("StepIndex")
+
+        header.addWidget(self.lbl, 1)
+
+        btn_h = 54
+        btn_w = 120
+
+        self.btn_up = TouchButton("Up", min_h=btn_h, min_w=btn_w)
+        self.btn_down = TouchButton("Down", min_h=btn_h, min_w=btn_w)
+        self.btn_remove = TouchButton("Remove", min_h=btn_h, min_w=btn_w)
+
+        header.addWidget(self.btn_up)
+        header.addWidget(self.btn_down)
+        header.addWidget(self.btn_remove)
+
+        root.addLayout(header)
+
+        # Controls row (side-by-side)
+        controls = QHBoxLayout()
+        controls.setSpacing(12)
+
+        self.vel = RpmControl("Velocity", VEL_MIN_RPM, VEL_MAX_RPM, VEL_STEP_RPM, compact=True)
         self.vel.set_value(step.velocity_rpm)
 
-        self.tim = TimeAdjust("Time", TIME_STEP_S)
+        self.tim = TimeControl("Time", TIME_STEP_S, compact=True)
         self.tim.set_seconds(step.duration_s)
 
-        self.btn_remove = BigButton("Remove")
-        self.btn_up = BigButton("Up")
-        self.btn_down = BigButton("Down")
+        controls.addWidget(self.vel, 1)
+        controls.addWidget(self.tim, 1)
 
-        self.btn_remove.setMinimumWidth(170)
-        self.btn_up.setMinimumWidth(170)
-        self.btn_down.setMinimumWidth(170)
-
-        root.addWidget(self.lbl_idx, 0, 0, 1, 3)
-        root.addWidget(self.vel, 1, 0, 1, 1)
-        root.addWidget(self.tim, 1, 1, 1, 1)
-
-        btn_col = QVBoxLayout()
-        btn_col.setSpacing(12)
-        btn_col.addWidget(self.btn_up)
-        btn_col.addWidget(self.btn_down)
-        btn_col.addWidget(self.btn_remove)
-        btn_col.addStretch(1)
-
-        root.addLayout(btn_col, 1, 2, 1, 1)
+        root.addLayout(controls)
 
         self.btn_remove.clicked.connect(lambda: self.remove_clicked.emit(self._index))
         self.btn_up.clicked.connect(lambda: self.move_up_clicked.emit(self._index))
         self.btn_down.clicked.connect(lambda: self.move_down_clicked.emit(self._index))
 
-        self.vel.value_changed.connect(lambda _v: self.changed.emit())
-        self.tim.value_changed.connect(lambda _s: self.changed.emit())
-
     def set_index(self, idx: int) -> None:
         self._index = idx
-        self.lbl_idx.setText(f"Step {idx + 1}")
+        self.lbl.setText(f"Step {idx + 1}")
 
     def get_step(self) -> Step:
         return Step(velocity_rpm=float(self.vel.value()), duration_s=int(self.tim.seconds()))
 
 
+# ----------------------------
+# Recipe Builder Screen
+# ----------------------------
+
 class RecipeBuilderScreen(QWidget):
-    """
-    Screen for creating/editing recipes.
-    """
+    """Screen to create or edit recipes with validation and JSON persistence."""
+
     back_clicked = Signal()
-    save_clicked = Signal(Recipe)
     cancel_clicked = Signal()
+    save_clicked = Signal(Recipe)
 
     def __init__(self) -> None:
         super().__init__()
         self._editing_id: Optional[str] = None
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(18, 16, 18, 16)
-        root.setSpacing(16)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(12)
 
         # Top bar
         top = QHBoxLayout()
-        top.setSpacing(14)
+        top.setSpacing(12)
 
-        self.btn_back = BigButton("Back")
-        self.btn_back.setMinimumWidth(180)
-
-        self.lbl_title = QLabel("Recipe Builder")
-        self.lbl_title.setObjectName("ScreenTitle")
+        self.btn_back = TouchButton("Back", min_h=66, min_w=170)
+        self.title = QLabel("Recipe Builder")
+        self.title.setObjectName("ScreenTitle")
 
         top.addWidget(self.btn_back)
-        top.addWidget(self.lbl_title, 1)
+        top.addWidget(self.title, 1)
+
         root.addLayout(top)
 
-        # Name entry
+        # Name row
         name_row = QHBoxLayout()
-        name_row.setSpacing(14)
+        name_row.setSpacing(12)
 
-        name_lbl = QLabel("Recipe Name")
-        name_lbl.setMinimumWidth(180)
-        name_lbl.setObjectName("FieldLabel")
+        lbl_name = QLabel("Name")
+        lbl_name.setObjectName("FieldLabel")
+        lbl_name.setMinimumWidth(120)
 
         self.name_edit = QLineEdit()
-        self.name_edit.setMinimumHeight(70)
+        self.name_edit.setMinimumHeight(66)
         self.name_edit.setPlaceholderText("Enter recipe name")
-        self.name_edit.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
-        name_row.addWidget(name_lbl)
+        name_row.addWidget(lbl_name)
         name_row.addWidget(self.name_edit, 1)
+
         root.addLayout(name_row)
 
-        # Steps list (scrollable)
+        # Steps (scroll)
         self.steps_area = QScrollArea()
         self.steps_area.setWidgetResizable(True)
         self.steps_area.setFrameShape(QFrame.NoFrame)
@@ -1000,61 +1074,49 @@ class RecipeBuilderScreen(QWidget):
         self.steps_container = QWidget()
         self.steps_layout = QVBoxLayout(self.steps_container)
         self.steps_layout.setContentsMargins(0, 0, 0, 0)
-        self.steps_layout.setSpacing(12)
+        self.steps_layout.setSpacing(10)
         self.steps_layout.addStretch(1)
 
         self.steps_area.setWidget(self.steps_container)
         root.addWidget(self.steps_area, 1)
 
-        # Add step
-        self.btn_add_step = BigButton("Add Step")
-        root.addWidget(self.btn_add_step)
+        # Actions
+        actions = QHBoxLayout()
+        actions.setSpacing(12)
 
-        # Bottom actions
-        bottom = QHBoxLayout()
-        bottom.setSpacing(14)
+        self.btn_add = TouchButton("Add Step", min_h=66, min_w=220)
+        self.btn_cancel = TouchButton("Cancel", min_h=66, min_w=220)
+        self.btn_save = TouchButton("Save", min_h=66, min_w=220)
 
-        self.btn_cancel = BigButton("Cancel")
-        self.btn_save = BigButton("Save")
+        actions.addWidget(self.btn_add, 1)
+        actions.addWidget(self.btn_cancel, 1)
+        actions.addWidget(self.btn_save, 1)
 
-        bottom.addWidget(self.btn_cancel, 1)
-        bottom.addWidget(self.btn_save, 1)
-        root.addLayout(bottom)
+        root.addLayout(actions)
 
-        # Signals
         self.btn_back.clicked.connect(self.back_clicked.emit)
         self.btn_cancel.clicked.connect(self.cancel_clicked.emit)
+        self.btn_add.clicked.connect(self._on_add_step)
         self.btn_save.clicked.connect(self._on_save)
-        self.btn_add_step.clicked.connect(self._on_add_step)
 
     def load_recipe(self, recipe: Optional[Recipe]) -> None:
-        """
-        Load an existing recipe for edit, or None for a new recipe.
-        """
-        self._clear_steps()
+        """Load an existing recipe for editing or start a new recipe when recipe is None."""
+        self._clear_rows()
 
         if recipe is None:
             self._editing_id = None
+            self.title.setText("Recipe Builder (New)")
             self.name_edit.setText("")
-            self._add_step(Step(velocity_rpm=120.0, duration_s=60))
-            self.lbl_title.setText("Recipe Builder (New)")
+            self._add_row(Step(velocity_rpm=120.0, duration_s=60))
             return
 
         self._editing_id = recipe.id
+        self.title.setText("Recipe Builder (Edit)")
         self.name_edit.setText(recipe.name)
         for s in recipe.steps:
-            self._add_step(Step(velocity_rpm=float(s.velocity_rpm), duration_s=int(s.duration_s)))
-        self.lbl_title.setText("Recipe Builder (Edit)")
+            self._add_row(Step(velocity_rpm=float(s.velocity_rpm), duration_s=int(s.duration_s)))
 
-    def _clear_steps(self) -> None:
-        # Remove all StepRow widgets while preserving the stretch at the bottom.
-        while self.steps_layout.count() > 1:
-            item = self.steps_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-
-    def _step_rows(self) -> List[StepRow]:
+    def _rows(self) -> List[StepRow]:
         rows: List[StepRow] = []
         for i in range(self.steps_layout.count() - 1):
             w = self.steps_layout.itemAt(i).widget()
@@ -1062,24 +1124,34 @@ class RecipeBuilderScreen(QWidget):
                 rows.append(w)
         return rows
 
-    def _add_step(self, step: Step) -> None:
-        idx = len(self._step_rows())
+    def _clear_rows(self) -> None:
+        """Remove all step row widgets while preserving the stretch."""
+        while self.steps_layout.count() > 1:
+            item = self.steps_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def _add_row(self, step: Step) -> None:
+        idx = len(self._rows())
         row = StepRow(idx, step)
-        row.remove_clicked.connect(self._on_remove_step)
+        row.remove_clicked.connect(self._on_remove)
         row.move_up_clicked.connect(self._on_move_up)
         row.move_down_clicked.connect(self._on_move_down)
-
-        # Insert above the stretch.
         self.steps_layout.insertWidget(self.steps_layout.count() - 1, row)
+
+    def _reindex(self) -> None:
+        for i, r in enumerate(self._rows()):
+            r.set_index(i)
 
     @Slot()
     def _on_add_step(self) -> None:
-        self._add_step(Step(velocity_rpm=120.0, duration_s=60))
+        self._add_row(Step(velocity_rpm=120.0, duration_s=60))
         self._reindex()
 
     @Slot(int)
-    def _on_remove_step(self, idx: int) -> None:
-        rows = self._step_rows()
+    def _on_remove(self, idx: int) -> None:
+        rows = self._rows()
         if idx < 0 or idx >= len(rows):
             return
         rows[idx].deleteLater()
@@ -1090,7 +1162,7 @@ class RecipeBuilderScreen(QWidget):
     def _on_move_up(self, idx: int) -> None:
         if idx <= 0:
             return
-        rows = self._step_rows()
+        rows = self._rows()
         if idx >= len(rows):
             return
         w = rows[idx]
@@ -1100,7 +1172,7 @@ class RecipeBuilderScreen(QWidget):
 
     @Slot(int)
     def _on_move_down(self, idx: int) -> None:
-        rows = self._step_rows()
+        rows = self._rows()
         if idx < 0 or idx >= len(rows) - 1:
             return
         w = rows[idx]
@@ -1108,17 +1180,12 @@ class RecipeBuilderScreen(QWidget):
         self.steps_layout.insertWidget(idx + 1, w)
         self._reindex()
 
-    def _reindex(self) -> None:
-        for i, r in enumerate(self._step_rows()):
-            r.set_index(i)
-
     @Slot()
     def _on_save(self) -> None:
+        """Validate fields and emit a fully populated Recipe."""
         name = self.name_edit.text().strip()
-        rows = self._step_rows()
-        steps = [r.get_step() for r in rows]
+        steps = [r.get_step() for r in self._rows()]
 
-        # Validation per requirements.
         if not name:
             QMessageBox.warning(self, "Validation", "Recipe name is required.")
             return
@@ -1129,7 +1196,7 @@ class RecipeBuilderScreen(QWidget):
             if s.duration_s <= 0:
                 QMessageBox.warning(self, "Validation", f"Step {i}: duration must be > 0.")
                 return
-            if not (VEL_MIN_RPM <= s.velocity_rpm <= VEL_MAX_RPM):
+            if not (VEL_MIN_RPM <= float(s.velocity_rpm) <= VEL_MAX_RPM):
                 QMessageBox.warning(self, "Validation", f"Step {i}: velocity out of range.")
                 return
 
@@ -1142,9 +1209,7 @@ class RecipeBuilderScreen(QWidget):
 # ----------------------------
 
 class HomeScreen(QWidget):
-    """
-    Main screen with status bar, controls, recipe list, and start/stop actions.
-    """
+    """Main screen: status bar, manual controls, recipe list, and start/stop actions."""
 
     start_clicked = Signal()
     stop_clicked = Signal()
@@ -1155,64 +1220,63 @@ class HomeScreen(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
-
         root = QVBoxLayout(self)
-        root.setContentsMargins(18, 16, 18, 16)
-        root.setSpacing(14)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(12)
 
         # Status bar
         self.status_bar = QFrame()
         self.status_bar.setObjectName("StatusBar")
         sb = QHBoxLayout(self.status_bar)
-        sb.setContentsMargins(16, 12, 16, 12)
-        sb.setSpacing(18)
+        sb.setContentsMargins(14, 10, 14, 10)
+        sb.setSpacing(14)
 
         self.lbl_state = QLabel("State: Idle")
         self.lbl_vel = QLabel("Velocity: 0 rpm")
         self.lbl_rem = QLabel("Remaining: 00:00")
         self.lbl_recipe = QLabel("Recipe: (none)")
-        self.lbl_step = QLabel("")  # visible only during recipe runs
+        self.lbl_step = QLabel("")
+        self.lbl_backend = QLabel("")
 
-        for lbl in (self.lbl_state, self.lbl_vel, self.lbl_rem, self.lbl_recipe):
-            lbl.setObjectName("StatusLabel")
-
+        for w in (self.lbl_state, self.lbl_vel, self.lbl_rem, self.lbl_recipe):
+            w.setObjectName("StatusLabel")
         self.lbl_step.setObjectName("StatusStep")
-        self.lbl_step.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_backend.setObjectName("StatusBackend")
 
         sb.addWidget(self.lbl_state)
         sb.addWidget(self.lbl_vel)
         sb.addWidget(self.lbl_rem)
         sb.addWidget(self.lbl_recipe, 1)
         sb.addWidget(self.lbl_step, 2)
+        sb.addWidget(self.lbl_backend, 1)
 
         root.addWidget(self.status_bar)
 
-        # Main controls + recipes area (split)
+        # Middle layout
         mid = QHBoxLayout()
-        mid.setSpacing(16)
+        mid.setSpacing(14)
 
-        # Left controls column
+        # Left controls
         left = QVBoxLayout()
-        left.setSpacing(16)
+        left.setSpacing(12)
 
-        self.vel_ctl = VelocityAdjust("Velocity", "rpm", VEL_MIN_RPM, VEL_MAX_RPM, VEL_STEP_RPM)
-        self.tim_ctl = TimeAdjust("Timer", TIME_STEP_S)
+        self.rpm_ctl = RpmControl("Velocity", VEL_MIN_RPM, VEL_MAX_RPM, VEL_STEP_RPM, compact=False)
+        self.time_ctl = TimeControl("Timer", TIME_STEP_S, compact=False)
 
-        left.addWidget(self.vel_ctl)
-        left.addWidget(self.tim_ctl)
+        self.btn_builder = TouchButton("Recipe Builder", min_h=70, min_w=240)
+        self.btn_clear = TouchButton("Clear Selection", min_h=70, min_w=240)
 
-        self.btn_builder = BigButton("Recipe Builder")
-        self.btn_clear = BigButton("Clear Selection")
-
+        left.addWidget(self.rpm_ctl)
+        left.addWidget(self.time_ctl)
         left.addWidget(self.btn_builder)
         left.addWidget(self.btn_clear)
-
         left.addStretch(1)
+
         mid.addLayout(left, 1)
 
-        # Recipe list area
+        # Recipe list
         recipes_col = QVBoxLayout()
-        recipes_col.setSpacing(10)
+        recipes_col.setSpacing(8)
 
         title = QLabel("Recipes")
         title.setObjectName("SectionTitle")
@@ -1225,7 +1289,7 @@ class HomeScreen(QWidget):
         self.recipes_container = QWidget()
         self.recipes_layout = QVBoxLayout(self.recipes_container)
         self.recipes_layout.setContentsMargins(0, 0, 0, 0)
-        self.recipes_layout.setSpacing(12)
+        self.recipes_layout.setSpacing(10)
         self.recipes_layout.addStretch(1)
 
         self.recipes_area.setWidget(self.recipes_container)
@@ -1234,30 +1298,27 @@ class HomeScreen(QWidget):
         mid.addLayout(recipes_col, 2)
         root.addLayout(mid, 1)
 
-        # Bottom action bar
+        # Bottom actions
         bottom = QHBoxLayout()
-        bottom.setSpacing(16)
+        bottom.setSpacing(14)
 
-        self.btn_start = BigButton("Start")
-        self.btn_stop = BigButton("Stop")
+        self.btn_start = TouchButton("Start", min_h=76, min_w=240)
+        self.btn_stop = TouchButton("Stop", min_h=76, min_w=240)
+        self.btn_start.setObjectName("StartButton")
+        self.btn_stop.setObjectName("StopButton")
 
         bottom.addWidget(self.btn_start, 1)
         bottom.addWidget(self.btn_stop, 1)
+
         root.addLayout(bottom)
 
-        # Signals
         self.btn_start.clicked.connect(self.start_clicked.emit)
         self.btn_stop.clicked.connect(self.stop_clicked.emit)
         self.btn_builder.clicked.connect(self.open_builder_clicked.emit)
         self.btn_clear.clicked.connect(self.clear_selection_clicked.emit)
 
     def set_recipe_cards(self, recipes: List[Recipe], selected_id: Optional[str]) -> None:
-        """
-        Rebuild the recipe list with large card widgets.
-
-        The list is rebuilt (rather than incrementally diffed) to keep behavior simple and robust.
-        """
-        # Remove all cards while preserving the stretch at the bottom.
+        """Rebuild the recipe card list."""
         while self.recipes_layout.count() > 1:
             item = self.recipes_layout.takeAt(0)
             w = item.widget()
@@ -1273,59 +1334,53 @@ class HomeScreen(QWidget):
 
     def set_running_ui(self, running: bool) -> None:
         """
-        Enforce UI rules:
+        Enforce key home-screen behaviors:
           - Start disabled while running
-          - Stop enabled while running (may be disabled when idle)
+          - Stop enabled only while running
+          - Lock inputs and recipe selection while running
         """
         self.btn_start.setEnabled(not running)
         self.btn_stop.setEnabled(running)
 
-        # While running, lock the controls to avoid changing the active run parameters mid-run.
-        self.vel_ctl.set_enabled_adjustment(not running)
-        self.tim_ctl.set_enabled_adjustment(not running)
+        self.rpm_ctl.set_enabled(not running)
+        self.time_ctl.set_enabled(not running)
 
-        # Recipe selection should not change while running.
         self.btn_builder.setEnabled(not running)
         self.btn_clear.setEnabled(not running)
         self.recipes_area.setEnabled(not running)
 
     def set_timer_enabled(self, enabled: bool) -> None:
-        """
-        Disable the main timer control when a recipe is selected (per requirements).
-        """
-        self.tim_ctl.set_enabled_adjustment(enabled)
+        """Disable the manual timer input when a recipe is selected."""
+        self.time_ctl.set_enabled(enabled)
 
     def set_status(
         self,
-        state_text: str,
-        active_rpm: float,
+        ui_state: str,
+        rpm: float,
         remaining_s: int,
-        selected_recipe_name: str,
-        step_text: str,
+        recipe_name: str,
+        step_info: str,
+        backend_state: str,
     ) -> None:
-        self.lbl_state.setText(f"State: {state_text}")
-        self.lbl_vel.setText(f"Velocity: {active_rpm:g} rpm")
+        self.lbl_state.setText(f"State: {ui_state}")
+        self.lbl_vel.setText(f"Velocity: {rpm:g} rpm")
         self.lbl_rem.setText(f"Remaining: {format_mmss(remaining_s)}")
-        self.lbl_recipe.setText(f"Recipe: {selected_recipe_name}")
-        self.lbl_step.setText(step_text)
+        self.lbl_recipe.setText(f"Recipe: {recipe_name}")
+        self.lbl_step.setText(step_info)
+        self.lbl_backend.setText(backend_state)
 
 
 # ----------------------------
-# Controller (connects UI, engine, storage, worker)
+# Controller (wires UI, engine, storage, worker)
 # ----------------------------
 
 class AppController(QObject):
     """
-    Central controller with a simple MVC-ish separation:
-      - Views: HomeScreen, RecipeBuilderScreen
-      - Model/Storage: RecipeStore, Recipe/Step dataclasses
-      - Logic: RunEngine, OdriveWorker
-
-    The controller is responsible for:
-      - validating start conditions
-      - maintaining selected recipe state
-      - updating UI based on engine signals
-      - stopping motor safely on app exit
+    Central controller:
+      - Manages selection state and start/stop rules
+      - Persists recipes via RecipeStore
+      - Drives RunEngine and sends motor commands to OdriveWorker
+      - Ensures safe shutdown by stopping the motor when exiting
     """
 
     def __init__(self, stack: QStackedWidget, home: HomeScreen, builder: RecipeBuilderScreen) -> None:
@@ -1341,34 +1396,32 @@ class AppController(QObject):
         self.connected: bool = False
         self.backend_state: str = "Disconnected"
 
-        # Create motor backend.
+        # Backend + worker thread
         backend: OdriveInterface = SimulatedOdrive() if BACKEND == "sim" else RealOdrive()
 
-        # Worker thread for motor commands.
         self.worker_thread = QThread()
         self.worker = OdriveWorker(backend)
         self.worker.moveToThread(self.worker_thread)
 
-        # Engine (timer-driven state machine).
+        # Run engine
         self.engine = RunEngine()
 
-        # Wire engine -> worker (queued across threads).
+        # Engine -> worker (queued across threads)
         self.engine.request_set_rpm.connect(self.worker.set_velocity_rpm)
         self.engine.request_stop.connect(self.worker.stop)
 
-        # Wire worker -> controller.
-        self.worker.connected_changed.connect(self._on_connected_changed)
-        self.worker.backend_state_changed.connect(self._on_backend_state)
+        # Worker -> controller/UI
+        self.worker.connected_changed.connect(self._on_connected)
+        self.worker.state_changed.connect(self._on_backend_state)
         self.worker.error.connect(self._on_worker_error)
 
-        # Wire engine -> controller/UI.
+        # Engine -> UI
         self.engine.status_changed.connect(self._on_engine_status)
         self.engine.active_rpm_changed.connect(self._on_engine_rpm)
-        self.engine.time_remaining_changed.connect(self._on_engine_remaining)
-        self.engine.total_remaining_changed.connect(self._on_engine_total_remaining)
-        self.engine.recipe_step_changed.connect(self._on_engine_step)
+        self.engine.remaining_changed.connect(self._on_engine_remaining)
+        self.engine.step_info_changed.connect(self._on_step_info)
 
-        # Wire UI -> controller.
+        # UI -> controller
         self.home.start_clicked.connect(self.on_start)
         self.home.stop_clicked.connect(self.on_stop)
         self.home.open_builder_clicked.connect(self.on_open_builder_new)
@@ -1376,34 +1429,31 @@ class AppController(QObject):
         self.home.recipe_select_clicked.connect(self.on_select_recipe)
         self.home.recipe_edit_clicked.connect(self.on_edit_recipe)
 
-        self.builder.back_clicked.connect(self.on_back_to_home)
-        self.builder.cancel_clicked.connect(self.on_back_to_home)
+        self.builder.back_clicked.connect(self.on_back_home)
+        self.builder.cancel_clicked.connect(self.on_back_home)
         self.builder.save_clicked.connect(self.on_builder_save)
 
-        # Cached display fields.
-        self._ui_state_text = "Idle"
-        self._ui_active_rpm = 0.0
-        self._ui_remaining_s = 0
-        self._ui_step_text = ""
+        # Cached fields for status bar
+        self._ui_state = "Idle"
+        self._ui_rpm = 0.0
+        self._ui_remaining = 0
+        self._ui_step_info = ""
 
-        # Start worker thread and connect backend.
+        # Start worker thread and connect backend
         self.worker_thread.start()
         QMetaObject.invokeMethod(self.worker, "connect_backend", Qt.QueuedConnection)
 
-        # Initial UI build.
-        self._refresh_recipe_list()
-        self._refresh_home_status()
+        self._refresh_recipes()
+        self._refresh_home()
 
     def shutdown(self) -> None:
         """
-        Safe shutdown:
-          - Stop engine (and therefore motor) if running.
-          - Ensure the worker executes stop() before the thread exits.
+        Stop the motor safely if running and shut down the worker thread.
         """
         try:
             if self.engine.is_running():
-                self.engine.stop()
-                # BlockingQueuedConnection ensures stop() runs in the worker thread before proceeding.
+                self.engine.stop(user_initiated=True)
+                # Ensure stop() runs in the worker thread before quitting.
                 QMetaObject.invokeMethod(self.worker, "stop", Qt.BlockingQueuedConnection)
         except Exception:
             pass
@@ -1414,7 +1464,7 @@ class AppController(QObject):
     def _recipes(self) -> List[Recipe]:
         return self.store.recipes()
 
-    def _get_selected_recipe(self) -> Optional[Recipe]:
+    def _selected_recipe(self) -> Optional[Recipe]:
         if not self.selected_recipe_id:
             return None
         for r in self._recipes():
@@ -1422,104 +1472,102 @@ class AppController(QObject):
                 return r
         return None
 
-    def _refresh_recipe_list(self) -> None:
+    def _refresh_recipes(self) -> None:
         self.home.set_recipe_cards(self._recipes(), self.selected_recipe_id)
-        selected = self._get_selected_recipe()
-        # Disable timer control if a recipe is selected (per execution rules).
-        self.home.set_timer_enabled(enabled=(selected is None))
+        self.home.set_timer_enabled(enabled=(self._selected_recipe() is None))
 
-    def _refresh_home_status(self) -> None:
-        selected = self._get_selected_recipe()
-        selected_name = selected.name if selected else "(none)"
-
+    def _refresh_home(self) -> None:
+        selected = self._selected_recipe()
+        recipe_name = selected.name if selected else "(none)"
         self.home.set_status(
-            state_text=self._ui_state_text,
-            active_rpm=self._ui_active_rpm,
-            remaining_s=self._ui_remaining_s,
-            selected_recipe_name=selected_name,
-            step_text=self._ui_step_text,
+            ui_state=self._ui_state,
+            rpm=self._ui_rpm,
+            remaining_s=self._ui_remaining,
+            recipe_name=recipe_name,
+            step_info=self._ui_step_info,
+            backend_state=self.backend_state,
         )
         self.home.set_running_ui(self.engine.is_running())
 
+    # ---- Worker callbacks ----
+
     @Slot(bool, str)
-    def _on_connected_changed(self, connected: bool, backend_state: str) -> None:
+    def _on_connected(self, connected: bool, state: str) -> None:
         self.connected = connected
-        self.backend_state = backend_state
+        self.backend_state = state
         if BACKEND == "real" and not connected:
             QMessageBox.critical(
                 self.home,
                 "ODrive Connection",
                 "ODrive is not connected.\n\n"
-                "Switch to simulation mode or implement RealOdrive.connect() for your hardware.",
+                "Check power/USB and ensure the odrive Python package is installed.",
             )
+        self._refresh_home()
 
     @Slot(str)
     def _on_backend_state(self, state: str) -> None:
         self.backend_state = state
+        self._refresh_home()
 
     @Slot(str)
     def _on_worker_error(self, msg: str) -> None:
-        # On worker errors during a run, stop the motor and return to Idle.
         if self.engine.is_running():
-            self.engine.stop()
+            self.engine.stop(user_initiated=True)
         QMessageBox.critical(self.home, "Motor Error", msg)
-        self._refresh_home_status()
+        self._refresh_home()
+
+    # ---- Engine callbacks ----
 
     @Slot(str)
     def _on_engine_status(self, status: str) -> None:
-        self._ui_state_text = status
-        self._refresh_home_status()
+        self._ui_state = status
+        self._refresh_home()
 
     @Slot(float)
     def _on_engine_rpm(self, rpm: float) -> None:
-        self._ui_active_rpm = float(rpm)
-        self._refresh_home_status()
+        self._ui_rpm = float(rpm)
+        self._refresh_home()
 
     @Slot(int)
     def _on_engine_remaining(self, seconds: int) -> None:
-        # This is step remaining for recipe mode, or total remaining for single mode.
-        self._ui_remaining_s = int(seconds)
-        self._refresh_home_status()
-
-    @Slot(int)
-    def _on_engine_total_remaining(self, _seconds: int) -> None:
-        # The home screen displays a single remaining time value. For a richer UI, this can be split.
-        pass
+        self._ui_remaining = int(seconds)
+        self._refresh_home()
 
     @Slot(str)
-    def _on_engine_step(self, step_text: str) -> None:
-        self._ui_step_text = step_text
-        self._refresh_home_status()
+    def _on_step_info(self, info: str) -> None:
+        self._ui_step_info = info
+        self._refresh_home()
+
+    # ---- UI actions ----
 
     @Slot()
     def on_start(self) -> None:
         if self.engine.is_running():
             return
-
         if BACKEND == "real" and not self.connected:
             QMessageBox.critical(self.home, "ODrive Not Connected", "Cannot start: ODrive is not connected.")
             return
 
-        rpm = clamp(self.home.vel_ctl.value(), VEL_MIN_RPM, VEL_MAX_RPM)
-        selected = self._get_selected_recipe()
+        rpm = clamp(self.home.rpm_ctl.value(), VEL_MIN_RPM, VEL_MAX_RPM)
+        recipe = self._selected_recipe()
 
-        if selected is None:
-            duration = self.home.tim_ctl.seconds()
+        if recipe is None:
+            duration = self.home.time_ctl.seconds()
             if duration <= 0:
                 QMessageBox.information(self.home, "Start", "Set a timer or select a recipe.")
                 return
             self.engine.start_single(rpm, duration)
             return
 
-        # Recipe selected: ignore the main timer and run the recipe.
-        if len(selected.steps) < 1:
+        if len(recipe.steps) < 1:
             QMessageBox.warning(self.home, "Start", "Selected recipe has no steps.")
             return
-        self.engine.start_recipe(selected)
+
+        self.engine.start_recipe(recipe)
 
     @Slot()
     def on_stop(self) -> None:
-        self.engine.stop()
+        self.engine.stop(user_initiated=True)
 
     @Slot()
     def on_open_builder_new(self) -> None:
@@ -1529,27 +1577,26 @@ class AppController(QObject):
         self.stack.setCurrentWidget(self.builder)
 
     @Slot()
-    def on_back_to_home(self) -> None:
+    def on_back_home(self) -> None:
         self.stack.setCurrentWidget(self.home)
-        self._refresh_recipe_list()
-        self._refresh_home_status()
+        self._refresh_recipes()
+        self._refresh_home()
 
     @Slot()
     def on_clear_selection(self) -> None:
         if self.engine.is_running():
             return
         self.selected_recipe_id = None
-        self._refresh_recipe_list()
-        self._refresh_home_status()
+        self._refresh_recipes()
+        self._refresh_home()
 
     @Slot(str)
     def on_select_recipe(self, recipe_id: str) -> None:
         if self.engine.is_running():
             return
-        # Toggle selection: selecting the same recipe again unselects it.
         self.selected_recipe_id = None if self.selected_recipe_id == recipe_id else recipe_id
-        self._refresh_recipe_list()
-        self._refresh_home_status()
+        self._refresh_recipes()
+        self._refresh_home()
 
     @Slot(str)
     def on_edit_recipe(self, recipe_id: str) -> None:
@@ -1564,24 +1611,17 @@ class AppController(QObject):
     @Slot(Recipe)
     def on_builder_save(self, recipe: Recipe) -> None:
         self.store.upsert(recipe)
-        # Keep the selection stable if the edited recipe was selected.
-        if self.selected_recipe_id == recipe.id:
-            self.selected_recipe_id = recipe.id
         self.stack.setCurrentWidget(self.home)
-        self._refresh_recipe_list()
-        self._refresh_home_status()
+        self._refresh_recipes()
+        self._refresh_home()
 
 
 # ----------------------------
-# Main Window Shell
+# Main Window
 # ----------------------------
 
 class MainWindow(QWidget):
-    """
-    Simple fixed-size main window that hosts a QStackedWidget (Home / Builder).
-
-    closeEvent enforces safe stop behavior when the application is closed mid-run.
-    """
+    """Fixed-size window hosting the Home and Recipe Builder screens."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -1594,9 +1634,9 @@ class MainWindow(QWidget):
         self.stack.addWidget(self.home)
         self.stack.addWidget(self.builder)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.stack)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(self.stack)
 
         self.controller = AppController(self.stack, self.home, self.builder)
 
@@ -1609,15 +1649,10 @@ class MainWindow(QWidget):
 # Styling
 # ----------------------------
 
-def apply_touch_style(app: QApplication) -> None:
-    """
-    Apply a high-contrast, large-font stylesheet.
-
-    The stylesheet avoids small hit targets by enforcing minimum heights in code and
-    uses padding and border radius for clear separation.
-    """
+def apply_style(app: QApplication) -> None:
+    """Apply a high-contrast, large-font stylesheet suitable for touchscreens."""
     base_font = QFont()
-    base_font.setPointSize(12)  # Combined with stylesheet pixel sizes for consistent touch readability.
+    base_font.setPointSize(12)
     app.setFont(base_font)
 
     app.setStyleSheet(
@@ -1638,9 +1673,19 @@ def apply_touch_style(app: QApplication) -> None:
             font-weight: 650;
         }
 
+        QLabel#SectionTitleCompact {
+            font-size: 20px;
+            font-weight: 650;
+        }
+
         QLabel#FieldLabel {
             font-size: 22px;
-            font-weight: 600;
+            font-weight: 650;
+        }
+
+        QLabel#UnitsLabel {
+            font-size: 18px;
+            color: #D0D7DE;
         }
 
         QFrame#StatusBar {
@@ -1651,7 +1696,7 @@ def apply_touch_style(app: QApplication) -> None:
 
         QLabel#StatusLabel {
             font-size: 20px;
-            font-weight: 600;
+            font-weight: 650;
         }
 
         QLabel#StatusStep {
@@ -1659,11 +1704,16 @@ def apply_touch_style(app: QApplication) -> None:
             color: #D0D7DE;
         }
 
+        QLabel#StatusBackend {
+            font-size: 16px;
+            color: #9FB0C0;
+        }
+
         QLineEdit {
             background: #0B0F14;
             border: 2px solid #2A313A;
             border-radius: 14px;
-            padding: 10px 14px;
+            padding: 8px 12px;
             font-size: 26px;
         }
 
@@ -1671,18 +1721,13 @@ def apply_touch_style(app: QApplication) -> None:
             background: #2B3440;
             border: 2px solid #3A4656;
             border-radius: 16px;
-            padding: 12px 18px;
-            font-size: 26px;
+            padding: 10px 14px;
+            font-size: 24px;
             font-weight: 650;
         }
 
-        QPushButton:hover {
-            background: #354152;
-        }
-
-        QPushButton:pressed {
-            background: #202733;
-        }
+        QPushButton:hover { background: #354152; }
+        QPushButton:pressed { background: #202733; }
 
         QPushButton:disabled {
             background: #1C222B;
@@ -1690,23 +1735,17 @@ def apply_touch_style(app: QApplication) -> None:
             color: #7A8794;
         }
 
-        QPushButton[text="Start"] {
+        QPushButton#StartButton {
             background: #1E5F3C;
             border: 2px solid #2D7B52;
         }
+        QPushButton#StartButton:hover { background: #21704A; }
 
-        QPushButton[text="Start"]:hover {
-            background: #21704A;
-        }
-
-        QPushButton[text="Stop"] {
+        QPushButton#StopButton {
             background: #6B1E1E;
             border: 2px solid #8B2A2A;
         }
-
-        QPushButton[text="Stop"]:hover {
-            background: #7A2424;
-        }
+        QPushButton#StopButton:hover { background: #7A2424; }
 
         QFrame#RecipeCard {
             background: #161B22;
@@ -1735,24 +1774,22 @@ def apply_touch_style(app: QApplication) -> None:
         }
 
         QLabel#StepIndex {
-            font-size: 22px;
+            font-size: 20px;
             font-weight: 700;
         }
 
-        QScrollArea {
-            border: none;
-        }
+        QScrollArea { border: none; }
         """
     )
 
 
 # ----------------------------
-# Entry point
+# Entry Point
 # ----------------------------
 
 def main() -> int:
     app = QApplication(sys.argv)
-    apply_touch_style(app)
+    apply_style(app)
 
     w = MainWindow()
     w.show()
