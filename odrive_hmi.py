@@ -396,19 +396,53 @@ class SettingSpec:
     max_value: Optional[float] = None
 
 
+# Defaults chosen for an agitator that can see significant load:
+# - Raise current limits above the prior ultra-conservative values, but keep them moderate.
+# - Keep watchdog disabled by default (app does not feed watchdog).
+# - Encoder defaults assume a typical incremental encoder is present (8192 CPR) but can be edited.
 IMPORTANT_SETTINGS: List[SettingSpec] = [
+    # --- Startup behavior (keep off for open-loop / avoid surprise calibrations) ---
     SettingSpec("axis0.config.startup_motor_calibration", "Startup: motor calibration", "bool", False),
     SettingSpec("axis0.config.startup_encoder_offset_calibration", "Startup: encoder offset calibration", "bool", False),
     SettingSpec("axis0.config.startup_encoder_index_search", "Startup: encoder index search", "bool", False),
     SettingSpec("axis0.config.startup_closed_loop_control", "Startup: closed loop control", "bool", False),
-    SettingSpec("axis0.config.motor.current_soft_max", "Motor: current soft max (A)", "float", 5.0, 0.0, 50.0),
-    SettingSpec("axis0.config.motor.current_hard_max", "Motor: current hard max (A)", "float", 8.0, 0.0, 100.0),
-    SettingSpec("axis0.config.general_lockin.current", "Lock-in: current (A)", "float", 2.0, 0.0, 20.0),
+
+    # --- Motor torque capability (limits) ---
+    SettingSpec("axis0.config.motor.current_soft_max", "Motor: current soft max (A)", "float", 20.0, 0.0, 60.0),
+    SettingSpec("axis0.config.motor.current_hard_max", "Motor: current hard max (A)", "float", 30.0, 0.0, 100.0),
+
+    # --- Open-loop lock-in profile (open-loop torque & ramping) ---
+    SettingSpec("axis0.config.general_lockin.current", "Lock-in: current (A)", "float", 6.0, 0.0, 60.0),
     SettingSpec("axis0.config.general_lockin.ramp_time", "Lock-in: ramp time (s)", "float", 1.0, 0.0, 30.0),
     SettingSpec("axis0.config.general_lockin.ramp_distance", "Lock-in: ramp distance (turns)", "float", 1.0, 0.0, 100.0),
-    SettingSpec("axis0.config.general_lockin.accel", "Lock-in: accel (turn/s²)", "float", 10.0, 0.0, 1000.0),
+    SettingSpec("axis0.config.general_lockin.accel", "Lock-in: accel (turn/s²)", "float", 20.0, 0.0, 2000.0),
     SettingSpec("axis0.config.general_lockin.finish_on_vel", "Lock-in: finish on vel", "bool", False),
     SettingSpec("axis0.config.general_lockin.finish_on_distance", "Lock-in: finish on distance", "bool", False),
+
+    # --- DC bus / supply-side limiting & protection (prevents “weak under load” from supply caps) ---
+    SettingSpec("config.dc_max_positive_current", "DC bus: max positive current (A)", "float", 25.0, 0.0, 120.0),
+    SettingSpec("config.dc_max_negative_current", "DC bus: max regen current (A, negative)", "float", -2.0, -120.0, 0.0),
+    SettingSpec("config.dc_bus_undervoltage_trip_level", "DC bus: undervoltage trip (V)", "float", 10.0, 0.0, 60.0),
+    SettingSpec("config.dc_bus_overvoltage_trip_level", "DC bus: overvoltage trip (V)", "float", 30.0, 0.0, 80.0),
+
+    # --- Brake resistor / regen clamp support (optional but important for spinning loads) ---
+    SettingSpec("config.enable_brake_resistor", "Brake resistor: enabled", "bool", False),
+    SettingSpec("config.brake_resistance", "Brake resistor: resistance (ohm)", "float", 2.0, 0.1, 20.0),
+
+    # --- Motor model (helps torque reporting and sanity; do not change unless you know your motor) ---
+    SettingSpec("axis0.config.motor.pole_pairs", "Motor: pole pairs", "int", 7, 1, 50),
+    SettingSpec("axis0.config.motor.torque_constant", "Motor: torque constant (Nm/A)", "float", 0.0306, 0.0001, 1.0),
+
+    # --- Current loop tuning (torque response) ---
+    SettingSpec("axis0.config.motor.current_control_bandwidth", "Motor: current control bandwidth", "float", 1000.0, 10.0, 5000.0),
+
+    # --- Encoder essentials (so vel_estimate / Actual RPM can be meaningful) ---
+    SettingSpec("inc_encoder0.config.enabled", "Encoder: incremental enabled", "bool", True),
+    SettingSpec("inc_encoder0.config.cpr", "Encoder: incremental CPR", "int", 8192, 1, 200000),
+
+    # --- Safety watchdog (leave disabled unless you also feed it) ---
+    SettingSpec("axis0.config.enable_watchdog", "Safety: enable watchdog", "bool", False),
+    SettingSpec("axis0.config.watchdog_timeout", "Safety: watchdog timeout (s)", "float", 1.0, 0.1, 10.0),
 ]
 
 DEFAULT_CONFIG_MAP: Dict[str, Any] = {s.key: s.default for s in IMPORTANT_SETTINGS}
