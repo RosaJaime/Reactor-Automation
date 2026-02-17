@@ -128,8 +128,8 @@ TAG_DEADBAND: Dict[str, float] = {
     TAG_VBUS_V: 0.1,
     TAG_IBUS_A: 0.05,
     TAG_PWR_W: 0.05,
-    TAG_CMD_RPM: 0.5,
-    TAG_VEL_RPM: 2.0,
+    TAG_CMD_RPM: 0.1,
+    TAG_VEL_RPM: 0.1,
 }
 TAG_HEARTBEAT_S: Dict[str, int] = {t: DB_HEARTBEAT_S_DEFAULT for t in TAG_DEADBAND}
 
@@ -2702,8 +2702,9 @@ class AppController(QObject):
         self._ui_rpm = float(rpm)
         self._cmd_rpm = float(rpm)
 
-        # Keep the Home RPM control display aligned with the active commanded rpm without causing feedback loops.
-        if not self.home.rpm_ctl.edit.hasFocus():
+        # Only force the Home RPM entry to follow the engine while running.
+        # When stopped, keep whatever the user last typed (don't overwrite to 0).
+        if self.engine.is_running() and not self.home.rpm_ctl.edit.hasFocus():
             self.home.rpm_ctl.set_value(float(rpm), emit_signal=False)
 
         self._refresh_status_all()
