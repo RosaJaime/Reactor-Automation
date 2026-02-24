@@ -15,18 +15,24 @@ from typing import Any, Dict
 HMI_DEFAULT_CONFIG_VALUES: Dict[str, Any] = {
     "config.dc_bus_overvoltage_trip_level": 25.0,
     "config.dc_bus_undervoltage_trip_level": 10.5,
-    "config.dc_max_positive_current": 25.0,
-    "config.dc_max_negative_current": -2.0,
-    "config.enable_brake_resistor": True,
-    "config.brake_resistance": 2.0,
+    "config.dc_max_positive_current": 120.0,
+    "config.dc_max_negative_current": -120.0,
+    "config.brake_resistor0.enable": True,
+    "config.brake_resistor0.resistance": 2.0,
     "axis0.config.startup_motor_calibration": False,
     "axis0.config.startup_encoder_offset_calibration": False,
     "axis0.config.startup_encoder_index_search": False,
     "axis0.config.startup_closed_loop_control": False,
     "axis0.config.motor.pole_pairs": 20,
     "axis0.config.motor.torque_constant": 0.0827,
-    "axis0.config.motor.current_soft_max": 20.0,
-    "axis0.config.motor.current_hard_max": 36.0,
+    "axis0.config.motor.current_soft_max": 50.0,
+    "axis0.config.motor.current_hard_max": 70.0,
+    "axis0.config.motor.calibration_current": 10.0,
+    "axis0.config.motor.resistance_calib_max_voltage": 2.0,
+    "axis0.config.calibration_lockin.current": 10.0,
+    "axis0.controller.config.vel_limit": 10.0,
+    "axis0.controller.config.vel_limit_tolerance": 1.2,
+    "axis0.controller.config.vel_ramp_rate": 10.0,
     "axis0.config.enable_watchdog": False,
     "axis0.config.watchdog_timeout": 1.0,
 }
@@ -130,15 +136,25 @@ SCRIPT_DEFAULT_ASSIGNMENTS = [
     ("config.dc_max_negative_current", -math.inf),
     ("config.brake_resistor0.enable", True),
     ("config.brake_resistor0.resistance", 2.0),
-    ("axis0.config.motor.current_soft_max", 20.0),
-    ("axis0.config.motor.current_hard_max", 36.0),
+    ("axis0.config.motor.motor_type", "MotorType.PMSM_CURRENT_CONTROL"),
+    ("axis0.config.motor.pole_pairs", 20),
+    ("axis0.config.motor.torque_constant", 0.0827),
+    ("axis0.config.motor.current_soft_max", 50.0),
+    ("axis0.config.motor.current_hard_max", 70.0),
     ("axis0.config.motor.calibration_current", 10.0),
     ("axis0.config.motor.resistance_calib_max_voltage", 2.0),
     ("axis0.config.calibration_lockin.current", 10.0),
+    ("axis0.motor.motor_thermistor.config.enabled", False),
+    ("axis0.controller.config.control_mode", "ControlMode.VELOCITY_CONTROL"),
+    ("axis0.controller.config.input_mode", "InputMode.VEL_RAMP"),
     ("axis0.config.enable_watchdog", False),
-    ("axis0.controller.config.vel_limit", 30.0),
-    ("axis0.controller.config.vel_limit_tolerance", 1.0666666666666667),
+    ("axis0.controller.config.vel_limit", 10.0),
+    ("axis0.controller.config.vel_limit_tolerance", 1.2),
     ("axis0.controller.config.vel_ramp_rate", 10.0),
+    ("axis0.config.load_encoder", "EncoderId.ONBOARD_ENCODER0"),
+    ("axis0.config.commutation_encoder", "EncoderId.ONBOARD_ENCODER0"),
+    ("can.config.protocol", "Protocol.NONE"),
+    ("config.enable_uart_a", False),
 ]
 
 
@@ -150,7 +166,23 @@ def _set_attr_path(root: Any, key: str, value: Any) -> None:
     setattr(obj, parts[-1], value)
 
 
+def _resolve_script_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    if "." not in value:
+        return value
+    enum_type_name, enum_member = value.split(".", 1)
+    try:
+        from odrive import enums as odrive_enums  # type: ignore
+    except Exception:
+        return value
+    enum_type = getattr(odrive_enums, enum_type_name, None)
+    if enum_type is None:
+        return value
+    return getattr(enum_type, enum_member, value)
+
+
 def apply_script_defaults(odrv: Any) -> None:
     """Apply the shared script defaults to an ODrive object."""
     for key, value in SCRIPT_DEFAULT_ASSIGNMENTS:
-        _set_attr_path(odrv, key, value)
+        _set_attr_path(odrv, key, _resolve_script_value(value))

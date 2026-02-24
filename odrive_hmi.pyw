@@ -48,10 +48,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 try:
-    from odrive_configuration import HMI_DEFAULT_CONFIG_VALUES, ODRIVE_MOTOR_PRESETS
+    from odrive_configuration import HMI_DEFAULT_CONFIG_VALUES, ODRIVE_MOTOR_PRESETS, SCRIPT_DEFAULT_ASSIGNMENTS
 except Exception:
     HMI_DEFAULT_CONFIG_VALUES = {}
     ODRIVE_MOTOR_PRESETS = {}
+    SCRIPT_DEFAULT_ASSIGNMENTS = []
 
 from PySide6.QtCore import (
     QObject,
@@ -424,11 +425,19 @@ ODRIVE_CONFIG_FIELDS: List[SettingSpec] = [
     SettingSpec("config.dc_max_negative_current", "DC bus: max regen current (A, negative)", "float", -2.0, -120.0, 0.0),
     SettingSpec("config.dc_bus_undervoltage_trip_level", "DC bus: undervoltage trip (V)", "float", 10.0, 0.0, 60.0),
     SettingSpec("config.dc_bus_overvoltage_trip_level", "DC bus: overvoltage trip (V)", "float", 30.0, 0.0, 80.0),
+    SettingSpec("config.brake_resistor0.enable", "Brake resistor: enable", "bool", True),
+    SettingSpec("config.brake_resistor0.resistance", "Brake resistor: resistance (ohm)", "float", 2.0, 0.1, 50.0),
 
     SettingSpec("axis0.config.motor.pole_pairs", "Motor: pole pairs", "int", 7, 1, 50),
     SettingSpec("axis0.config.motor.torque_constant", "Motor: torque constant (Nm/A)", "float", 0.0306, 0.0001, 1.0),
+    SettingSpec("axis0.config.motor.calibration_current", "Motor: calibration current (A)", "float", 10.0, 0.0, 100.0),
+    SettingSpec("axis0.config.motor.resistance_calib_max_voltage", "Motor: resistance calib max voltage (V)", "float", 2.0, 0.1, 30.0),
+    SettingSpec("axis0.config.calibration_lockin.current", "Calibration lock-in: current (A)", "float", 10.0, 0.0, 100.0),
 
     SettingSpec("axis0.config.motor.current_control_bandwidth", "Motor: current control bandwidth", "float", 1000.0, 10.0, 5000.0),
+    SettingSpec("axis0.controller.config.vel_limit", "Controller: velocity limit (turn/s)", "float", 10.0, 0.1, 200.0),
+    SettingSpec("axis0.controller.config.vel_limit_tolerance", "Controller: vel limit tolerance", "float", 1.2, 1.0, 5.0),
+    SettingSpec("axis0.controller.config.vel_ramp_rate", "Controller: vel ramp rate (turn/s^2)", "float", 10.0, 0.0, 2000.0),
 
     SettingSpec("inc_encoder0.config.enabled", "Encoder: incremental enabled", "bool", True),
     SettingSpec("inc_encoder0.config.cpr", "Encoder: incremental CPR", "int", 8192, 1, 200000),
@@ -459,6 +468,7 @@ class OdriveInterface:
     def apply_config(self, values: Dict[str, Any]) -> Tuple[bool, str, List[str]]: raise NotImplementedError
     def save_config(self, values: Dict[str, Any]) -> Tuple[bool, str, List[str]]: raise NotImplementedError
     def erase_config(self) -> Tuple[bool, str]: raise NotImplementedError
+    def clear_errors(self) -> Tuple[bool, str]: raise NotImplementedError
     def get_tags(self, tags: Sequence[str]) -> Dict[str, float]: raise NotImplementedError
     def get_json(self) -> str: raise NotImplementedError
 
@@ -528,6 +538,10 @@ class SimulatedOdrive(OdriveInterface):
         self._config = dict(DEFAULT_CONFIG_MAP)
         self._state = "Idle"
         return True, "Simulation config reset to defaults"
+
+    def clear_errors(self) -> Tuple[bool, str]:
+        self._state = "Idle"
+        return True, "Simulation errors cleared"
 
     def _update_actual(self) -> None:
         now = time.monotonic()
@@ -753,6 +767,21 @@ class RealOdrive(OdriveInterface):
             except Exception:
                 pass
 
+    def clear_errors(self) -> Tuple[bool, str]:
+        if not self._connected:
+            return False, "ODrive not connected"
+        try:
+            self._clear_errors()
+            try:
+                if self._AxisState is not None and self._axis is not None:
+                    self._axis.requested_state = self._AxisState.IDLE
+            except Exception:
+                pass
+            self._state = "Idle (errors cleared)"
+            return True, "ODrive errors cleared"
+        except Exception as e:
+            return False, f"Failed to clear errors: {e}"
+
     def _wait_axis_idle(self, timeout_s: float) -> bool:
         if self._axis is None or self._AxisState is None:
             return False
@@ -878,6 +907,20 @@ class RealOdrive(OdriveInterface):
         return obj
 
     @staticmethod
+    def _resolve_config_value(value: Any) -> Any:
+        if not isinstance(value, str) or "." not in value:
+            return value
+        enum_type_name, enum_member = value.split(".", 1)
+        try:
+            from odrive import enums as odrive_enums  # type: ignore
+            enum_type = getattr(odrive_enums, enum_type_name, None)
+            if enum_type is None:
+                return value
+            return getattr(enum_type, enum_member, value)
+        except Exception:
+            return value
+
+    @staticmethod
     def _set_attr_path(root: Any, key: str, value: Any) -> None:
         parts = key.split(".")
         parent = root
@@ -948,7 +991,7 @@ class RealOdrive(OdriveInterface):
             pass
         for k, v in values.items():
             try:
-                self._set_attr_path(self._odrv, k, v)
+                self._set_attr_path(self._odrv, k, self._resolve_config_value(v))
             except Exception:
                 missing.append(k)
         return missing
@@ -1081,6 +1124,7 @@ class OdriveWorker(QObject):
     config_saved = Signal(bool, str, object)      # ok, message, missing list
     config_erased = Signal(bool, str)             # ok, message
     export_json_done = Signal(bool, str)          # ok, path/message
+    errors_cleared = Signal(bool, str)            # ok, message
     tags_sample = Signal(int, object)             # ts, dict
     calibration_checked = Signal(bool, str)       # calibrated, detail
     calibration_done = Signal(bool, str)          # calibrated, detail
@@ -1330,6 +1374,25 @@ class OdriveWorker(QObject):
             else:
                 self.error.emit(f"Erase config failed: {e}")
                 self.config_erased.emit(False, str(e))
+
+    @Slot()
+    def clear_errors(self) -> None:
+        if not self._backend.is_connected():
+            self.errors_cleared.emit(False, "ODrive not connected (reconnecting)")
+            return
+        try:
+            ok, msg = self._backend.clear_errors()
+            self.errors_cleared.emit(bool(ok), str(msg))
+            if not self._backend.is_connected():
+                self._set_connected(False, self._backend.get_state())
+            else:
+                self._emit_state(self._backend.get_state())
+        except Exception as e:
+            if self._is_disconnect_error(e):
+                self._mark_disconnected("Disconnected (reconnecting)")
+                self.errors_cleared.emit(False, "ODrive disconnected while clearing errors (reconnecting)")
+            else:
+                self.errors_cleared.emit(False, str(e))
 
     @Slot()
     def export_json(self) -> None:
@@ -2455,6 +2518,7 @@ class ODriveConfigScreen(QWidget):
     apply_clicked = Signal(object)         # dict key->value
     save_reboot_clicked = Signal(object)   # dict key->value
     erase_reset_clicked = Signal()
+    clear_errors_clicked = Signal()
     request_refresh = Signal()
     export_json_clicked = Signal()
     hmi_max_velocity_changed = Signal(float)
@@ -2475,8 +2539,10 @@ class ODriveConfigScreen(QWidget):
         self.title.setObjectName("ScreenTitle")
         self.btn_refresh = TouchButton("Refresh", min_h=66, min_w=170)
         self.btn_export = TouchButton("Export JSON", min_h=66, min_w=190)
+        self.btn_clear_errors = TouchButton("Clear Errors", min_h=66, min_w=190)
         top.addWidget(self.btn_back)
         top.addWidget(self.title, 1)
+        top.addWidget(self.btn_clear_errors)
         top.addWidget(self.btn_refresh)
         top.addWidget(self.btn_export)
         root.addLayout(top)
@@ -2550,6 +2616,7 @@ class ODriveConfigScreen(QWidget):
         self.btn_apply.clicked.connect(lambda: self.apply_clicked.emit(self.gather_values()))
         self.btn_save.clicked.connect(lambda: self.save_reboot_clicked.emit(self.gather_values()))
         self.btn_erase_reset.clicked.connect(self.erase_reset_clicked.emit)
+        self.btn_clear_errors.clicked.connect(self.clear_errors_clicked.emit)
         self.btn_refresh.clicked.connect(self.request_refresh.emit)
         self.btn_export.clicked.connect(self.export_json_clicked.emit)
         self.cmb_motor_preset.currentIndexChanged.connect(self._on_motor_preset_changed)
@@ -2841,22 +2908,71 @@ class QtChartsPlot(QWidget):
         self._series: Dict[str, QLineSeries] = {}
         self._minutes = 10
         self._tags: List[str] = []
+        self._y_axes: Dict[str, QValueAxis] = {}
 
         self._x = QDateTimeAxis()
         self._x.setFormat("HH:mm:ss")
         self._x.setTitleText("Time")
         self._chart.addAxis(self._x, Qt.AlignBottom)
 
-        self._y_rpm = QValueAxis()
-        self._y_rpm.setTitleText("RPM")
-        self._chart.addAxis(self._y_rpm, Qt.AlignLeft)
+    def _axis_group_for_tag(self, tag: str) -> str:
+        unit = str(TAG_UNITS.get(tag, "") or "value")
+        return unit
 
-        self._y_other = QValueAxis()
-        self._y_other.setTitleText("Value")
-        self._chart.addAxis(self._y_other, Qt.AlignRight)
+    def _axis_title_for_group(self, group: str) -> str:
+        g = str(group or "value")
+        return "RPM" if g.lower() == "rpm" else g
 
-    def _axis_for_tag(self, tag: str) -> QValueAxis:
-        return self._y_rpm if TAG_PLOT_GROUP.get(tag) == PLOT_GROUP_RPM else self._y_other
+    def _sync_y_axes(self) -> None:
+        wanted_groups: List[str] = []
+        for tag in self._tags:
+            grp = self._axis_group_for_tag(tag)
+            if grp not in wanted_groups:
+                wanted_groups.append(grp)
+
+        # Remove axes for groups no longer present.
+        for grp in list(self._y_axes.keys()):
+            if grp in wanted_groups:
+                continue
+            axis = self._y_axes.pop(grp)
+            for s in self._series.values():
+                try:
+                    s.detachAxis(axis)
+                except Exception:
+                    pass
+            try:
+                self._chart.removeAxis(axis)
+            except Exception:
+                pass
+
+        # Create missing axes and alternate sides.
+        for i, grp in enumerate(wanted_groups):
+            axis = self._y_axes.get(grp)
+            if axis is None:
+                axis = QValueAxis()
+                self._y_axes[grp] = axis
+                align = Qt.AlignLeft if (i % 2 == 0) else Qt.AlignRight
+                self._chart.addAxis(axis, align)
+            axis.setTitleText(self._axis_title_for_group(grp))
+
+        # Reattach all existing series to the correct y-axis.
+        for tag, s in self._series.items():
+            self._attach_series_axes(s, tag)
+
+    def _attach_series_axes(self, series: QLineSeries, tag: str) -> None:
+        try:
+            series.attachAxis(self._x)
+        except Exception:
+            pass
+        for axis in self._y_axes.values():
+            try:
+                series.detachAxis(axis)
+            except Exception:
+                pass
+        grp = self._axis_group_for_tag(tag)
+        axis = self._y_axes.get(grp)
+        if axis is not None:
+            series.attachAxis(axis)
 
     def set_series_data(self, data: Dict[str, List[Tuple[int, float]]], tags: List[str], minutes: int) -> None:
         self._minutes = int(minutes)
@@ -2866,14 +2982,15 @@ class QtChartsPlot(QWidget):
             self._chart.removeSeries(s)
         self._series.clear()
 
+        self._sync_y_axes()
+
         for tag in self._tags:
             series = QLineSeries()
             series.setName(TAG_LABELS.get(tag, tag))
             for ts, val in data.get(tag, []):
                 series.append(float(ts) * 1000.0, float(val))
             self._chart.addSeries(series)
-            series.attachAxis(self._x)
-            series.attachAxis(self._axis_for_tag(tag))
+            self._attach_series_axes(series, tag)
             self._series[tag] = series
 
         self._rescale_axes()
@@ -2881,14 +2998,14 @@ class QtChartsPlot(QWidget):
     def append_points(self, points: List[Tuple[str, int, float]], tags: List[str], minutes: int) -> None:
         self._minutes = int(minutes)
         self._tags = list(tags)
+        self._sync_y_axes()
 
         for tag in self._tags:
             if tag not in self._series:
                 s = QLineSeries()
                 s.setName(TAG_LABELS.get(tag, tag))
                 self._chart.addSeries(s)
-                s.attachAxis(self._x)
-                s.attachAxis(self._axis_for_tag(tag))
+                self._attach_series_axes(s, tag)
                 self._series[tag] = s
 
         for tag in list(self._series.keys()):
@@ -2918,16 +3035,13 @@ class QtChartsPlot(QWidget):
         start_ts = now_ts - self._minutes * 60
         self._x.setRange(QDateTime.fromSecsSinceEpoch(start_ts), QDateTime.fromSecsSinceEpoch(now_ts))
 
-        rpm_vals: List[float] = []
-        other_vals: List[float] = []
+        vals_by_group: Dict[str, List[float]] = {}
         for tag, s in self._series.items():
             pts = s.pointsVector()
             if not pts:
                 continue
-            if TAG_PLOT_GROUP.get(tag) == PLOT_GROUP_RPM:
-                rpm_vals += [float(pt.y()) for pt in pts]
-            else:
-                other_vals += [float(pt.y()) for pt in pts]
+            grp = self._axis_group_for_tag(tag)
+            vals_by_group.setdefault(grp, []).extend(float(pt.y()) for pt in pts)
 
         def apply_axis(axis: QValueAxis, vals: List[float]) -> bool:
             if not vals:
@@ -2940,13 +3054,15 @@ class QtChartsPlot(QWidget):
             axis.setRange(vmin - pad, vmax + pad)
             return True
 
-        rpm_active = apply_axis(self._y_rpm, rpm_vals)
-        other_active = apply_axis(self._y_other, other_vals)
-        # Make axis changes obvious when tag groups are added/removed.
-        self._y_rpm.setVisible(rpm_active)
-        self._y_other.setVisible(other_active)
-        if not rpm_active and not other_active:
-            self._y_rpm.setVisible(True)
+        any_active = False
+        for grp, axis in self._y_axes.items():
+            active = apply_axis(axis, vals_by_group.get(grp, []))
+            axis.setVisible(active)
+            any_active = any_active or active
+        if not any_active:
+            for axis in self._y_axes.values():
+                axis.setVisible(True)
+                break
 
 
 def make_plot_widget() -> QWidget:
@@ -3155,6 +3271,7 @@ class RecipeRunStepBox(QFrame):
 class RecipeRunMonitorScreen(QWidget):
     back_clicked = Signal()
     stop_clicked = Signal()
+    tags_changed = Signal(object)  # list[str]
 
     def __init__(self) -> None:
         super().__init__()
@@ -3173,9 +3290,11 @@ class RecipeRunMonitorScreen(QWidget):
         self.title.setObjectName("ScreenTitle")
         self.lbl_recipe = QLabel("")
         self.lbl_recipe.setObjectName("InfoLabel")
+        self.btn_options = TouchButton("Options", min_h=66, min_w=180)
         top.addWidget(self.btn_back)
         top.addWidget(self.title)
         top.addWidget(self.lbl_recipe, 1)
+        top.addWidget(self.btn_options)
         root.addLayout(top)
 
         body = QHBoxLayout()
@@ -3220,6 +3339,15 @@ class RecipeRunMonitorScreen(QWidget):
 
         self.btn_back.clicked.connect(self.back_clicked.emit)
         self.btn_stop.clicked.connect(self.stop_clicked.emit)
+        self.btn_options.clicked.connect(self._open_options_dialog)
+
+    def selected_tags(self) -> List[str]:
+        return list(getattr(self, "_selected_tags", [TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM]))
+
+    def set_selected_tags(self, tags: List[str]) -> None:
+        known = {TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_VBUS_V, TAG_IBUS_A}
+        out = [t for t in (tags or []) if t in known]
+        self._selected_tags = list(out or [TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM])
 
     def set_recipe(self, recipe: Recipe) -> None:
         self.lbl_recipe.setText(f"Recipe: {recipe.name} ({format_mmss(recipe_total_seconds(recipe))})")
@@ -3266,6 +3394,46 @@ class RecipeRunMonitorScreen(QWidget):
 
     def append_points(self, points: List[Tuple[str, int, float]], tags: List[str]) -> None:
         self.plot.append_points(points, tags, self._plot_minutes)  # type: ignore[attr-defined]
+
+    @Slot()
+    def _open_options_dialog(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Recipe Run Trend Options")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(ui(700))
+
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(ui(16), ui(16), ui(16), ui(16))
+        root.setSpacing(ui(12))
+
+        lbl_tags = QLabel("Tags")
+        lbl_tags.setObjectName("SectionTitle")
+        root.addWidget(lbl_tags)
+
+        tag_checks: Dict[str, QCheckBox] = {}
+        ordered_tags = [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_VBUS_V, TAG_IBUS_A]
+        wanted = set(self.selected_tags())
+        for tag in ordered_tags:
+            cb = QCheckBox(TAG_LABELS.get(tag, tag))
+            cb.setMinimumHeight(ui(44))
+            cb.setChecked(tag in wanted)
+            tag_checks[tag] = cb
+            root.addWidget(cb)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        btn_apply = buttons.addButton("Apply", QDialogButtonBox.AcceptRole)
+        btn_apply.setMinimumHeight(ui(58))
+        root.addWidget(buttons)
+
+        buttons.rejected.connect(dlg.reject)
+        buttons.accepted.connect(dlg.accept)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        selected = [t for t in ordered_tags if tag_checks[t].isChecked()]
+        self.set_selected_tags(selected)
+        self.tags_changed.emit(self.selected_tags())
 
 
 # ----------------------------
@@ -3435,6 +3603,7 @@ class AppController(QObject):
     request_apply_config = Signal(object)         # dict (live apply, no save)
     request_save_config = Signal(object)          # dict (save + reboot)
     request_erase_config = Signal()               # erase + reboot
+    request_clear_errors = Signal()
     request_export_json = Signal()
     request_set_polled_tags = Signal(object)      # list[str]
     request_start_poll = Signal()
@@ -3483,6 +3652,8 @@ class AppController(QObject):
 
         self._dlog_minutes = 10
         self._dlog_selected_tags: List[str] = list(DEFAULT_ENABLED_TAGS)
+        self._reset_defaults_after_erase_pending = False
+        self._reset_defaults_auto_save_in_progress = False
         self._hmi_fullscreen_pref = bool(START_FULLSCREEN)
         self._hmi_max_velocity_rpm = float(HMI_MAX_VEL_DEFAULT_RPM)
         self._recipe_monitor_recipe: Optional[Recipe] = None
@@ -3509,6 +3680,7 @@ class AppController(QObject):
         self.request_apply_config.connect(self.worker.apply_config)
         self.request_save_config.connect(self.worker.save_config)
         self.request_erase_config.connect(self.worker.erase_config)
+        self.request_clear_errors.connect(self.worker.clear_errors)
         self.request_export_json.connect(self.worker.export_json)
         self.request_set_polled_tags.connect(self.worker.set_polled_tags)
         self.request_start_poll.connect(self.worker.start_tag_polling)
@@ -3523,6 +3695,7 @@ class AppController(QObject):
         self.worker.config_saved.connect(self._on_config_saved)
         self.worker.config_erased.connect(self._on_config_erased)
         self.worker.export_json_done.connect(self._on_export_json_done)
+        self.worker.errors_cleared.connect(self._on_errors_cleared)
         self.worker.tags_sample.connect(self._on_tags_sample)
         self.worker.calibration_checked.connect(self._on_calibration_checked)
         self.worker.calibration_done.connect(self._on_calibration_done)
@@ -3559,6 +3732,7 @@ class AppController(QObject):
         self.hmi_settings.back_clicked.connect(self.on_back_settings)
         self.recipe_run.back_clicked.connect(self.on_back_home)
         self.recipe_run.stop_clicked.connect(self.on_stop)
+        self.recipe_run.tags_changed.connect(self._on_recipe_run_tags_changed)
         self.hmi_settings.fullscreen_changed.connect(self.on_hmi_fullscreen_changed)
 
         self.cfg.back_clicked.connect(self.on_back_home)
@@ -3566,6 +3740,7 @@ class AppController(QObject):
         self.cfg.apply_clicked.connect(self._apply_odrive_config)
         self.cfg.save_reboot_clicked.connect(self._save_odrive_config)
         self.cfg.erase_reset_clicked.connect(self._erase_reset_odrive_config)
+        self.cfg.clear_errors_clicked.connect(self._clear_odrive_errors)
         self.cfg.export_json_clicked.connect(self._export_odrive_json)
         self.cfg.hmi_max_velocity_changed.connect(self.on_hmi_max_velocity_changed)
 
@@ -3598,6 +3773,7 @@ class AppController(QObject):
         self._loading_ui_state = False
         self.hmi_settings.set_fullscreen_state(self._hmi_fullscreen_pref, emit_signal=False)
         self.cfg.set_hmi_max_velocity(self._hmi_max_velocity_rpm, emit_signal=False)
+        self.recipe_run.set_selected_tags(self._recipe_monitor_plot_tags)
         self._apply_hmi_velocity_limit()
 
         self.worker_thread.start()
@@ -3642,6 +3818,26 @@ class AppController(QObject):
             pass
         box.setStandardButtons(QMessageBox.Ok)
         box.exec()
+
+    def _show_odrive_error_with_clear(self, parent: QWidget, msg: str) -> None:
+        now_m = time.monotonic()
+        if (now_m - self._last_modal_error_mono) < self._modal_error_cooldown_s:
+            return
+        self._last_modal_error_mono = now_m
+        box = QMessageBox(parent)
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle("ODrive Error")
+        box.setText(str(msg))
+        try:
+            box.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        except Exception:
+            pass
+        btn_clear = box.addButton("Clear Error", QMessageBox.ActionRole)
+        btn_close = box.addButton(QMessageBox.Close)
+        box.setDefaultButton(btn_close)
+        box.exec()
+        if box.clickedButton() is btn_clear:
+            self._clear_odrive_errors()
 
     def _selected_recipe(self) -> Optional[Recipe]:
         if not self.selected_recipe_id:
@@ -3873,9 +4069,15 @@ class AppController(QObject):
             self.recipe_run.append_audit(f"Error: {msg}")
         if self.engine.is_running():
             self.engine.stop(user_initiated=True)
-        self._show_modal_error(self.stack.currentWidget(), "ODrive Error", msg)
+        self._show_odrive_error_with_clear(self.stack.currentWidget(), msg)
         self._refresh_status_all()
         self._apply_controls()
+
+    def _project_reset_config_values(self) -> Dict[str, Any]:
+        values: Dict[str, Any] = dict(DEFAULT_CONFIG_MAP)
+        for key, value in SCRIPT_DEFAULT_ASSIGNMENTS:
+            values[str(key)] = value
+        return values
 
     @Slot(bool, str)
     def _on_calibration_checked(self, calibrated: bool, detail: str) -> None:
@@ -3938,6 +4140,16 @@ class AppController(QObject):
         else:
             self._show_modal_error(self.cfg, "Export JSON", msg)
             self.cfg.set_loading("Loaded")
+
+    @Slot(bool, str)
+    def _on_errors_cleared(self, ok: bool, message: str) -> None:
+        if self.stack.currentWidget() is self.cfg:
+            self.cfg.set_loading("Loaded")
+        parent = self.cfg if self.stack.currentWidget() is self.cfg else self.stack.currentWidget()
+        if ok:
+            QMessageBox.information(parent, "Clear Errors", str(message))
+        else:
+            self._show_modal_error(parent, "Clear Errors", str(message))
 
     @Slot(int, object)
     def _on_tags_sample(self, ts: int, values_obj: Any) -> None:
@@ -4247,6 +4459,16 @@ class AppController(QObject):
         self.request_erase_config.emit()
 
     @Slot()
+    def _clear_odrive_errors(self) -> None:
+        parent = self.cfg if self.stack.currentWidget() is self.cfg else self.stack.currentWidget()
+        if BACKEND == "real" and not self.connected:
+            self._show_modal_error(parent, "Clear Errors", "ODrive is not connected.")
+            return
+        if self.stack.currentWidget() is self.cfg:
+            self.cfg.set_loading("Clearing ODrive errors...")
+        self.request_clear_errors.emit()
+
+    @Slot()
     def _export_odrive_json(self) -> None:
         if BACKEND == "real" and not self.connected:
             QMessageBox.critical(self.cfg, "Export JSON", "Cannot export: ODrive is not connected.")
@@ -4272,6 +4494,16 @@ class AppController(QObject):
         if self.stack.currentWidget() is self.dlog:
             self._refresh_datalogger_plot()
         self._schedule_ui_state_save()
+
+    @Slot(object)
+    def _on_recipe_run_tags_changed(self, tags_obj: Any) -> None:
+        tags = [str(t) for t in (list(tags_obj or []))]
+        known = set(self._known_tags())
+        tags = [t for t in tags if t in known]
+        self._recipe_monitor_plot_tags = tags if tags else [TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM]
+        self.recipe_run.set_selected_tags(self._recipe_monitor_plot_tags)
+        if self.stack.currentWidget() is self.recipe_run:
+            self._refresh_recipe_monitor_plot()
 
     def _refresh_datalogger_plot(self) -> None:
         now_ts = epoch_s()
@@ -4542,8 +4774,8 @@ def show_startup_splash(app: QApplication) -> QWidget:
             border: 2px solid #2A313A;
             border-radius: 14px;
         }
-        QLabel#SplashTitle { font-size: 28px; font-weight: 700; }
-        QLabel#SplashInfo { font-size: 16px; color: #D0D7DE; }
+        QLabel#SplashTitle { font-size: 28px; font-weight: 700; color: #FFFFFF; }
+        QLabel#SplashInfo { font-size: 16px; color: #FFFFFF; }
         """
     )
 
