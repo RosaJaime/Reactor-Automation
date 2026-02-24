@@ -70,6 +70,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -1593,6 +1595,7 @@ class RpmControl(QWidget):
 
     def __init__(self, title: str, vmin: float, vmax: float, step: float, compact: bool = False) -> None:
         super().__init__()
+        self.setObjectName("RpmControl")
         self._vmin, self._vmax, self._step = float(vmin), float(vmax), float(step)
 
         min_h = ui(70 if not compact else 58)
@@ -1615,12 +1618,13 @@ class RpmControl(QWidget):
 
         self.edit = QLineEdit()
         self.edit.setMinimumHeight(min_h)
+        self.edit.setMinimumWidth(ui(180 if not compact else 140))
         self.edit.setAlignment(Qt.AlignCenter)
         self.edit.setText("120")
         self.edit.setValidator(QDoubleValidator(self._vmin, self._vmax, 2, self.edit))
 
         units = QLabel("rpm")
-        units.setMinimumWidth(ui(70 if not compact else 60))
+        units.setMinimumWidth(ui(54 if not compact else 46))
         units.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         units.setObjectName("UnitsLabel")
 
@@ -1663,6 +1667,7 @@ class TimeControl(QWidget):
 
     def __init__(self, title: str, step_s: int, compact: bool = False) -> None:
         super().__init__()
+        self.setObjectName("TimeControl")
         self._step_s = int(step_s)
         self._adjust_cb: Optional[Callable[[int], None]] = None
 
@@ -1686,12 +1691,13 @@ class TimeControl(QWidget):
 
         self.edit = QLineEdit()
         self.edit.setMinimumHeight(min_h)
+        self.edit.setMinimumWidth(ui(180 if not compact else 140))
         self.edit.setAlignment(Qt.AlignCenter)
         self.edit.setText("00:00")
         self.edit.setPlaceholderText("mm:ss")
 
         hint = QLabel("mm:ss")
-        hint.setMinimumWidth(ui(70 if not compact else 60))
+        hint.setMinimumWidth(ui(54 if not compact else 46))
         hint.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         hint.setObjectName("UnitsLabel")
 
@@ -1740,6 +1746,11 @@ class TimeControl(QWidget):
 
     def set_edit_enabled(self, enabled: bool) -> None:
         self.edit.setEnabled(enabled)
+
+    def set_dimmed(self, dimmed: bool) -> None:
+        self.setProperty("dimmed", "true" if dimmed else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     def _adjust(self, delta_s: int) -> None:
         # During a running SINGLE run, the +/- buttons must adjust remaining time only,
@@ -2611,18 +2622,24 @@ class QtChartsPlot(QWidget):
             else:
                 other_vals += [float(pt.y()) for pt in pts]
 
-        def apply_axis(axis: QValueAxis, vals: List[float]) -> None:
+        def apply_axis(axis: QValueAxis, vals: List[float]) -> bool:
             if not vals:
                 axis.setRange(0.0, 1.0)
-                return
+                return False
             vmin, vmax = min(vals), max(vals)
             if abs(vmax - vmin) < 1e-9:
                 vmax = vmin + 1.0
             pad = 0.05 * (vmax - vmin)
             axis.setRange(vmin - pad, vmax + pad)
+            return True
 
-        apply_axis(self._y_rpm, rpm_vals)
-        apply_axis(self._y_other, other_vals)
+        rpm_active = apply_axis(self._y_rpm, rpm_vals)
+        other_active = apply_axis(self._y_other, other_vals)
+        # Make axis changes obvious when tag groups are added/removed.
+        self._y_rpm.setVisible(rpm_active)
+        self._y_other.setVisible(other_active)
+        if not rpm_active and not other_active:
+            self._y_rpm.setVisible(True)
 
 
 def make_plot_widget() -> QWidget:
@@ -2644,6 +2661,7 @@ class DataLoggerScreen(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self._minutes = 10
+        self._selected_tags: List[str] = list(DEFAULT_ENABLED_TAGS)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(ui(18), ui(16), ui(18), ui(16))
@@ -2654,56 +2672,19 @@ class DataLoggerScreen(QWidget):
         self.btn_back = TouchButton("Back", min_h=66, min_w=170)
         self.title = QLabel("Data Logger")
         self.title.setObjectName("ScreenTitle")
+        self.btn_options = TouchButton("Options", min_h=66, min_w=180)
         self.btn_export = TouchButton("Export CSV", min_h=66, min_w=200)
         top.addWidget(self.btn_back)
         top.addWidget(self.title, 1)
+        top.addWidget(self.btn_options)
         top.addWidget(self.btn_export)
         root.addLayout(top)
 
         self.status = StatusHeader()
         root.addWidget(self.status)
 
-        body = QHBoxLayout()
-        body.setSpacing(ui(12))
-        left = QVBoxLayout()
-        left.setSpacing(ui(12))
-
-        lbl_tags = QLabel("Tags")
-        lbl_tags.setObjectName("SectionTitle")
-        left.addWidget(lbl_tags)
-
-        self._tag_checks: Dict[str, QCheckBox] = {}
-        for tag in [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_VBUS_V, TAG_IBUS_A]:
-            cb = QCheckBox(TAG_LABELS.get(tag, tag))
-            cb.setChecked(tag in DEFAULT_ENABLED_TAGS)
-            cb.setMinimumHeight(ui(44))
-            cb.stateChanged.connect(lambda _=0: self.tags_changed.emit(self.selected_tags()))
-            self._tag_checks[tag] = cb
-            left.addWidget(cb)
-
-        left.addStretch(1)
-
-        win_row = QHBoxLayout()
-        win_row.setSpacing(ui(12))
-        lbl_win = QLabel("Minutes to display")
-        lbl_win.setObjectName("FieldLabel")
-        lbl_win.setMinimumWidth(ui(260))
-        self.edit_min = QLineEdit()
-        self.edit_min.setMinimumHeight(ui(66))
-        self.edit_min.setAlignment(Qt.AlignCenter)
-        self.edit_min.setValidator(QIntValidator(1, 24 * 60, self.edit_min))
-        self.edit_min.setText(str(self._minutes))
-        self.btn_apply = TouchButton("Apply", min_h=66, min_w=170)
-        win_row.addWidget(lbl_win)
-        win_row.addWidget(self.edit_min, 1)
-        win_row.addWidget(self.btn_apply)
-        left.addLayout(win_row)
-
-        body.addLayout(left, 1)
-
         self.plot = make_plot_widget()
-        body.addWidget(self.plot, 2)
-        root.addLayout(body, 1)
+        root.addWidget(self.plot, 1)
 
         self.footer = StartStopFooter()
         root.addWidget(self.footer)
@@ -2711,8 +2692,7 @@ class DataLoggerScreen(QWidget):
         self.btn_back.clicked.connect(self.back_clicked.emit)
         self.footer.start_clicked.connect(self.start_clicked.emit)
         self.footer.stop_clicked.connect(self.stop_clicked.emit)
-        self.btn_apply.clicked.connect(self._on_apply)
-        self.edit_min.editingFinished.connect(self._on_apply)
+        self.btn_options.clicked.connect(self._open_options_dialog)
         self.btn_export.clicked.connect(self._on_export)
 
     def set_status(self, ui_state: str, rpm: float, remaining_s: int, recipe_name: str, step_info: str, backend: str) -> None:
@@ -2723,25 +2703,21 @@ class DataLoggerScreen(QWidget):
         self.footer.set_motor_controls_enabled(motor_controls_enabled)
 
     def minutes_window(self) -> int:
-        try:
-            return max(1, int(self.edit_min.text()))
-        except Exception:
-            return 10
+        return int(clamp(int(self._minutes), 1, 24 * 60))
 
     def selected_tags(self) -> List[str]:
-        return [t for t, cb in self._tag_checks.items() if cb.isChecked()]
+        return list(self._selected_tags)
 
     def set_selected_tags(self, tags: List[str]) -> None:
-        wanted = set(tags)
-        for t, cb in self._tag_checks.items():
-            with QSignalBlocker(cb):
-                cb.setChecked(t in wanted)
+        known = {
+            TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_VBUS_V, TAG_IBUS_A
+        }
+        out = [t for t in (tags or []) if t in known]
+        self._selected_tags = list(out or DEFAULT_ENABLED_TAGS)
 
     def set_minutes_window(self, minutes: int) -> None:
         minutes = int(clamp(int(minutes), 1, 24 * 60))
         self._minutes = minutes
-        with QSignalBlocker(self.edit_min):
-            self.edit_min.setText(str(minutes))
 
     def set_series_data(self, data: Dict[str, List[Tuple[int, float]]], tags: List[str], minutes: int) -> None:
         self.plot.set_series_data(data, tags, minutes)  # type: ignore[attr-defined]
@@ -2756,6 +2732,68 @@ class DataLoggerScreen(QWidget):
     @Slot()
     def _on_export(self) -> None:
         self.export_clicked.emit(self.minutes_window(), self.selected_tags())
+
+    @Slot()
+    def _open_options_dialog(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Data Logger Options")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(ui(700))
+
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(ui(16), ui(16), ui(16), ui(16))
+        root.setSpacing(ui(12))
+
+        lbl_tags = QLabel("Tags")
+        lbl_tags.setObjectName("SectionTitle")
+        root.addWidget(lbl_tags)
+
+        tag_checks: Dict[str, QCheckBox] = {}
+        ordered_tags = [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_VBUS_V, TAG_IBUS_A]
+        wanted = set(self._selected_tags)
+        for tag in ordered_tags:
+            cb = QCheckBox(TAG_LABELS.get(tag, tag))
+            cb.setMinimumHeight(ui(44))
+            cb.setChecked(tag in wanted)
+            tag_checks[tag] = cb
+            root.addWidget(cb)
+
+        win_row = QHBoxLayout()
+        win_row.setSpacing(ui(12))
+        lbl_win = QLabel("Minutes to display")
+        lbl_win.setObjectName("FieldLabel")
+        lbl_win.setMinimumWidth(ui(260))
+        edit_min = QLineEdit()
+        edit_min.setMinimumHeight(ui(66))
+        edit_min.setAlignment(Qt.AlignCenter)
+        edit_min.setValidator(QIntValidator(1, 24 * 60, edit_min))
+        edit_min.setText(str(self._minutes))
+        win_row.addWidget(lbl_win)
+        win_row.addWidget(edit_min, 1)
+        root.addLayout(win_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        btn_apply = buttons.addButton("Apply", QDialogButtonBox.AcceptRole)
+        btn_apply.setMinimumHeight(ui(58))
+        root.addWidget(buttons)
+
+        buttons.rejected.connect(dlg.reject)
+        buttons.accepted.connect(dlg.accept)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        try:
+            minutes = max(1, int(edit_min.text()))
+        except Exception:
+            minutes = self._minutes
+        self._minutes = int(clamp(int(minutes), 1, 24 * 60))
+
+        selected = [t for t in ordered_tags if tag_checks[t].isChecked()]
+        self._selected_tags = list(selected or DEFAULT_ENABLED_TAGS)
+
+        self.tags_changed.emit(self.selected_tags())
+        self.window_changed.emit(self.minutes_window())
 
 
 # ----------------------------
@@ -2885,12 +2923,23 @@ class HomeScreen(QWidget):
 
         if running:
             if run_mode == "single":
+                self.time_ctl.setEnabled(True)
+                self.time_ctl.set_dimmed(False)
                 self.time_ctl.set_buttons_enabled(motor_controls_enabled)
                 self.time_ctl.set_edit_enabled(False)
             else:
+                self.time_ctl.setEnabled(True)
+                self.time_ctl.set_dimmed(True)
                 self.time_ctl.set_enabled(False)
         else:
-            self.time_ctl.set_enabled(not recipe_selected)
+            if recipe_selected:
+                self.time_ctl.setEnabled(False)
+                self.time_ctl.set_dimmed(True)
+                self.time_ctl.set_enabled(False)
+            else:
+                self.time_ctl.setEnabled(True)
+                self.time_ctl.set_dimmed(False)
+                self.time_ctl.set_enabled(True)
 
         self.btn_calibrate.setEnabled((not running) and connected and (not calibrating))
         self.btn_calibrate.setText("Calibrating..." if calibrating else ("Recalibrate Motor" if calibrated else "Calibrate Motor"))
@@ -3454,6 +3503,11 @@ class AppController(QObject):
     @Slot(int)
     def _on_home_time_changed(self, _seconds: int) -> None:
         # Save the entry text (mm:ss) when edited while stopped. During a run, the entry is disabled.
+        if (not self.engine.is_running()) and (self.selected_recipe_id is not None):
+            self.selected_recipe_id = None
+            self._refresh_recipes()
+            self._refresh_status_all()
+            self._apply_controls()
         self._schedule_ui_state_save()
 
     # ---- Home actions ----
@@ -3860,6 +3914,11 @@ def apply_style(app: QApplication) -> None:
         QFrame#ConfigRow {{ background: #161B22; border: 2px solid #2A313A; border-radius: {border_r_btn}px; }}
         QLabel#ConfigLabel {{ font-size: {ui(20)}px; font-weight: 650; }}
         QLabel#ConfigNote {{ font-size: {ui(18)}px; color: #9FB0C0; }}
+
+        QWidget#TimeControl[dimmed="true"] QLabel {{ color: #7A8794; }}
+        QWidget#TimeControl[dimmed="true"] QLineEdit {{
+            background: #0E1218; border: 2px solid #232A33; color: #7A8794;
+        }}
 
         QScrollArea {{ border: none; }}
         """
