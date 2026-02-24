@@ -5,8 +5,10 @@ A touch-friendly desktop app for running a reactor agitator motor with an ODrive
 It provides:
 - Manual velocity + timer runs
 - Multi-step recipe runs (speed + duration per step)
+- Previous recipe run history with run IDs
 - ODrive configuration screen for common settings
 - Data logger with live plots and CSV export
+- PDF report export for recipe runs (ReportLab)
 - Auto reconnect when the ODrive disconnects/reboots
 - Motor calibration workflow (required before motor controls are enabled)
 
@@ -43,11 +45,22 @@ Before starting a run, the app checks whether the motor/encoder are calibrated. 
   - Live trend plots (voltage/current/power/commanded RPM/estimated RPM)
   - CSV export
 
+## Screenshots
+
+<p>
+  <img src="Images/Main%20Screen.png" alt="Main screen" width="49%" />
+  <img src="Images/Recipe%20Builder.png" alt="Recipe builder screen" width="49%" />
+</p>
+<p>
+  <img src="Images/Recipe%20Run%20View.png" alt="Recipe run monitor view" width="100%" />
+</p>
+
 ## Requirements
 
 - Python 3.10+ (recommended)
 - ODrive Python package
 - PySide6
+- ReportLab (for PDF reports)
 
 Install dependencies:
 
@@ -58,6 +71,7 @@ pip install -r requirements.txt
 `requirements.txt` currently includes:
 - `PySide6`
 - `odrive`
+- `reportlab`
 
 Note:
 - If `PySide6.QtCharts` is available, the app uses QtCharts for plotting.
@@ -164,6 +178,7 @@ Exports are written to:
 Examples:
 - ODrive JSON export: `odrive_get_json_YYYYMMDD_HHMMSS.json`
 - Data logger CSV export: `datalogger_<minutes>min_YYYYMMDD_HHMMSS.csv`
+- Recipe run PDF report: `recipe_run_report_<runid>_YYYYMMDD_HHMMSS.pdf`
 
 ## Safety Notes
 
