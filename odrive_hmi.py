@@ -98,6 +98,7 @@ except Exception:
 # ----------------------------
 
 BACKEND = "real"  # "sim" or "real"
+START_FULLSCREEN = True
 
 WINDOW_W = 1280
 WINDOW_H = 800
@@ -2334,6 +2335,87 @@ class ODriveConfigScreen(QWidget):
 
 
 # ----------------------------
+# Settings Screens
+# ----------------------------
+
+class SettingsHubScreen(QWidget):
+    back_clicked = Signal()
+    open_hmi_clicked = Signal()
+    open_odrive_clicked = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        root = QVBoxLayout(self)
+        root.setContentsMargins(ui(18), ui(16), ui(18), ui(16))
+        root.setSpacing(ui(12))
+
+        top = QHBoxLayout()
+        top.setSpacing(ui(12))
+        self.btn_back = TouchButton("Back", min_h=66, min_w=170)
+        self.title = QLabel("Settings")
+        self.title.setObjectName("ScreenTitle")
+        top.addWidget(self.btn_back)
+        top.addWidget(self.title, 1)
+        root.addLayout(top)
+
+        self.info = QLabel("Select a settings category")
+        self.info.setObjectName("InfoLabel")
+        root.addWidget(self.info)
+
+        self.btn_hmi = TouchButton("HMI", min_h=86, min_w=260)
+        self.btn_odrive = TouchButton("ODrive", min_h=86, min_w=260)
+        root.addWidget(self.btn_hmi)
+        root.addWidget(self.btn_odrive)
+        root.addStretch(1)
+
+        self.btn_back.clicked.connect(self.back_clicked.emit)
+        self.btn_hmi.clicked.connect(self.open_hmi_clicked.emit)
+        self.btn_odrive.clicked.connect(self.open_odrive_clicked.emit)
+
+
+class HMISettingsScreen(QWidget):
+    back_clicked = Signal()
+    fullscreen_changed = Signal(bool)
+
+    def __init__(self) -> None:
+        super().__init__()
+        root = QVBoxLayout(self)
+        root.setContentsMargins(ui(18), ui(16), ui(18), ui(16))
+        root.setSpacing(ui(12))
+
+        top = QHBoxLayout()
+        top.setSpacing(ui(12))
+        self.btn_back = TouchButton("Back", min_h=66, min_w=170)
+        self.title = QLabel("HMI Settings")
+        self.title.setObjectName("ScreenTitle")
+        top.addWidget(self.btn_back)
+        top.addWidget(self.title, 1)
+        root.addLayout(top)
+
+        self.info = QLabel("Display")
+        self.info.setObjectName("SectionTitle")
+        root.addWidget(self.info)
+
+        self.chk_fullscreen = QCheckBox("Run in full screen")
+        self.chk_fullscreen.setMinimumHeight(ui(52))
+        root.addWidget(self.chk_fullscreen)
+
+        self.note = QLabel("Press Esc to exit full screen at any time.")
+        self.note.setObjectName("InfoLabel")
+        root.addWidget(self.note)
+        root.addStretch(1)
+
+        self.btn_back.clicked.connect(self.back_clicked.emit)
+        self.chk_fullscreen.toggled.connect(self.fullscreen_changed.emit)
+
+    def set_fullscreen_state(self, enabled: bool, emit_signal: bool = False) -> None:
+        with QSignalBlocker(self.chk_fullscreen):
+            self.chk_fullscreen.setChecked(bool(enabled))
+        if emit_signal:
+            self.fullscreen_changed.emit(bool(enabled))
+
+
+# ----------------------------
 # Plot Widgets
 # ----------------------------
 
@@ -2684,6 +2766,7 @@ class HomeScreen(QWidget):
     start_clicked = Signal()
     stop_clicked = Signal()
     calibrate_clicked = Signal()
+    open_settings_clicked = Signal()
     open_builder_clicked = Signal()
     recipe_select_clicked = Signal(str)
     recipe_edit_clicked = Signal(str)
@@ -2696,8 +2779,15 @@ class HomeScreen(QWidget):
         root.setContentsMargins(ui(18), ui(16), ui(18), ui(16))
         root.setSpacing(ui(12))
 
+        top_row = QHBoxLayout()
+        top_row.setSpacing(ui(12))
         self.status_bar = StatusHeader()
-        root.addWidget(self.status_bar)
+        self.btn_settings = TouchButton("\u2699", min_h=66, min_w=66)
+        self.btn_settings.setObjectName("SettingsButton")
+        self.btn_settings.setToolTip("Settings")
+        top_row.addWidget(self.status_bar, 1)
+        top_row.addWidget(self.btn_settings)
+        root.addLayout(top_row)
 
         mid = QHBoxLayout()
         mid.setSpacing(ui(14))
@@ -2746,6 +2836,7 @@ class HomeScreen(QWidget):
         self.footer.start_clicked.connect(self.start_clicked.emit)
         self.footer.stop_clicked.connect(self.stop_clicked.emit)
         self.btn_calibrate.clicked.connect(self.calibrate_clicked.emit)
+        self.btn_settings.clicked.connect(self.open_settings_clicked.emit)
         self.btn_builder.clicked.connect(self.open_builder_clicked.emit)
         self.btn_config.clicked.connect(self.open_config_clicked.emit)
         self.btn_datalogger.clicked.connect(self.open_datalogger_clicked.emit)
@@ -2826,9 +2917,26 @@ class AppController(QObject):
     request_start_poll = Signal()
     request_stop_poll = Signal()
 
-    def __init__(self, stack: QStackedWidget, home: HomeScreen, builder: RecipeBuilderScreen, cfg: ODriveConfigScreen, dlog: DataLoggerScreen) -> None:
+    def __init__(
+        self,
+        stack: QStackedWidget,
+        home: HomeScreen,
+        builder: RecipeBuilderScreen,
+        settings: SettingsHubScreen,
+        hmi_settings: HMISettingsScreen,
+        cfg: ODriveConfigScreen,
+        dlog: DataLoggerScreen,
+    ) -> None:
         super().__init__()
-        self.stack, self.home, self.builder, self.cfg, self.dlog = stack, home, builder, cfg, dlog
+        self.stack, self.home, self.builder, self.settings, self.hmi_settings, self.cfg, self.dlog = (
+            stack,
+            home,
+            builder,
+            settings,
+            hmi_settings,
+            cfg,
+            dlog,
+        )
 
         self.store = RecipeStore()
         self.store.load()
@@ -2849,6 +2957,7 @@ class AppController(QObject):
 
         self._dlog_minutes = 10
         self._dlog_selected_tags: List[str] = list(DEFAULT_ENABLED_TAGS)
+        self._hmi_fullscreen_pref = bool(START_FULLSCREEN)
 
         self.history_db = HistoryDB(app_config_dir() / "history.sqlite")
 
@@ -2896,6 +3005,7 @@ class AppController(QObject):
         self.home.start_clicked.connect(self.on_start)
         self.home.stop_clicked.connect(self.on_stop)
         self.home.calibrate_clicked.connect(self.on_calibrate)
+        self.home.open_settings_clicked.connect(self.on_open_settings)
         self.home.open_builder_clicked.connect(self.on_open_builder_new)
         self.home.recipe_select_clicked.connect(self.on_select_recipe)
         self.home.recipe_edit_clicked.connect(self.on_edit_recipe)
@@ -2908,6 +3018,13 @@ class AppController(QObject):
         self.builder.back_clicked.connect(self.on_back_home)
         self.builder.cancel_clicked.connect(self.on_back_home)
         self.builder.save_clicked.connect(self.on_builder_save)
+
+        self.settings.back_clicked.connect(self.on_back_home)
+        self.settings.open_hmi_clicked.connect(self.on_open_hmi_settings)
+        self.settings.open_odrive_clicked.connect(self.on_open_config)
+
+        self.hmi_settings.back_clicked.connect(self.on_back_settings)
+        self.hmi_settings.fullscreen_changed.connect(self.on_hmi_fullscreen_changed)
 
         self.cfg.back_clicked.connect(self.on_back_home)
         self.cfg.request_refresh.connect(self._refresh_odrive_config)
@@ -2943,6 +3060,7 @@ class AppController(QObject):
         self._loading_ui_state = True
         self._load_ui_state()
         self._loading_ui_state = False
+        self.hmi_settings.set_fullscreen_state(self._hmi_fullscreen_pref, emit_signal=False)
 
         self.worker_thread.start()
         self.request_connect.emit()
@@ -3078,6 +3196,9 @@ class AppController(QObject):
         if recipe_id and not any(r.id == recipe_id for r in self.store.recipes()):
             recipe_id = None
 
+        fullscreen_pref = raw.get("hmi_fullscreen", START_FULLSCREEN)
+        self._hmi_fullscreen_pref = bool(fullscreen_pref)
+
         self.home.rpm_ctl.set_value(home_rpm, emit_signal=False)
         self.home.time_ctl.set_text_mmss(timer_mmss, emit_signal=False)
 
@@ -3096,6 +3217,7 @@ class AppController(QObject):
         self.dlog.set_minutes_window(self._dlog_minutes)
         self.dlog.set_selected_tags(self._dlog_selected_tags)
         self.selected_recipe_id = None
+        self._hmi_fullscreen_pref = bool(START_FULLSCREEN)
 
     def _schedule_ui_state_save(self) -> None:
         if self._loading_ui_state:
@@ -3127,7 +3249,15 @@ class AppController(QObject):
             "dlog_tags": list(tags),
             "dlog_minutes": int(minutes),
             "selected_recipe_id": recipe_id,
+            "hmi_fullscreen": bool(self._hmi_fullscreen_pref),
         }
+
+    def hmi_fullscreen_preference(self) -> bool:
+        return bool(self._hmi_fullscreen_pref)
+
+    def set_hmi_fullscreen_preference(self, enabled: bool) -> None:
+        self._hmi_fullscreen_pref = bool(enabled)
+        self._schedule_ui_state_save()
 
     @Slot()
     def _save_ui_state_now(self) -> None:
@@ -3379,6 +3509,27 @@ class AppController(QObject):
         self.stack.setCurrentWidget(self.builder)
 
     @Slot()
+    def on_open_settings(self) -> None:
+        if self.engine.is_running():
+            return
+        self.stack.setCurrentWidget(self.settings)
+
+    @Slot()
+    def on_back_settings(self) -> None:
+        self.stack.setCurrentWidget(self.settings)
+
+    @Slot()
+    def on_open_hmi_settings(self) -> None:
+        if self.engine.is_running():
+            return
+        self.stack.setCurrentWidget(self.hmi_settings)
+
+    @Slot(bool)
+    def on_hmi_fullscreen_changed(self, enabled: bool) -> None:
+        self._hmi_fullscreen_pref = bool(enabled)
+        self._schedule_ui_state_save()
+
+    @Slot()
     def on_open_config(self) -> None:
         if self.engine.is_running():
             return
@@ -3554,11 +3705,15 @@ class MainWindow(QWidget):
         self.stack = QStackedWidget()
         self.home = HomeScreen()
         self.builder = RecipeBuilderScreen()
+        self.settings = SettingsHubScreen()
+        self.hmi_settings = HMISettingsScreen()
         self.cfg = ODriveConfigScreen()
         self.dlog = DataLoggerScreen()
 
         self.stack.addWidget(self.home)
         self.stack.addWidget(self.builder)
+        self.stack.addWidget(self.settings)
+        self.stack.addWidget(self.hmi_settings)
         self.stack.addWidget(self.cfg)
         self.stack.addWidget(self.dlog)
 
@@ -3566,11 +3721,44 @@ class MainWindow(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.addWidget(self.stack)
 
-        self.controller = AppController(self.stack, self.home, self.builder, self.cfg, self.dlog)
+        self.controller = AppController(
+            self.stack,
+            self.home,
+            self.builder,
+            self.settings,
+            self.hmi_settings,
+            self.cfg,
+            self.dlog,
+        )
+        self.hmi_settings.fullscreen_changed.connect(self._set_fullscreen_mode)
 
     def closeEvent(self, event) -> None:
         self.controller.shutdown()
         event.accept()
+
+    def keyPressEvent(self, event) -> None:
+        try:
+            if event.key() == Qt.Key_Escape and self.isFullScreen():
+                self.showNormal()
+                self.hmi_settings.set_fullscreen_state(False, emit_signal=False)
+                self.controller.set_hmi_fullscreen_preference(False)
+                event.accept()
+                return
+        except Exception:
+            pass
+        super().keyPressEvent(event)
+
+    @Slot(bool)
+    def _set_fullscreen_mode(self, enabled: bool) -> None:
+        if bool(enabled):
+            self.showFullScreen()
+            self.hmi_settings.set_fullscreen_state(True, emit_signal=False)
+            return
+        self.showNormal()
+        self.hmi_settings.set_fullscreen_state(False, emit_signal=False)
+
+    def start_in_fullscreen(self) -> bool:
+        return bool(self.controller.hmi_fullscreen_preference())
 
 
 # ----------------------------
@@ -3690,7 +3878,10 @@ def main() -> int:
 
     apply_style(app)
     w = MainWindow()
-    w.show()
+    if w.start_in_fullscreen():
+        w.showFullScreen()
+    else:
+        w.show()
     return app.exec()
 
 
