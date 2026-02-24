@@ -3,7 +3,7 @@ Touch-Friendly ODrive Reactor Agitator HMI (PySide6)
 
 Run:
   pip install PySide6
-  python odrive_hmi.py
+  python odrive_hmi.pyw
 
 Backends:
   - BACKEND = "real" (default)
