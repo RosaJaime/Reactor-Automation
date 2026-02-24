@@ -4818,11 +4818,14 @@ class AppController(QObject):
         root.addLayout(body, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        btn_report = buttons.addButton("Generate Report", QDialogButtonBox.ActionRole)
+        btn_report.setMinimumHeight(ui(58))
         root.addWidget(buttons)
         buttons.rejected.connect(dlg.reject)
         buttons.accepted.connect(dlg.accept)
 
         runs = self.run_store.runs()
+        btn_report.setEnabled(False)
         if not runs:
             run_list.addItem("No previous recipe runs recorded yet.")
         else:
@@ -4855,9 +4858,18 @@ class AppController(QObject):
                     ts = int(safe_float((a or {}).get("ts", 0), 0))
                     ttxt = time.strftime("%H:%M:%S", time.localtime(ts)) if ts > 0 else "--:--:--"
                     detail_list.addItem(f"{ttxt}  {str((a or {}).get('text', ''))}")
+                btn_report.setEnabled(True)
 
             run_list.currentRowChanged.connect(load_detail)
             run_list.setCurrentRow(0)
+
+            def on_generate_report() -> None:
+                idx = int(run_list.currentRow())
+                if not (0 <= idx < len(runs)):
+                    return
+                self._export_recipe_run_report(dict(runs[idx]))
+
+            btn_report.clicked.connect(on_generate_report)
 
         dlg.exec()
 
