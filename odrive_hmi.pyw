@@ -2213,7 +2213,6 @@ class RecipeBuilderScreen(QWidget):
     back_clicked = Signal()
     cancel_clicked = Signal()
     save_clicked = Signal(Recipe)
-    view_runs_clicked = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -2227,11 +2226,9 @@ class RecipeBuilderScreen(QWidget):
         top = QHBoxLayout()
         top.setSpacing(ui(12))
         self.btn_back = TouchButton("Back", min_h=66, min_w=170)
-        self.btn_view_runs = TouchButton("Previous Runs", min_h=66, min_w=220)
         self.title = QLabel("Recipe Builder")
         self.title.setObjectName("ScreenTitle")
         top.addWidget(self.btn_back)
-        top.addWidget(self.btn_view_runs)
         top.addWidget(self.title, 1)
         root.addLayout(top)
 
@@ -2270,7 +2267,6 @@ class RecipeBuilderScreen(QWidget):
         root.addLayout(actions)
 
         self.btn_back.clicked.connect(self.back_clicked.emit)
-        self.btn_view_runs.clicked.connect(self.view_runs_clicked.emit)
         self.btn_cancel.clicked.connect(self.cancel_clicked.emit)
         self.btn_add.clicked.connect(self._on_add_step)
         self.btn_save.clicked.connect(self._on_save)
@@ -3450,6 +3446,7 @@ class HomeScreen(QWidget):
     recipe_edit_clicked = Signal(str)
     open_datalogger_clicked = Signal()
     open_recipe_run_clicked = Signal()
+    open_previous_runs_clicked = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -3477,6 +3474,7 @@ class HomeScreen(QWidget):
         self.btn_builder = TouchButton("Recipe Builder", min_h=70, min_w=240)
         self.btn_datalogger = TouchButton("Data Logger", min_h=70, min_w=240)
         self.btn_recipe_run = TouchButton("Recipe Run", min_h=70, min_w=240)
+        self.btn_previous_runs = TouchButton("Previous Runs", min_h=70, min_w=240)
         self.btn_calibrate = TouchButton("Calibrate Motor", min_h=70, min_w=240)
 
         left.addWidget(self.rpm_ctl)
@@ -3485,6 +3483,7 @@ class HomeScreen(QWidget):
         left.addWidget(self.btn_builder)
         left.addWidget(self.btn_datalogger)
         left.addWidget(self.btn_recipe_run)
+        left.addWidget(self.btn_previous_runs)
         left.addStretch(1)
         mid.addLayout(left, 1)
 
@@ -3505,6 +3504,8 @@ class HomeScreen(QWidget):
         self.recipes_layout.addStretch(1)
         self.recipes_area.setWidget(self.recipes_container)
         recipes_col.addWidget(self.recipes_area, 1)
+        self.btn_add_recipe = TouchButton("+ New Recipe", min_h=66, min_w=240)
+        recipes_col.addWidget(self.btn_add_recipe)
 
         mid.addLayout(recipes_col, 2)
         root.addLayout(mid, 1)
@@ -3519,6 +3520,8 @@ class HomeScreen(QWidget):
         self.btn_builder.clicked.connect(self.open_builder_clicked.emit)
         self.btn_datalogger.clicked.connect(self.open_datalogger_clicked.emit)
         self.btn_recipe_run.clicked.connect(self.open_recipe_run_clicked.emit)
+        self.btn_previous_runs.clicked.connect(self.open_previous_runs_clicked.emit)
+        self.btn_add_recipe.clicked.connect(self.open_builder_clicked.emit)
 
     def set_recipe_cards(self, recipes: List[Recipe], selected_id: Optional[str]) -> None:
         while self.recipes_layout.count() > 1:
@@ -3588,6 +3591,8 @@ class HomeScreen(QWidget):
         self.btn_builder.setEnabled(not running)
         self.btn_datalogger.setEnabled(True)
         self.btn_recipe_run.setEnabled(bool(recipe_run_active))
+        self.btn_previous_runs.setEnabled(True)
+        self.btn_add_recipe.setEnabled(not running)
         self.recipes_area.setEnabled(not running)
 
 
@@ -3634,6 +3639,8 @@ class AppController(QObject):
 
         self.store = RecipeStore()
         self.store.load()
+        self.run_store = RecipeRunStore()
+        self.run_store.load()
         self.selected_recipe_id: Optional[str] = None
 
         self.connected = False
@@ -3660,6 +3667,7 @@ class AppController(QObject):
         self._recipe_monitor_step_idx = -1
         self._recipe_monitor_failed = False
         self._recipe_monitor_plot_tags: List[str] = [TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM]
+        self._current_recipe_run_record: Optional[Dict[str, Any]] = None
 
         self.history_db = HistoryDB(app_config_dir() / "history.sqlite")
 
@@ -3716,6 +3724,7 @@ class AppController(QObject):
         self.home.recipe_select_clicked.connect(self.on_select_recipe)
         self.home.recipe_edit_clicked.connect(self.on_edit_recipe)
         self.home.open_datalogger_clicked.connect(self.on_open_datalogger)
+        self.home.open_previous_runs_clicked.connect(self.on_open_previous_runs)
         self.home.open_recipe_run_clicked.connect(self.on_open_recipe_run)
 
         self.home.rpm_ctl.value_changed.connect(self._on_home_rpm_changed)
@@ -3849,6 +3858,14 @@ class AppController(QObject):
 
     def _refresh_recipes(self) -> None:
         self.home.set_recipe_cards(self.store.recipes(), self.selected_recipe_id)
+
+    def _recipe_run_audit(self, text: str) -> None:
+        msg = str(text)
+        self.recipe_run.append_audit(msg)
+        if self._current_recipe_run_record is not None:
+            self._current_recipe_run_record.setdefault("audit", []).append(
+                {"ts": int(epoch_s()), "text": msg}
+            )
 
     def _refresh_status_all(self) -> None:
         r = self._selected_recipe()
@@ -4066,7 +4083,7 @@ class AppController(QObject):
             self._recipe_monitor_failed = True
             if self._recipe_monitor_step_idx >= 0:
                 self.recipe_run.set_step_error(self._recipe_monitor_step_idx, str(msg))
-            self.recipe_run.append_audit(f"Error: {msg}")
+            self._recipe_run_audit(f"Error: {msg}")
         if self.engine.is_running():
             self.engine.stop(user_initiated=True)
         self._show_odrive_error_with_clear(self.stack.currentWidget(), msg)
@@ -4223,7 +4240,7 @@ class AppController(QObject):
         try:
             step = self._recipe_monitor_recipe.steps[step_idx]
             step_name = step.name or f"Step {step_idx + 1}"
-            self.recipe_run.append_audit(f"Step {step_idx + 1} started: {step_name}")
+            self._recipe_run_audit(f"Step {step_idx + 1} started: {step_name}")
             self.recipe_run.set_step_running(step_idx, int(step.duration_s))
         except Exception:
             self.recipe_run.set_step_running(step_idx, 0)
@@ -4302,7 +4319,7 @@ class AppController(QObject):
     @Slot()
     def on_stop(self) -> None:
         if self._run_mode == "recipe" and self._recipe_monitor_recipe is not None and not self._recipe_monitor_failed:
-            self.recipe_run.append_audit("Recipe stopped by user")
+            self._recipe_run_audit("Recipe stopped by user")
             if self._recipe_monitor_step_idx >= 0:
                 self.recipe_run.set_step_error(self._recipe_monitor_step_idx, "Stopped by user")
             self._recipe_monitor_failed = True
@@ -4375,6 +4392,76 @@ class AppController(QObject):
             return
         self.stack.setCurrentWidget(self.recipe_run)
         self._refresh_recipe_monitor_plot()
+
+    @Slot()
+    def on_open_previous_runs(self) -> None:
+        dlg = QDialog(self.home)
+        dlg.setWindowTitle("Previous Recipe Runs")
+        dlg.setModal(True)
+        dlg.setMinimumSize(ui(980), ui(620))
+
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(ui(16), ui(16), ui(16), ui(16))
+        root.setSpacing(ui(12))
+
+        title = QLabel("Previous Recipe Runs")
+        title.setObjectName("ScreenTitle")
+        root.addWidget(title)
+
+        body = QHBoxLayout()
+        body.setSpacing(ui(12))
+
+        run_list = QListWidget()
+        enable_touch_scrolling(run_list)
+        detail_list = QListWidget()
+        enable_touch_scrolling(detail_list)
+        body.addWidget(run_list, 1)
+        body.addWidget(detail_list, 2)
+        root.addLayout(body, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        root.addWidget(buttons)
+        buttons.rejected.connect(dlg.reject)
+        buttons.accepted.connect(dlg.accept)
+
+        runs = self.run_store.runs()
+        if not runs:
+            run_list.addItem("No previous recipe runs recorded yet.")
+        else:
+            for r in runs:
+                started = int(safe_float(r.get("started_ts", 0), 0))
+                started_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)) if started > 0 else "Unknown time"
+                status = str(r.get("status") or "unknown")
+                recipe_name = str(r.get("recipe_name") or "(unknown recipe)")
+                run_id = str(r.get("run_id") or "")
+                label = f"{started_txt} | {recipe_name} | {status} | {run_id[:8]}"
+                run_list.addItem(label)
+
+            def load_detail(idx: int) -> None:
+                detail_list.clear()
+                if not (0 <= idx < len(runs)):
+                    return
+                r = runs[idx]
+                started = int(safe_float(r.get('started_ts', 0), 0))
+                ended = int(safe_float(r.get('ended_ts', 0), 0))
+                detail_list.addItem(f"Run ID: {r.get('run_id', '')}")
+                detail_list.addItem(f"Recipe: {r.get('recipe_name', '')}")
+                detail_list.addItem(f"Status: {r.get('status', '')}")
+                if started > 0:
+                    detail_list.addItem(f"Started: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(started))}")
+                if ended > 0:
+                    detail_list.addItem(f"Ended: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ended))}")
+                detail_list.addItem("")
+                detail_list.addItem("Audit Trail")
+                for a in list(r.get("audit") or []):
+                    ts = int(safe_float((a or {}).get("ts", 0), 0))
+                    ttxt = time.strftime("%H:%M:%S", time.localtime(ts)) if ts > 0 else "--:--:--"
+                    detail_list.addItem(f"{ttxt}  {str((a or {}).get('text', ''))}")
+
+            run_list.currentRowChanged.connect(load_detail)
+            run_list.setCurrentRow(0)
+
+        dlg.exec()
 
     @Slot()
     def on_back_home(self) -> None:
@@ -4533,15 +4620,39 @@ class AppController(QObject):
         self._recipe_monitor_recipe = recipe
         self._recipe_monitor_step_idx = -1
         self._recipe_monitor_failed = False
+        run_id = str(uuid.uuid4())
+        self._current_recipe_run_record = {
+            "run_id": run_id,
+            "recipe_id": str(recipe.id),
+            "recipe_name": str(recipe.name),
+            "started_ts": int(epoch_s()),
+            "ended_ts": None,
+            "status": "running",
+            "audit": [],
+        }
         self.recipe_run.set_recipe(recipe)
-        self.recipe_run.append_audit(f"Recipe started: {recipe.name}")
+        self._recipe_run_audit(f"Recipe started: {recipe.name} (Run ID: {run_id})")
         self._refresh_recipe_monitor_plot()
         self.stack.setCurrentWidget(self.recipe_run)
 
     def _recipe_monitor_finish(self, reason: str) -> None:
         if self._recipe_monitor_recipe is None:
             return
-        self.recipe_run.append_audit(reason)
+        self._recipe_run_audit(reason)
+        if self._current_recipe_run_record is not None:
+            self._current_recipe_run_record["ended_ts"] = int(epoch_s())
+            rtxt = str(reason).lower()
+            if "completed" in rtxt:
+                status = "completed"
+            elif "user" in rtxt or "stopped" in rtxt:
+                status = "stopped"
+            elif "error" in rtxt or self._recipe_monitor_failed:
+                status = "error"
+            else:
+                status = "ended"
+            self._current_recipe_run_record["status"] = status
+            self.run_store.add_run(self._current_recipe_run_record)
+            self._current_recipe_run_record = None
         self._recipe_monitor_recipe = None
         self._recipe_monitor_step_idx = -1
 
