@@ -39,6 +39,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import sqlite3
 import sys
 import time
@@ -4347,7 +4348,21 @@ class AppController(QObject):
             self._draw_report_chart(c, page_w, page_h, title_txt, series)
 
         c.save()
-        QMessageBox.information(self.home, "Report Export", f"Saved report:\n{out}")
+        ans = QMessageBox.question(
+            self.home,
+            "Report Export",
+            f"Saved report:\n{out}\n\nOpen PDF now?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if ans == QMessageBox.Yes:
+            try:
+                if hasattr(os, "startfile"):
+                    os.startfile(str(out))  # type: ignore[attr-defined]
+                else:
+                    raise RuntimeError("Opening files is not supported on this platform build.")
+            except Exception as e:
+                self._show_modal_error(self.home, "Open PDF", f"Failed to open PDF:\n{e}")
 
     @Slot(bool, str)
     def _on_calibration_checked(self, calibrated: bool, detail: str) -> None:
