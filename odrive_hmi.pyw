@@ -3280,6 +3280,7 @@ class RecipeRunMonitorScreen(QWidget):
     back_clicked = Signal()
     stop_clicked = Signal()
     tags_changed = Signal(object)  # list[str]
+    generate_report_clicked = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -3340,14 +3341,17 @@ class RecipeRunMonitorScreen(QWidget):
         footer_row = QHBoxLayout()
         footer_row.setSpacing(ui(12))
         footer_row.addStretch(1)
+        self.btn_report = TouchButton("Generate Report", min_h=72, min_w=260)
         self.btn_stop = TouchButton("Stop", min_h=72, min_w=220)
         self.btn_stop.setObjectName("StopButton")
+        footer_row.addWidget(self.btn_report)
         footer_row.addWidget(self.btn_stop)
         root.addLayout(footer_row)
 
         self.btn_back.clicked.connect(self.back_clicked.emit)
         self.btn_stop.clicked.connect(self.stop_clicked.emit)
         self.btn_options.clicked.connect(self._open_options_dialog)
+        self.btn_report.clicked.connect(self.generate_report_clicked.emit)
 
     def selected_tags(self) -> List[str]:
         return list(getattr(self, "_selected_tags", [TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM]))
@@ -3751,6 +3755,7 @@ class AppController(QObject):
         self.recipe_run.back_clicked.connect(self.on_back_home)
         self.recipe_run.stop_clicked.connect(self.on_stop)
         self.recipe_run.tags_changed.connect(self._on_recipe_run_tags_changed)
+        self.recipe_run.generate_report_clicked.connect(self.on_generate_current_recipe_report)
         self.hmi_settings.fullscreen_changed.connect(self.on_hmi_fullscreen_changed)
 
         self.cfg.back_clicked.connect(self.on_back_home)
@@ -4872,6 +4877,23 @@ class AppController(QObject):
             btn_report.clicked.connect(on_generate_report)
 
         dlg.exec()
+
+    @Slot()
+    def on_generate_current_recipe_report(self) -> None:
+        run: Optional[Dict[str, Any]] = None
+        if self._current_recipe_run_record is not None:
+            run = dict(self._current_recipe_run_record)
+            run.setdefault("status", "running")
+            run.setdefault("started_ts", int(epoch_s()))
+            run["ended_ts"] = int(epoch_s())
+        else:
+            runs = self.run_store.runs()
+            if runs:
+                run = dict(runs[0])
+        if not run:
+            QMessageBox.information(self.recipe_run, "Generate Report", "No recipe run is available to export.")
+            return
+        self._export_recipe_run_report(run)
 
     @Slot()
     def on_back_home(self) -> None:
