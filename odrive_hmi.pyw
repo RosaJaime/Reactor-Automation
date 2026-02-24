@@ -1737,6 +1737,18 @@ class HistoryDB:
     def query_window_multi(self, now_ts: int, tags: Sequence[str], minutes: int) -> Dict[str, List[Tuple[int, float]]]:
         return {t: self.query_window(now_ts, t, minutes) for t in tags}
 
+    def query_range(self, start_ts: int, end_ts: int, tag: str) -> List[Tuple[int, float]]:
+        lo = int(min(start_ts, end_ts))
+        hi = int(max(start_ts, end_ts))
+        cur = self._conn.execute(
+            "SELECT ts, value FROM samples WHERE tag=? AND ts>=? AND ts<=? ORDER BY ts ASC",
+            (tag, lo, hi),
+        )
+        return [(int(r[0]), float(r[1])) for r in cur.fetchall()]
+
+    def query_range_multi(self, start_ts: int, end_ts: int, tags: Sequence[str]) -> Dict[str, List[Tuple[int, float]]]:
+        return {t: self.query_range(start_ts, end_ts, t) for t in tags}
+
     def export_window_csv_multi(self, out_path: Path, now_ts: int, tags: Sequence[str], minutes: int) -> int:
         start_ts = now_ts - max(1, int(minutes)) * 60
         tags = list(tags)
@@ -3471,7 +3483,6 @@ class HomeScreen(QWidget):
         left.setSpacing(ui(12))
         self.rpm_ctl = RpmControl("Velocity", VEL_MIN_RPM, VEL_MAX_RPM, VEL_STEP_RPM, compact=False)
         self.time_ctl = TimeControl("Timer", TIME_STEP_S, compact=False)
-        self.btn_builder = TouchButton("Recipe Builder", min_h=70, min_w=240)
         self.btn_datalogger = TouchButton("Data Logger", min_h=70, min_w=240)
         self.btn_recipe_run = TouchButton("Recipe Run", min_h=70, min_w=240)
         self.btn_previous_runs = TouchButton("Previous Runs", min_h=70, min_w=240)
@@ -3480,7 +3491,6 @@ class HomeScreen(QWidget):
         left.addWidget(self.rpm_ctl)
         left.addWidget(self.time_ctl)
         left.addWidget(self.btn_calibrate)
-        left.addWidget(self.btn_builder)
         left.addWidget(self.btn_datalogger)
         left.addWidget(self.btn_recipe_run)
         left.addWidget(self.btn_previous_runs)
@@ -3517,7 +3527,6 @@ class HomeScreen(QWidget):
         self.footer.stop_clicked.connect(self.stop_clicked.emit)
         self.btn_calibrate.clicked.connect(self.calibrate_clicked.emit)
         self.btn_settings.clicked.connect(self.open_settings_clicked.emit)
-        self.btn_builder.clicked.connect(self.open_builder_clicked.emit)
         self.btn_datalogger.clicked.connect(self.open_datalogger_clicked.emit)
         self.btn_recipe_run.clicked.connect(self.open_recipe_run_clicked.emit)
         self.btn_previous_runs.clicked.connect(self.open_previous_runs_clicked.emit)
@@ -3588,7 +3597,6 @@ class HomeScreen(QWidget):
 
         self.btn_calibrate.setEnabled((not running) and connected and (not calibrating))
         self.btn_calibrate.setText("Calibrating..." if calibrating else ("Recalibrate Motor" if calibrated else "Calibrate Motor"))
-        self.btn_builder.setEnabled(not running)
         self.btn_datalogger.setEnabled(True)
         self.btn_recipe_run.setEnabled(bool(recipe_run_active))
         self.btn_previous_runs.setEnabled(True)
@@ -3715,6 +3723,7 @@ class AppController(QObject):
         self.engine.remaining_changed.connect(self._on_engine_remaining)
         self.engine.step_info_changed.connect(lambda x: self._set_ui(step=x))
         self.engine.recipe_step_changed.connect(self._on_engine_recipe_step_changed)
+        self.engine.recipe_data_entry_requested.connect(self._on_engine_recipe_data_entry_requested)
 
         self.home.start_clicked.connect(self.on_start)
         self.home.stop_clicked.connect(self.on_stop)
@@ -4096,6 +4105,245 @@ class AppController(QObject):
             values[str(key)] = value
         return values
 
+    def _report_wrap_lines(self, text: str, max_chars: int = 110) -> List[str]:
+        s = str(text or "")
+        if not s:
+            return [""]
+        out: List[str] = []
+        for para in s.splitlines() or [""]:
+            p = para.strip()
+            if not p:
+                out.append("")
+                continue
+            while len(p) > max_chars:
+                cut = p.rfind(" ", 0, max_chars + 1)
+                if cut <= 0:
+                    cut = max_chars
+                out.append(p[:cut].rstrip())
+                p = p[cut:].lstrip()
+            out.append(p)
+        return out
+
+    def _draw_report_chart(
+        self,
+        canv: Any,
+        page_w: float,
+        page_h: float,
+        title: str,
+        series_by_tag: Dict[str, List[Tuple[int, float]]],
+    ) -> None:
+        margin = 48.0
+        canv.setFont("Helvetica-Bold", 16)
+        canv.drawString(margin, page_h - margin, str(title))
+
+        chart_x = margin
+        chart_y = 120.0
+        chart_w = page_w - 2 * margin
+        chart_h = page_h - 200.0
+
+        canv.setLineWidth(1)
+        canv.rect(chart_x, chart_y, chart_w, chart_h)
+
+        active_tags = [t for t, pts in series_by_tag.items() if pts]
+        if not active_tags:
+            canv.setFont("Helvetica", 12)
+            canv.drawString(chart_x + 12, chart_y + chart_h - 24, "No data in selected run window")
+            return
+
+        all_pts = [(ts, float(v)) for t in active_tags for ts, v in series_by_tag.get(t, [])]
+        ts_min = min(ts for ts, _ in all_pts)
+        ts_max = max(ts for ts, _ in all_pts)
+        if ts_max <= ts_min:
+            ts_max = ts_min + 1
+        y_min = min(v for _, v in all_pts)
+        y_max = max(v for _, v in all_pts)
+        if not math.isfinite(y_min) or not math.isfinite(y_max):
+            y_min, y_max = 0.0, 1.0
+        if abs(y_max - y_min) < 1e-9:
+            y_max = y_min + 1.0
+        pad = 0.05 * (y_max - y_min)
+        y_min -= pad
+        y_max += pad
+
+        def mx(ts: int) -> float:
+            return chart_x + (float(ts - ts_min) / float(ts_max - ts_min)) * chart_w
+
+        def my(v: float) -> float:
+            return chart_y + (float(v - y_min) / float(y_max - y_min)) * chart_h
+
+        canv.setFont("Helvetica", 10)
+        canv.drawString(chart_x, chart_y - 18, time.strftime("%H:%M:%S", time.localtime(ts_min)))
+        canv.drawRightString(chart_x + chart_w, chart_y - 18, time.strftime("%H:%M:%S", time.localtime(ts_max)))
+        canv.drawRightString(chart_x - 6, chart_y + chart_h - 2, f"{y_max:.3g}")
+        canv.drawRightString(chart_x - 6, chart_y - 2, f"{y_min:.3g}")
+
+        colors = [
+            (0.00, 0.75, 1.00),
+            (1.00, 0.85, 0.10),
+            (0.20, 0.90, 0.35),
+            (1.00, 0.25, 0.75),
+            (1.00, 0.35, 0.20),
+            (0.45, 0.65, 1.00),
+        ]
+
+        legend_y = page_h - 78.0
+        legend_x = margin
+        for i, tag in enumerate(active_tags):
+            pts = series_by_tag.get(tag, [])
+            if len(pts) < 1:
+                continue
+            r, g, b = colors[i % len(colors)]
+            canv.setStrokeColorRGB(r, g, b)
+            canv.setFillColorRGB(r, g, b)
+            canv.rect(legend_x, legend_y - 8, 10, 10, fill=1, stroke=0)
+            canv.setFillColorRGB(1, 1, 1)
+            canv.setFont("Helvetica", 10)
+            label = f"{TAG_LABELS.get(tag, tag)} ({TAG_UNITS.get(tag, '')})"
+            canv.drawString(legend_x + 14, legend_y - 1, label)
+            legend_x += 14 + min(260, 8 * len(label))
+            if legend_x > (page_w - margin - 220):
+                legend_x = margin
+                legend_y -= 16
+
+            canv.setStrokeColorRGB(r, g, b)
+            canv.setLineWidth(1.4)
+            prev: Optional[Tuple[float, float]] = None
+            for ts, val in pts:
+                px, py = mx(int(ts)), my(float(val))
+                if prev is not None:
+                    canv.line(prev[0], prev[1], px, py)
+                prev = (px, py)
+
+        canv.setStrokeColorRGB(1, 1, 1)
+        canv.setFillColorRGB(1, 1, 1)
+
+    def _export_recipe_run_report(self, run: Dict[str, Any]) -> None:
+        try:
+            from reportlab.lib.pagesizes import letter  # type: ignore
+            from reportlab.pdfgen import canvas  # type: ignore
+        except Exception as e:
+            self._show_modal_error(self.home, "Report Export", f"ReportLab is not installed:\n{e}")
+            return
+
+        run_id = str(run.get("run_id") or str(uuid.uuid4()))
+        recipe_name = str(run.get("recipe_name") or "Recipe Run")
+        started_ts = int(safe_float(run.get("started_ts", 0), 0))
+        ended_ts = int(safe_float(run.get("ended_ts", epoch_s()), epoch_s()))
+        if ended_ts <= 0:
+            ended_ts = max(started_ts, epoch_s())
+        if started_ts <= 0:
+            started_ts = max(0, ended_ts - 60)
+        if ended_ts < started_ts:
+            ended_ts = started_ts
+
+        out = downloads_dir() / f"recipe_run_report_{run_id[:8]}_{time.strftime('%Y%m%d_%H%M%S')}.pdf"
+
+        try:
+            data = self.history_db.query_range_multi(
+                started_ts,
+                ended_ts,
+                [TAG_CMD_RPM, TAG_VEL_RPM, TAG_PWR_W, TAG_TORQUE_NM],
+            )
+        except Exception as e:
+            self._show_modal_error(self.home, "Report Export", f"Failed to query run data:\n{e}")
+            return
+
+        c = canvas.Canvas(str(out), pagesize=letter)
+        page_w, page_h = letter
+        margin = 48.0
+
+        # Page 1: Title + metadata + block diagram
+        c.setTitle(f"Recipe Run Report - {run_id}")
+        c.setFont("Helvetica-Bold", 20)
+        c.drawString(margin, page_h - margin, "Recipe Run Report")
+        c.setFont("Helvetica", 11)
+        meta_lines = [
+            f"Recipe: {recipe_name}",
+            f"Run ID: {run_id}",
+            f"Status: {str(run.get('status') or 'unknown')}",
+            f"Started: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(started_ts)) if started_ts > 0 else 'Unknown'}",
+            f"Ended: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ended_ts)) if ended_ts > 0 else 'Unknown'}",
+            f"Duration: {format_mmss(max(0, ended_ts - started_ts))}",
+        ]
+        y = page_h - margin - 28
+        for line in meta_lines:
+            c.drawString(margin, y, line)
+            y -= 15
+
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(margin, y - 10, "Block Diagram")
+        y -= 26
+
+        steps = list(run.get("recipe_steps") or [])
+        if not steps:
+            c.setFont("Helvetica", 11)
+            c.drawString(margin, y, "No recipe step snapshot saved for this run.")
+        else:
+            box_x = margin
+            box_w = page_w - 2 * margin
+            box_h = 42.0
+            for i, s in enumerate(steps):
+                if y - box_h < 70:
+                    c.showPage()
+                    y = page_h - margin
+                    c.setFont("Helvetica-Bold", 14)
+                    c.drawString(margin, y, "Block Diagram (cont.)")
+                    y -= 24
+                kind = str((s or {}).get("kind", "motor") or "motor")
+                name = str((s or {}).get("name") or f"Step {i+1}")
+                if kind == "data_entry":
+                    prompt = str((s or {}).get("prompt") or "")
+                    rkind = str((s or {}).get("response_kind") or "text")
+                    detail = f"Data entry [{rkind}] - {prompt}"
+                else:
+                    rpm = safe_float((s or {}).get("velocity_rpm", 0), 0.0)
+                    dur = int(safe_float((s or {}).get("duration_s", 0), 0))
+                    detail = f"{rpm:g} rpm for {format_mmss(dur)}"
+                c.rect(box_x, y - box_h + 6, box_w, box_h, stroke=1, fill=0)
+                c.setFont("Helvetica-Bold", 11)
+                c.drawString(box_x + 8, y - 10, f"{i+1}. {name}")
+                c.setFont("Helvetica", 10)
+                c.drawString(box_x + 8, y - 25, detail[:150])
+                y -= (box_h + 8)
+
+        # Audit trail pages
+        c.showPage()
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(margin, page_h - margin, "Audit Trail")
+        y = page_h - margin - 24
+        c.setFont("Helvetica", 10)
+        audit = list(run.get("audit") or [])
+        if not audit:
+            c.drawString(margin, y, "No audit entries saved.")
+        else:
+            for entry in audit:
+                ts = int(safe_float((entry or {}).get("ts", 0), 0))
+                ttxt = time.strftime("%H:%M:%S", time.localtime(ts)) if ts > 0 else "--:--:--"
+                prefix = f"{ttxt}  "
+                lines = self._report_wrap_lines(f"{prefix}{str((entry or {}).get('text', ''))}", max_chars=115)
+                for line in lines:
+                    if y < 60:
+                        c.showPage()
+                        c.setFont("Helvetica-Bold", 16)
+                        c.drawString(margin, page_h - margin, "Audit Trail (cont.)")
+                        y = page_h - margin - 24
+                        c.setFont("Helvetica", 10)
+                    c.drawString(margin, y, line)
+                    y -= 13
+
+        # Trend pages
+        chart_pages = [
+            ("Velocity Trend", {TAG_CMD_RPM: data.get(TAG_CMD_RPM, []), TAG_VEL_RPM: data.get(TAG_VEL_RPM, [])}),
+            ("Power Trend", {TAG_PWR_W: data.get(TAG_PWR_W, [])}),
+            ("Torque Trend", {TAG_TORQUE_NM: data.get(TAG_TORQUE_NM, [])}),
+        ]
+        for title_txt, series in chart_pages:
+            c.showPage()
+            self._draw_report_chart(c, page_w, page_h, title_txt, series)
+
+        c.save()
+        QMessageBox.information(self.home, "Report Export", f"Saved report:\n{out}")
+
     @Slot(bool, str)
     def _on_calibration_checked(self, calibrated: bool, detail: str) -> None:
         self.motor_calibrated = bool(calibrated)
@@ -4244,6 +4492,156 @@ class AppController(QObject):
             self.recipe_run.set_step_running(step_idx, int(step.duration_s))
         except Exception:
             self.recipe_run.set_step_running(step_idx, 0)
+
+    @Slot(object, int, int)
+    def _on_engine_recipe_data_entry_requested(self, step_obj: Any, step_idx: int, total_steps: int) -> None:
+        step = step_obj if isinstance(step_obj, Step) else Step(**dict(step_obj)) if isinstance(step_obj, dict) else None
+        if step is None:
+            self._recipe_run_audit(f"Step {int(step_idx)+1}: data entry prompt missing; continuing")
+            self.engine.continue_after_data_entry()
+            return
+
+        parent = self.recipe_run if self.stack.currentWidget() is self.recipe_run else self.home
+        title = (step.name or f"Step {int(step_idx)+1}").strip()
+        prompt = (step.prompt or title or "Enter value").strip()
+        response_kind = str(getattr(step, "response_kind", "text") or "text")
+        allow_skip = bool(getattr(step, "allow_skip", True))
+
+        while True:
+            dlg = QDialog(parent)
+            dlg.setWindowTitle(f"Recipe Data Entry ({int(step_idx)+1}/{int(total_steps)})")
+            dlg.setModal(True)
+            dlg.setMinimumWidth(ui(700))
+
+            root = QVBoxLayout(dlg)
+            root.setContentsMargins(ui(16), ui(16), ui(16), ui(16))
+            root.setSpacing(ui(12))
+
+            lbl_title = QLabel(title)
+            lbl_title.setObjectName("SectionTitle")
+            root.addWidget(lbl_title)
+
+            lbl_prompt = QLabel(prompt)
+            lbl_prompt.setObjectName("InfoLabel")
+            lbl_prompt.setWordWrap(True)
+            root.addWidget(lbl_prompt)
+
+            editor: Optional[QWidget] = None
+            if response_kind == "pass_fail":
+                combo = QComboBox()
+                combo.setMinimumHeight(ui(66))
+                combo.addItem("Pass", "pass")
+                combo.addItem("Fail", "fail")
+                editor = combo
+                root.addWidget(combo)
+            else:
+                edit = QLineEdit()
+                edit.setMinimumHeight(ui(66))
+                if response_kind == "numeric":
+                    edit.setValidator(QDoubleValidator(edit))
+                    edit.setPlaceholderText("Enter numeric value")
+                else:
+                    edit.setPlaceholderText("Enter text")
+                editor = edit
+                root.addWidget(edit)
+
+            buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+            btn_submit = buttons.addButton("Submit", QDialogButtonBox.AcceptRole)
+            btn_submit.setMinimumHeight(ui(58))
+            btn_skip = None
+            if allow_skip:
+                btn_skip = buttons.addButton("Skip", QDialogButtonBox.ActionRole)
+                btn_skip.setMinimumHeight(ui(58))
+            root.addWidget(buttons)
+
+            result: Dict[str, Any] = {"action": "cancel", "value": None}
+
+            def on_accept() -> None:
+                if response_kind == "pass_fail":
+                    assert isinstance(editor, QComboBox)
+                    result["action"] = "submit"
+                    result["value"] = str(editor.currentData() or editor.currentText() or "")
+                    dlg.accept()
+                    return
+                assert isinstance(editor, QLineEdit)
+                txt = editor.text().strip()
+                if response_kind == "numeric":
+                    if not txt:
+                        QMessageBox.warning(dlg, "Data Entry", "Enter a numeric value or choose Skip.")
+                        return
+                    try:
+                        result["value"] = float(txt)
+                    except Exception:
+                        QMessageBox.warning(dlg, "Data Entry", "Numeric value is invalid.")
+                        return
+                else:
+                    if not txt:
+                        QMessageBox.warning(dlg, "Data Entry", "Enter a value or choose Skip.")
+                        return
+                    result["value"] = txt
+                result["action"] = "submit"
+                dlg.accept()
+
+            buttons.accepted.connect(on_accept)
+            buttons.rejected.connect(dlg.reject)
+            if btn_skip is not None:
+                btn_skip.clicked.connect(lambda: (result.update({"action": "skip", "value": None}), dlg.accept()))
+
+            dlg.exec()
+
+            action = str(result.get("action", "cancel"))
+            if action == "cancel":
+                if allow_skip:
+                    # Treat closing/cancel as skip when skipping is allowed.
+                    action = "skip"
+                else:
+                    ans = QMessageBox.question(
+                        parent,
+                        "Data Entry Required",
+                        "This step requires a response.\n\nRetry entry or stop the run?",
+                        QMessageBox.Retry | QMessageBox.Abort,
+                        QMessageBox.Retry,
+                    )
+                    if ans == QMessageBox.Retry:
+                        continue
+                    self._recipe_run_audit(f"Step {int(step_idx)+1} data entry aborted by user")
+                    self.on_stop()
+                    return
+
+            if action == "skip":
+                self._recipe_run_audit(f"Step {int(step_idx)+1} data entry skipped: {prompt}")
+                if self._current_recipe_run_record is not None:
+                    self._current_recipe_run_record.setdefault("data_entries", []).append(
+                        {
+                            "ts": int(epoch_s()),
+                            "step_idx": int(step_idx),
+                            "step_name": title,
+                            "prompt": prompt,
+                            "response_kind": response_kind,
+                            "skipped": True,
+                            "value": None,
+                        }
+                    )
+                self.engine.continue_after_data_entry()
+                return
+
+            val = result.get("value")
+            val_txt = f"{val:g}" if isinstance(val, (int, float)) else str(val)
+            self._recipe_run_audit(f"Step {int(step_idx)+1} data entry: {prompt} = {val_txt}")
+            if self._current_recipe_run_record is not None:
+                self._current_recipe_run_record.setdefault("data_entries", []).append(
+                    {
+                        "ts": int(epoch_s()),
+                        "step_idx": int(step_idx),
+                        "step_name": title,
+                        "prompt": prompt,
+                        "response_kind": response_kind,
+                        "skipped": False,
+                        "value": val,
+                    }
+                )
+            self.engine.continue_after_data_entry()
+            return
 
     @Slot(str)
     def _on_engine_run_mode_changed(self, mode: str) -> None:
@@ -4628,6 +5026,7 @@ class AppController(QObject):
             "started_ts": int(epoch_s()),
             "ended_ts": None,
             "status": "running",
+            "recipe_steps": [asdict(s) for s in recipe.steps],
             "audit": [],
         }
         self.recipe_run.set_recipe(recipe)
