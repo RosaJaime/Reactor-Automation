@@ -35,25 +35,29 @@ Before starting a run, the app checks whether the motor/encoder are calibrated. 
   - Start/Stop
   - Select and run recipes
   - Calibrate motor
+
+  <p>
+    <img src="Images/Main%20Screen.png" alt="Main screen" width="85%" />
+    <br />
+    <em>Main screen: manual controls, recipe selection, calibration, and quick access to logs/history.</em>
+  </p>
+
 - `Recipe Builder`
   - Create/edit named recipes with multiple steps
   - Each step has velocity (RPM) and duration
+
+  <p>
+    <img src="Images/Recipe%20Builder.png" alt="Recipe builder screen" width="85%" />
+    <br />
+    <em>Recipe Builder: create/edit multi-step recipes, including motor steps and data-entry prompts.</em>
+  </p>
+
 - `ODrive Configuration`
   - Read/apply a curated list of common ODrive settings
   - Export `get_json()` to file
 - `Data Logger`
   - Live trend plots (voltage/current/power/commanded RPM/estimated RPM)
   - CSV export
-
-## Screenshots
-
-<p>
-  <img src="Images/Main%20Screen.png" alt="Main screen" width="49%" />
-  <img src="Images/Recipe%20Builder.png" alt="Recipe builder screen" width="49%" />
-</p>
-<p>
-  <img src="Images/Recipe%20Run%20View.png" alt="Recipe run monitor view" width="100%" />
-</p>
 
 ## Requirements
 
@@ -132,6 +136,12 @@ A recipe is a sequence of steps:
 - `duration_s`
 
 The app transitions through each step automatically and stops at the end.
+
+<p>
+  <img src="Images/Recipe%20Run%20View.png" alt="Recipe run monitor view" width="95%" />
+  <br />
+  <em>Recipe Run view: active step progress, audit trail, and live trend chart during execution.</em>
+</p>
 
 ## Calibration Workflow (Important)
 
