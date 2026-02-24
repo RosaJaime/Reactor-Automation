@@ -76,6 +76,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -245,6 +246,7 @@ def downloads_dir() -> Path:
 class Step:
     velocity_rpm: float
     duration_s: int
+    name: str = ""
 
 
 @dataclass
@@ -280,7 +282,15 @@ class RecipeStore:
             data = json.loads(self._path.read_text(encoding="utf-8"))
             out: List[Recipe] = []
             for rj in data.get("recipes", []):
-                steps = [Step(float(s["velocity_rpm"]), int(s["duration_s"])) for s in rj.get("steps", [])]
+                steps = []
+                for i, s in enumerate(rj.get("steps", []), start=1):
+                    steps.append(
+                        Step(
+                            float(s["velocity_rpm"]),
+                            int(s["duration_s"]),
+                            str(s.get("name") or f"Step {i}"),
+                        )
+                    )
                 out.append(Recipe(id=str(rj["id"]), name=str(rj["name"]), steps=steps))
             self._recipes = out
         except Exception:
@@ -310,7 +320,11 @@ class RecipeStore:
             Recipe(
                 id=str(uuid.uuid4()),
                 name="Gentle Mix",
-                steps=[Step(120.0, 60), Step(200.0, 120), Step(120.0, 60)],
+                steps=[
+                    Step(120.0, 60, "Step 1"),
+                    Step(200.0, 120, "Step 2"),
+                    Step(120.0, 60, "Step 3"),
+                ],
             )
         ]
 
@@ -1318,6 +1332,7 @@ class RunEngine(QObject):
     active_rpm_changed = Signal(float)
     remaining_changed = Signal(int)
     step_info_changed = Signal(str)
+    recipe_step_changed = Signal(int, int)       # step_idx, total_steps
 
     request_set_rpm = Signal(float)
     request_stop = Signal()
@@ -1387,12 +1402,14 @@ class RunEngine(QObject):
     def _start_current_step(self, now: float) -> None:
         assert self._recipe is not None
         step = self._recipe.steps[self._step_idx]
+        self.recipe_step_changed.emit(int(self._step_idx), int(len(self._recipe.steps)))
         self._active_rpm = float(step.velocity_rpm)
         self.request_set_rpm.emit(self._active_rpm)
         self.active_rpm_changed.emit(self._active_rpm)
 
         self._step_end_t = now + max(0, int(step.duration_s))
-        info = f"Step {self._step_idx + 1}/{len(self._recipe.steps)} • {step.velocity_rpm:g} rpm • {format_mmss(step.duration_s)}"
+        step_name = (step.name or f"Step {self._step_idx + 1}").strip()
+        info = f"{step_name} ? {self._step_idx + 1}/{len(self._recipe.steps)} ? {step.velocity_rpm:g} rpm ? {format_mmss(step.duration_s)}"
         self.step_info_changed.emit(info)
 
     @Slot(float)
@@ -1921,10 +1938,15 @@ class StepRow(QFrame):
 
         controls = QHBoxLayout()
         controls.setSpacing(ui(12))
+        self.name_edit = QLineEdit()
+        self.name_edit.setMinimumHeight(ui(54))
+        self.name_edit.setPlaceholderText(f"Step {index + 1}")
+        self.name_edit.setText(str(step.name or f"Step {index + 1}"))
         self.vel = RpmControl("Velocity", VEL_MIN_RPM, VEL_MAX_RPM, VEL_STEP_RPM, compact=True)
         self.tim = TimeControl("Time", TIME_STEP_S, compact=True)
         self.vel.set_value(step.velocity_rpm, emit_signal=False)
         self.tim.set_seconds(step.duration_s, emit_signal=False)
+        controls.addWidget(self.name_edit, 1)
         controls.addWidget(self.vel, 1)
         controls.addWidget(self.tim, 1)
         root.addLayout(controls)
@@ -1936,9 +1958,12 @@ class StepRow(QFrame):
     def set_index(self, idx: int) -> None:
         self._index = idx
         self.lbl.setText(f"Step {idx + 1}")
+        if not self.name_edit.text().strip() or self.name_edit.text().startswith("Step "):
+            self.name_edit.setPlaceholderText(f"Step {idx + 1}")
 
     def get_step(self) -> Step:
-        return Step(velocity_rpm=float(self.vel.value()), duration_s=int(self.tim.seconds()))
+        name = self.name_edit.text().strip() or f"Step {self._index + 1}"
+        return Step(velocity_rpm=float(self.vel.value()), duration_s=int(self.tim.seconds()), name=name)
 
 
 class RecipeBuilderScreen(QWidget):
@@ -2797,6 +2822,169 @@ class DataLoggerScreen(QWidget):
 
 
 # ----------------------------
+# Recipe Run Monitor Screen
+# ----------------------------
+
+class RecipeRunStepBox(QFrame):
+    def __init__(self, index: int, step: Step) -> None:
+        super().__init__()
+        self._index = int(index)
+        self._base_duration = int(max(0, step.duration_s))
+        self.setObjectName("RecipeRunStepBox")
+        self.setProperty("status", "pending")
+        self.setFrameShape(QFrame.StyledPanel)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(ui(10), ui(8), ui(10), ui(8))
+        root.setSpacing(ui(6))
+
+        self.lbl_title = QLabel(f"{index + 1}. {step.name or f'Step {index + 1}'}")
+        self.lbl_title.setObjectName("FieldLabel")
+        self.lbl_meta = QLabel(f"{step.velocity_rpm:g} rpm • {format_mmss(self._base_duration)}")
+        self.lbl_meta.setObjectName("InfoLabel")
+        self.lbl_status = QLabel("Pending")
+        self.lbl_status.setObjectName("InfoLabel")
+        self.lbl_error = QLabel("")
+        self.lbl_error.setObjectName("InfoLabel")
+        self.lbl_error.setWordWrap(True)
+
+        root.addWidget(self.lbl_title)
+        root.addWidget(self.lbl_meta)
+        root.addWidget(self.lbl_status)
+        root.addWidget(self.lbl_error)
+
+    def set_state(self, status: str, remaining_s: Optional[int] = None, error_text: str = "") -> None:
+        status = str(status)
+        self.setProperty("status", status)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        if status == "running":
+            rem = max(0, int(remaining_s or 0))
+            self.lbl_status.setText(f"In progress • {format_mmss(rem)} remaining")
+        elif status == "done":
+            self.lbl_status.setText("Completed")
+        elif status == "error":
+            self.lbl_status.setText("Error")
+        else:
+            self.lbl_status.setText("Pending")
+        self.lbl_error.setText(str(error_text or ""))
+
+
+class RecipeRunMonitorScreen(QWidget):
+    back_clicked = Signal()
+    stop_clicked = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._plot_minutes = 10
+        self._step_boxes: List[RecipeRunStepBox] = []
+        self._active_step_idx = -1
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(ui(18), ui(16), ui(18), ui(16))
+        root.setSpacing(ui(12))
+
+        top = QHBoxLayout()
+        top.setSpacing(ui(12))
+        self.btn_back = TouchButton("Back", min_h=66, min_w=170)
+        self.title = QLabel("Recipe Run")
+        self.title.setObjectName("ScreenTitle")
+        self.lbl_recipe = QLabel("")
+        self.lbl_recipe.setObjectName("InfoLabel")
+        top.addWidget(self.btn_back)
+        top.addWidget(self.title)
+        top.addWidget(self.lbl_recipe, 1)
+        root.addLayout(top)
+
+        body = QHBoxLayout()
+        body.setSpacing(ui(12))
+
+        left = QVBoxLayout()
+        left.setSpacing(ui(10))
+
+        self.steps_area = QScrollArea()
+        self.steps_area.setWidgetResizable(True)
+        self.steps_area.setFrameShape(QFrame.NoFrame)
+        self.steps_container = QWidget()
+        self.steps_layout = QVBoxLayout(self.steps_container)
+        self.steps_layout.setContentsMargins(0, 0, 0, 0)
+        self.steps_layout.setSpacing(ui(8))
+        self.steps_layout.addStretch(1)
+        self.steps_area.setWidget(self.steps_container)
+        left.addWidget(self.steps_area, 2)
+
+        audit_title = QLabel("Audit Trail")
+        audit_title.setObjectName("SectionTitleCompact")
+        left.addWidget(audit_title)
+        self.audit_list = QListWidget()
+        self.audit_list.setMinimumHeight(ui(180))
+        left.addWidget(self.audit_list, 1)
+
+        body.addLayout(left, 1)
+
+        self.plot = make_plot_widget()
+        body.addWidget(self.plot, 2)
+        root.addLayout(body, 1)
+
+        footer_row = QHBoxLayout()
+        footer_row.setSpacing(ui(12))
+        footer_row.addStretch(1)
+        self.btn_stop = TouchButton("Stop", min_h=72, min_w=220)
+        self.btn_stop.setObjectName("StopButton")
+        footer_row.addWidget(self.btn_stop)
+        root.addLayout(footer_row)
+
+        self.btn_back.clicked.connect(self.back_clicked.emit)
+        self.btn_stop.clicked.connect(self.stop_clicked.emit)
+
+    def set_recipe(self, recipe: Recipe) -> None:
+        self.lbl_recipe.setText(f"Recipe: {recipe.name} ({format_mmss(recipe_total_seconds(recipe))})")
+        self._plot_minutes = max(1, int(math.ceil(recipe_total_seconds(recipe) / 60.0)))
+        self._active_step_idx = -1
+        self.audit_list.clear()
+        while self.steps_layout.count() > 1:
+            item = self.steps_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._step_boxes = []
+        for i, step in enumerate(recipe.steps):
+            box = RecipeRunStepBox(i, step)
+            self._step_boxes.append(box)
+            self.steps_layout.insertWidget(self.steps_layout.count() - 1, box)
+
+    def append_audit(self, text: str) -> None:
+        self.audit_list.addItem(f"{time.strftime('%H:%M:%S')}  {text}")
+        self.audit_list.scrollToBottom()
+
+    def set_step_running(self, idx: int, remaining_s: int) -> None:
+        self._active_step_idx = int(idx)
+        for i, box in enumerate(self._step_boxes):
+            if i == idx:
+                box.set_state("running", remaining_s=int(remaining_s))
+        if 0 <= idx < len(self._step_boxes):
+            self.steps_area.ensureWidgetVisible(self._step_boxes[idx])
+
+    def set_step_remaining(self, idx: int, remaining_s: int) -> None:
+        if 0 <= idx < len(self._step_boxes):
+            self._step_boxes[idx].set_state("running", remaining_s=int(remaining_s))
+
+    def set_step_done(self, idx: int) -> None:
+        if 0 <= idx < len(self._step_boxes):
+            self._step_boxes[idx].set_state("done")
+
+    def set_step_error(self, idx: int, error_text: str) -> None:
+        if 0 <= idx < len(self._step_boxes):
+            self._step_boxes[idx].set_state("error", error_text=error_text)
+
+    def set_series_data(self, data: Dict[str, List[Tuple[int, float]]], tags: List[str]) -> None:
+        self.plot.set_series_data(data, tags, self._plot_minutes)  # type: ignore[attr-defined]
+
+    def append_points(self, points: List[Tuple[str, int, float]], tags: List[str]) -> None:
+        self.plot.append_points(points, tags, self._plot_minutes)  # type: ignore[attr-defined]
+
+
+# ----------------------------
 # Home Screen
 # ----------------------------
 
@@ -2973,16 +3161,18 @@ class AppController(QObject):
         builder: RecipeBuilderScreen,
         settings: SettingsHubScreen,
         hmi_settings: HMISettingsScreen,
+        recipe_run: RecipeRunMonitorScreen,
         cfg: ODriveConfigScreen,
         dlog: DataLoggerScreen,
     ) -> None:
         super().__init__()
-        self.stack, self.home, self.builder, self.settings, self.hmi_settings, self.cfg, self.dlog = (
+        self.stack, self.home, self.builder, self.settings, self.hmi_settings, self.recipe_run, self.cfg, self.dlog = (
             stack,
             home,
             builder,
             settings,
             hmi_settings,
+            recipe_run,
             cfg,
             dlog,
         )
@@ -3002,11 +3192,16 @@ class AppController(QObject):
         self._ui_remaining = 0
         self._ui_step_info = ""
         self._run_mode = "idle"
+        self._last_run_mode = "idle"
         self._cmd_rpm = 0.0
 
         self._dlog_minutes = 10
         self._dlog_selected_tags: List[str] = list(DEFAULT_ENABLED_TAGS)
         self._hmi_fullscreen_pref = bool(START_FULLSCREEN)
+        self._recipe_monitor_recipe: Optional[Recipe] = None
+        self._recipe_monitor_step_idx = -1
+        self._recipe_monitor_failed = False
+        self._recipe_monitor_plot_tags: List[str] = [TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM]
 
         self.history_db = HistoryDB(app_config_dir() / "history.sqlite")
 
@@ -3047,9 +3242,11 @@ class AppController(QObject):
 
         self.engine.status_changed.connect(lambda s: self._set_ui(status=s))
         self.engine.run_mode_changed.connect(lambda m: setattr(self, "_run_mode", m))
+        self.engine.run_mode_changed.connect(self._on_engine_run_mode_changed)
         self.engine.active_rpm_changed.connect(self._on_engine_rpm)
         self.engine.remaining_changed.connect(self._on_engine_remaining)
         self.engine.step_info_changed.connect(lambda x: self._set_ui(step=x))
+        self.engine.recipe_step_changed.connect(self._on_engine_recipe_step_changed)
 
         self.home.start_clicked.connect(self.on_start)
         self.home.stop_clicked.connect(self.on_stop)
@@ -3073,6 +3270,8 @@ class AppController(QObject):
         self.settings.open_odrive_clicked.connect(self.on_open_config)
 
         self.hmi_settings.back_clicked.connect(self.on_back_settings)
+        self.recipe_run.back_clicked.connect(self.on_back_home)
+        self.recipe_run.stop_clicked.connect(self.on_stop)
         self.hmi_settings.fullscreen_changed.connect(self.on_hmi_fullscreen_changed)
 
         self.cfg.back_clicked.connect(self.on_back_home)
@@ -3359,6 +3558,11 @@ class AppController(QObject):
     @Slot(str)
     def _on_worker_error(self, msg: str) -> None:
         self._calibration_busy = False
+        if self._run_mode == "recipe" and self._recipe_monitor_recipe is not None:
+            self._recipe_monitor_failed = True
+            if self._recipe_monitor_step_idx >= 0:
+                self.recipe_run.set_step_error(self._recipe_monitor_step_idx, str(msg))
+            self.recipe_run.append_audit(f"Error: {msg}")
         if self.engine.is_running():
             self.engine.stop(user_initiated=True)
         self._show_modal_error(self.stack.currentWidget(), "ODrive Error", msg)
@@ -3459,6 +3663,11 @@ class AppController(QObject):
             points = [(tag, ts, float(values[tag])) for tag in inserted if tag in selected]
             if points:
                 self.dlog.append_points(points, tags=self._dlog_selected_tags, minutes=self._dlog_minutes)
+        if self.stack.currentWidget() is self.recipe_run and inserted and self._recipe_monitor_recipe is not None:
+            selected = set(self._recipe_monitor_plot_tags)
+            points = [(tag, ts, float(values[tag])) for tag in inserted if tag in selected]
+            if points:
+                self.recipe_run.append_points(points, tags=self._recipe_monitor_plot_tags)
 
     # ---- Engine callbacks ----
 
@@ -3479,7 +3688,36 @@ class AppController(QObject):
     def _on_engine_remaining(self, seconds: int) -> None:
         # Remaining countdown is shown ONLY in the status header; the home timer entry must not count down.
         self._ui_remaining = int(seconds)
+        if self._run_mode == "recipe" and self._recipe_monitor_recipe is not None and self._recipe_monitor_step_idx >= 0:
+            self.recipe_run.set_step_remaining(self._recipe_monitor_step_idx, int(seconds))
         self._refresh_status_all()
+
+    @Slot(int, int)
+    def _on_engine_recipe_step_changed(self, step_idx: int, total_steps: int) -> None:
+        if self._recipe_monitor_recipe is None:
+            return
+        prev = self._recipe_monitor_step_idx
+        if 0 <= prev < total_steps and prev != step_idx and not self._recipe_monitor_failed:
+            self.recipe_run.set_step_done(prev)
+        self._recipe_monitor_step_idx = int(step_idx)
+        try:
+            step = self._recipe_monitor_recipe.steps[step_idx]
+            step_name = step.name or f"Step {step_idx + 1}"
+            self.recipe_run.append_audit(f"Step {step_idx + 1} started: {step_name}")
+            self.recipe_run.set_step_running(step_idx, int(step.duration_s))
+        except Exception:
+            self.recipe_run.set_step_running(step_idx, 0)
+
+    @Slot(str)
+    def _on_engine_run_mode_changed(self, mode: str) -> None:
+        prev_mode = getattr(self, "_last_run_mode", "idle")
+        if prev_mode == "recipe" and mode == "idle" and self._recipe_monitor_recipe is not None:
+            if not self._recipe_monitor_failed and self._recipe_monitor_step_idx >= 0:
+                self.recipe_run.set_step_done(self._recipe_monitor_step_idx)
+                self._recipe_monitor_finish("Recipe completed")
+            elif self._recipe_monitor_failed:
+                self._recipe_monitor_finish("Recipe ended with error")
+        self._last_run_mode = str(mode)
 
     # ---- Screen changes ----
 
@@ -3489,6 +3727,8 @@ class AppController(QObject):
             self._dlog_minutes = self.dlog.minutes_window()
             self._dlog_selected_tags = self.dlog.selected_tags() or list(DEFAULT_ENABLED_TAGS)
             self._refresh_datalogger_plot()
+        if self.stack.currentWidget() is self.recipe_run:
+            self._refresh_recipe_monitor_plot()
         self._schedule_ui_state_save()
 
     # ---- Home field changes ----
@@ -3536,10 +3776,16 @@ class AppController(QObject):
         if len(recipe.steps) < 1:
             QMessageBox.warning(self.home, "Start", "Selected recipe has no steps.")
             return
+        self._recipe_monitor_begin(recipe)
         self.engine.start_recipe(recipe)
 
     @Slot()
     def on_stop(self) -> None:
+        if self._run_mode == "recipe" and self._recipe_monitor_recipe is not None and not self._recipe_monitor_failed:
+            self.recipe_run.append_audit("Recipe stopped by user")
+            if self._recipe_monitor_step_idx >= 0:
+                self.recipe_run.set_step_error(self._recipe_monitor_step_idx, "Stopped by user")
+            self._recipe_monitor_failed = True
         self.engine.stop(user_initiated=True)
 
     @Slot()
@@ -3717,6 +3963,35 @@ class AppController(QObject):
             data = {t: [] for t in tags}
         self.dlog.set_series_data(data, tags=tags, minutes=minutes)
 
+    def _refresh_recipe_monitor_plot(self) -> None:
+        if self._recipe_monitor_recipe is None:
+            self.recipe_run.set_series_data({t: [] for t in self._recipe_monitor_plot_tags}, self._recipe_monitor_plot_tags)
+            return
+        minutes = max(1, int(math.ceil(recipe_total_seconds(self._recipe_monitor_recipe) / 60.0)))
+        now_ts = epoch_s()
+        try:
+            data = self.history_db.query_window_multi(now_ts, self._recipe_monitor_plot_tags, minutes)
+        except Exception as e:
+            self._show_modal_error(self.recipe_run, "Data Logger DB", f"Failed to load recipe run window:\n{e}")
+            data = {t: [] for t in self._recipe_monitor_plot_tags}
+        self.recipe_run.set_series_data(data, tags=self._recipe_monitor_plot_tags)
+
+    def _recipe_monitor_begin(self, recipe: Recipe) -> None:
+        self._recipe_monitor_recipe = recipe
+        self._recipe_monitor_step_idx = -1
+        self._recipe_monitor_failed = False
+        self.recipe_run.set_recipe(recipe)
+        self.recipe_run.append_audit(f"Recipe started: {recipe.name}")
+        self._refresh_recipe_monitor_plot()
+        self.stack.setCurrentWidget(self.recipe_run)
+
+    def _recipe_monitor_finish(self, reason: str) -> None:
+        if self._recipe_monitor_recipe is None:
+            return
+        self.recipe_run.append_audit(reason)
+        self._recipe_monitor_recipe = None
+        self._recipe_monitor_step_idx = -1
+
     @Slot()
     def _log_cmd_rpm(self) -> None:
         ts = epoch_s()
@@ -3761,6 +4036,7 @@ class MainWindow(QWidget):
         self.builder = RecipeBuilderScreen()
         self.settings = SettingsHubScreen()
         self.hmi_settings = HMISettingsScreen()
+        self.recipe_run = RecipeRunMonitorScreen()
         self.cfg = ODriveConfigScreen()
         self.dlog = DataLoggerScreen()
 
@@ -3768,6 +4044,7 @@ class MainWindow(QWidget):
         self.stack.addWidget(self.builder)
         self.stack.addWidget(self.settings)
         self.stack.addWidget(self.hmi_settings)
+        self.stack.addWidget(self.recipe_run)
         self.stack.addWidget(self.cfg)
         self.stack.addWidget(self.dlog)
 
@@ -3781,6 +4058,7 @@ class MainWindow(QWidget):
             self.builder,
             self.settings,
             self.hmi_settings,
+            self.recipe_run,
             self.cfg,
             self.dlog,
         )
@@ -3914,6 +4192,10 @@ def apply_style(app: QApplication) -> None:
         QFrame#ConfigRow {{ background: #161B22; border: 2px solid #2A313A; border-radius: {border_r_btn}px; }}
         QLabel#ConfigLabel {{ font-size: {ui(20)}px; font-weight: 650; }}
         QLabel#ConfigNote {{ font-size: {ui(18)}px; color: #9FB0C0; }}
+        QFrame#RecipeRunStepBox {{ background: #161B22; border: 2px solid #2A313A; border-radius: {border_r_btn}px; }}
+        QFrame#RecipeRunStepBox[status="running"] {{ background: #163323; border: 2px solid #2D7B52; }}
+        QFrame#RecipeRunStepBox[status="done"] {{ background: #1A222C; border: 2px solid #3A4656; }}
+        QFrame#RecipeRunStepBox[status="error"] {{ background: #3A1717; border: 2px solid #8B2A2A; }}
 
         QWidget#TimeControl[dimmed="true"] QLabel {{ color: #7A8794; }}
         QWidget#TimeControl[dimmed="true"] QLineEdit {{
