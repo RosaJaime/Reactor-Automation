@@ -55,6 +55,7 @@ except Exception:
 
 from PySide6.QtCore import (
     QObject,
+    QEvent,
     Qt,
     QThread,
     QTimer,
@@ -80,6 +81,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QScroller,
     QSizePolicy,
     QStackedWidget,
     QVBoxLayout,
@@ -196,6 +198,21 @@ def safe_float(x: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def enable_touch_scrolling(widget: QWidget) -> None:
+    """
+    Enable single-finger kinetic scrolling on touchscreens.
+    Use the viewport for scroll areas/list widgets so gestures are captured where content is drawn.
+    """
+    try:
+        target = widget.viewport() if hasattr(widget, "viewport") else widget  # type: ignore[assignment]
+        if not isinstance(target, QWidget):
+            return
+        target.setAttribute(Qt.WA_AcceptTouchEvents, True)
+        QScroller.grabGesture(target, QScroller.LeftMouseButtonGesture)
+    except Exception:
+        pass
+
+
 def format_mmss(seconds: int) -> str:
     seconds = max(0, int(seconds))
     m, s = divmod(seconds, 60)
@@ -245,9 +262,17 @@ def downloads_dir() -> Path:
 
 @dataclass
 class Step:
-    velocity_rpm: float
-    duration_s: int
+    velocity_rpm: float = 0.0
+    duration_s: int = 0
     name: str = ""
+    kind: str = "motor"  # "motor" | "data_entry"
+    prompt: str = ""
+    response_kind: str = "text"  # "text" | "numeric" | "pass_fail"
+    allow_skip: bool = True
+
+
+def is_data_entry_step(step: Step) -> bool:
+    return str(getattr(step, "kind", "motor") or "motor") == "data_entry"
 
 
 @dataclass
@@ -258,7 +283,7 @@ class Recipe:
 
 
 def recipe_total_seconds(r: Recipe) -> int:
-    return sum(max(0, int(s.duration_s)) for s in r.steps)
+    return sum(max(0, int(s.duration_s)) for s in r.steps if not is_data_entry_step(s))
 
 
 def recipe_summary(r: Recipe) -> str:
@@ -285,11 +310,16 @@ class RecipeStore:
             for rj in data.get("recipes", []):
                 steps = []
                 for i, s in enumerate(rj.get("steps", []), start=1):
+                    kind = str(s.get("kind") or "motor")
                     steps.append(
                         Step(
-                            float(s["velocity_rpm"]),
-                            int(s["duration_s"]),
+                            float(s.get("velocity_rpm", 0.0)),
+                            int(s.get("duration_s", 0)),
                             str(s.get("name") or f"Step {i}"),
+                            kind=kind,
+                            prompt=str(s.get("prompt") or ""),
+                            response_kind=str(s.get("response_kind") or "text"),
+                            allow_skip=bool(s.get("allow_skip", True)),
                         )
                     )
                 out.append(Recipe(id=str(rj["id"]), name=str(rj["name"]), steps=steps))
@@ -328,6 +358,36 @@ class RecipeStore:
                 ],
             )
         ]
+
+
+class RecipeRunStore:
+    def __init__(self) -> None:
+        self._path = app_config_dir() / "recipe_runs.json"
+        self._runs: List[Dict[str, Any]] = []
+
+    def load(self) -> None:
+        if not self._path.exists():
+            self._runs = []
+            return
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            self._runs = [dict(x) for x in list(data.get("runs", []))]
+        except Exception:
+            self._runs = []
+
+    def save(self) -> None:
+        try:
+            self._path.write_text(json.dumps({"runs": self._runs}, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def add_run(self, run: Dict[str, Any]) -> None:
+        self._runs.insert(0, dict(run))
+        self._runs = self._runs[:200]
+        self.save()
+
+    def runs(self) -> List[Dict[str, Any]]:
+        return list(self._runs)
 
 
 # ----------------------------
@@ -1334,6 +1394,7 @@ class RunEngine(QObject):
     remaining_changed = Signal(int)
     step_info_changed = Signal(str)
     recipe_step_changed = Signal(int, int)       # step_idx, total_steps
+    recipe_data_entry_requested = Signal(object, int, int)  # Step, step_idx, total_steps
 
     request_set_rpm = Signal(float)
     request_stop = Signal()
@@ -1353,6 +1414,7 @@ class RunEngine(QObject):
         self._step_idx = -1
         self._step_end_t = 0.0
         self._recipe_override_rpm: Optional[float] = None
+        self._waiting_data_entry = False
 
     def is_running(self) -> bool:
         return self._mode in ("single", "recipe")
@@ -1394,6 +1456,7 @@ class RunEngine(QObject):
         self._recipe = recipe
         self._step_idx = 0
         self._recipe_override_rpm = None
+        self._waiting_data_entry = False
         self._start_current_step(time.monotonic())
         self._set_status("Running")
 
@@ -1404,14 +1467,50 @@ class RunEngine(QObject):
         assert self._recipe is not None
         step = self._recipe.steps[self._step_idx]
         self.recipe_step_changed.emit(int(self._step_idx), int(len(self._recipe.steps)))
+        step_name = (step.name or f"Step {self._step_idx + 1}").strip()
+        if is_data_entry_step(step):
+            self._waiting_data_entry = True
+            self._active_rpm = 0.0
+            self.request_stop.emit()
+            self.active_rpm_changed.emit(0.0)
+            self.remaining_changed.emit(0)
+            prompt = (step.prompt or step_name or "Enter value").strip()
+            info = f"{step_name} • {self._step_idx + 1}/{len(self._recipe.steps)} • Data entry"
+            self.step_info_changed.emit(info)
+            self.recipe_data_entry_requested.emit(step, int(self._step_idx), int(len(self._recipe.steps)))
+            return
+
+        self._waiting_data_entry = False
         self._active_rpm = float(step.velocity_rpm)
         self.request_set_rpm.emit(self._active_rpm)
         self.active_rpm_changed.emit(self._active_rpm)
 
         self._step_end_t = now + max(0, int(step.duration_s))
-        step_name = (step.name or f"Step {self._step_idx + 1}").strip()
-        info = f"{step_name} ? {self._step_idx + 1}/{len(self._recipe.steps)} ? {step.velocity_rpm:g} rpm ? {format_mmss(step.duration_s)}"
+        info = f"{step_name} • {self._step_idx + 1}/{len(self._recipe.steps)} • {step.velocity_rpm:g} rpm • {format_mmss(step.duration_s)}"
         self.step_info_changed.emit(info)
+
+    @Slot()
+    def continue_after_data_entry(self) -> None:
+        if self._mode != "recipe" or self._recipe is None or not self._waiting_data_entry:
+            return
+        self._waiting_data_entry = False
+        now = time.monotonic()
+        self._step_idx += 1
+        if self._step_idx >= len(self._recipe.steps):
+            self.request_stop.emit()
+            self._set_mode("idle")
+            self._active_rpm = 0.0
+            self.active_rpm_changed.emit(0.0)
+            self.remaining_changed.emit(0)
+            self.step_info_changed.emit("")
+            self._set_status("Idle")
+            self._timer.stop()
+            return
+        self._recipe_override_rpm = None
+        self._start_current_step(now)
+        if not self._timer.isActive():
+            self._timer.start()
+        self._tick()
 
     @Slot(float)
     def override_rpm(self, rpm: float) -> None:
@@ -1455,6 +1554,7 @@ class RunEngine(QObject):
         self._step_idx = -1
         self._active_rpm = 0.0
         self._recipe_override_rpm = None
+        self._waiting_data_entry = False
 
         self.active_rpm_changed.emit(0.0)
         self.remaining_changed.emit(0)
@@ -1482,6 +1582,9 @@ class RunEngine(QObject):
         if self._mode == "recipe":
             if not self._recipe:
                 self.stop(user_initiated=False)
+                return
+            if self._waiting_data_entry:
+                self.remaining_changed.emit(0)
                 return
             step_remaining = int(round(self._step_end_t - now))
             if step_remaining <= 0:
@@ -1937,6 +2040,12 @@ class StepRow(QFrame):
         self.lbl.setObjectName("StepIndex")
         header.addWidget(self.lbl, 1)
 
+        self.kind_combo = QComboBox()
+        self.kind_combo.setMinimumHeight(ui(54))
+        self.kind_combo.addItem("Motor Run", "motor")
+        self.kind_combo.addItem("Data Entry", "data_entry")
+        header.addWidget(self.kind_combo)
+
         btn_h, btn_w = ui(54), ui(120)
         self.btn_up = TouchButton("Up", min_h=btn_h, min_w=btn_w)
         self.btn_down = TouchButton("Down", min_h=btn_h, min_w=btn_w)
@@ -1946,24 +2055,62 @@ class StepRow(QFrame):
         header.addWidget(self.btn_remove)
         root.addLayout(header)
 
-        controls = QHBoxLayout()
-        controls.setSpacing(ui(12))
         self.name_edit = QLineEdit()
         self.name_edit.setMinimumHeight(ui(54))
         self.name_edit.setPlaceholderText(f"Step {index + 1}")
         self.name_edit.setText(str(step.name or f"Step {index + 1}"))
+
+        name_row = QHBoxLayout()
+        name_row.setSpacing(ui(12))
+        name_row.addWidget(self.name_edit, 1)
+        root.addLayout(name_row)
+
+        self.motor_controls = QWidget()
+        controls = QHBoxLayout(self.motor_controls)
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(ui(12))
         self.vel = RpmControl("Velocity", VEL_MIN_RPM, VEL_MAX_RPM, VEL_STEP_RPM, compact=True)
         self.tim = TimeControl("Time", TIME_STEP_S, compact=True)
-        self.vel.set_value(step.velocity_rpm, emit_signal=False)
-        self.tim.set_seconds(step.duration_s, emit_signal=False)
-        controls.addWidget(self.name_edit, 1)
+        self.vel.set_value(float(step.velocity_rpm), emit_signal=False)
+        self.tim.set_seconds(int(step.duration_s), emit_signal=False)
         controls.addWidget(self.vel, 1)
         controls.addWidget(self.tim, 1)
-        root.addLayout(controls)
+        root.addWidget(self.motor_controls)
+
+        self.data_controls = QWidget()
+        data = QHBoxLayout(self.data_controls)
+        data.setContentsMargins(0, 0, 0, 0)
+        data.setSpacing(ui(12))
+        self.prompt_edit = QLineEdit()
+        self.prompt_edit.setMinimumHeight(ui(54))
+        self.prompt_edit.setPlaceholderText("Prompt (shown during run)")
+        self.prompt_edit.setText(str(step.prompt or ""))
+        self.response_combo = QComboBox()
+        self.response_combo.setMinimumHeight(ui(54))
+        self.response_combo.addItem("Text", "text")
+        self.response_combo.addItem("Numeric", "numeric")
+        self.response_combo.addItem("Pass / Fail", "pass_fail")
+        self.chk_allow_skip = QCheckBox("Allow skip")
+        self.chk_allow_skip.setMinimumHeight(ui(54))
+        self.chk_allow_skip.setChecked(bool(getattr(step, "allow_skip", True)))
+        data.addWidget(self.prompt_edit, 2)
+        data.addWidget(self.response_combo, 1)
+        data.addWidget(self.chk_allow_skip, 1)
+        root.addWidget(self.data_controls)
 
         self.btn_remove.clicked.connect(lambda: self.remove_clicked.emit(self._index))
         self.btn_up.clicked.connect(lambda: self.move_up_clicked.emit(self._index))
         self.btn_down.clicked.connect(lambda: self.move_down_clicked.emit(self._index))
+        self.kind_combo.currentIndexChanged.connect(self._refresh_kind_ui)
+
+        kind = str(getattr(step, "kind", "motor") or "motor")
+        self.kind_combo.setCurrentIndex(1 if kind == "data_entry" else 0)
+        rk = str(getattr(step, "response_kind", "text") or "text")
+        for i in range(self.response_combo.count()):
+            if str(self.response_combo.itemData(i)) == rk:
+                self.response_combo.setCurrentIndex(i)
+                break
+        self._refresh_kind_ui()
 
     def set_index(self, idx: int) -> None:
         self._index = idx
@@ -1973,13 +2120,37 @@ class StepRow(QFrame):
 
     def get_step(self) -> Step:
         name = self.name_edit.text().strip() or f"Step {self._index + 1}"
-        return Step(velocity_rpm=float(self.vel.value()), duration_s=int(self.tim.seconds()), name=name)
+        kind = str(self.kind_combo.currentData() or "motor")
+        if kind == "data_entry":
+            return Step(
+                velocity_rpm=0.0,
+                duration_s=0,
+                name=name,
+                kind="data_entry",
+                prompt=self.prompt_edit.text().strip(),
+                response_kind=str(self.response_combo.currentData() or "text"),
+                allow_skip=bool(self.chk_allow_skip.isChecked()),
+            )
+        return Step(
+            velocity_rpm=float(self.vel.value()),
+            duration_s=int(self.tim.seconds()),
+            name=name,
+            kind="motor",
+            allow_skip=True,
+        )
+
+    @Slot()
+    def _refresh_kind_ui(self) -> None:
+        is_data = str(self.kind_combo.currentData() or "motor") == "data_entry"
+        self.motor_controls.setVisible(not is_data)
+        self.data_controls.setVisible(is_data)
 
 
 class RecipeBuilderScreen(QWidget):
     back_clicked = Signal()
     cancel_clicked = Signal()
     save_clicked = Signal(Recipe)
+    view_runs_clicked = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -1993,9 +2164,11 @@ class RecipeBuilderScreen(QWidget):
         top = QHBoxLayout()
         top.setSpacing(ui(12))
         self.btn_back = TouchButton("Back", min_h=66, min_w=170)
+        self.btn_view_runs = TouchButton("Previous Runs", min_h=66, min_w=220)
         self.title = QLabel("Recipe Builder")
         self.title.setObjectName("ScreenTitle")
         top.addWidget(self.btn_back)
+        top.addWidget(self.btn_view_runs)
         top.addWidget(self.title, 1)
         root.addLayout(top)
 
@@ -2014,6 +2187,7 @@ class RecipeBuilderScreen(QWidget):
         self.steps_area = QScrollArea()
         self.steps_area.setWidgetResizable(True)
         self.steps_area.setFrameShape(QFrame.NoFrame)
+        enable_touch_scrolling(self.steps_area)
         self.steps_container = QWidget()
         self.steps_layout = QVBoxLayout(self.steps_container)
         self.steps_layout.setContentsMargins(0, 0, 0, 0)
@@ -2033,6 +2207,7 @@ class RecipeBuilderScreen(QWidget):
         root.addLayout(actions)
 
         self.btn_back.clicked.connect(self.back_clicked.emit)
+        self.btn_view_runs.clicked.connect(self.view_runs_clicked.emit)
         self.btn_cancel.clicked.connect(self.cancel_clicked.emit)
         self.btn_add.clicked.connect(self._on_add_step)
         self.btn_save.clicked.connect(self._on_save)
@@ -2071,17 +2246,28 @@ class RecipeBuilderScreen(QWidget):
             self._editing_id = None
             self.title.setText("Recipe Builder (New)")
             self.name_edit.setText("")
-            self._add_row(Step(120.0, 60))
+            self._add_row(Step(name="Run Name", kind="data_entry", prompt="Run name", response_kind="text", allow_skip=True))
+            self._add_row(Step(120.0, 60, "Step 2", kind="motor"))
             return
         self._editing_id = recipe.id
         self.title.setText("Recipe Builder (Edit)")
         self.name_edit.setText(recipe.name)
         for s in recipe.steps:
-            self._add_row(Step(float(s.velocity_rpm), int(s.duration_s)))
+            self._add_row(
+                Step(
+                    velocity_rpm=float(getattr(s, "velocity_rpm", 0.0)),
+                    duration_s=int(getattr(s, "duration_s", 0)),
+                    name=str(getattr(s, "name", "") or ""),
+                    kind=str(getattr(s, "kind", "motor") or "motor"),
+                    prompt=str(getattr(s, "prompt", "") or ""),
+                    response_kind=str(getattr(s, "response_kind", "text") or "text"),
+                    allow_skip=bool(getattr(s, "allow_skip", True)),
+                )
+            )
 
     @Slot()
     def _on_add_step(self) -> None:
-        self._add_row(Step(120.0, 60))
+        self._add_row(Step(120.0, 60, kind="motor"))
         self._reindex()
 
     @Slot(int)
@@ -2127,12 +2313,20 @@ class RecipeBuilderScreen(QWidget):
             QMessageBox.warning(self, "Validation", "Add at least one step.")
             return
         for i, s in enumerate(steps, start=1):
-            if s.duration_s <= 0:
-                QMessageBox.warning(self, "Validation", f"Step {i}: duration must be > 0.")
-                return
-            if not (VEL_MIN_RPM <= float(s.velocity_rpm) <= float(self._vel_max_rpm)):
-                QMessageBox.warning(self, "Validation", f"Step {i}: velocity out of range.")
-                return
+            if is_data_entry_step(s):
+                if not (s.prompt or "").strip():
+                    QMessageBox.warning(self, "Validation", f"Step {i}: data entry prompt is required.")
+                    return
+                if str(s.response_kind) not in {"text", "numeric", "pass_fail"}:
+                    QMessageBox.warning(self, "Validation", f"Step {i}: invalid data entry type.")
+                    return
+            else:
+                if s.duration_s <= 0:
+                    QMessageBox.warning(self, "Validation", f"Step {i}: duration must be > 0.")
+                    return
+                if not (VEL_MIN_RPM <= float(s.velocity_rpm) <= float(self._vel_max_rpm)):
+                    QMessageBox.warning(self, "Validation", f"Step {i}: velocity out of range.")
+                    return
 
         rid = self._editing_id or str(uuid.uuid4())
         self.save_clicked.emit(Recipe(id=rid, name=name, steps=steps))
@@ -2263,6 +2457,7 @@ class ODriveConfigScreen(QWidget):
     erase_reset_clicked = Signal()
     request_refresh = Signal()
     export_json_clicked = Signal()
+    hmi_max_velocity_changed = Signal(float)
 
     def __init__(self) -> None:
         super().__init__()
@@ -2304,9 +2499,25 @@ class ODriveConfigScreen(QWidget):
         preset_row.addWidget(self.cmb_motor_preset, 1)
         root.addLayout(preset_row)
 
+        hmi_max_row = QHBoxLayout()
+        hmi_max_row.setSpacing(ui(12))
+        self.lbl_hmi_max_vel = QLabel("HMI max velocity (rpm)")
+        self.lbl_hmi_max_vel.setObjectName("FieldLabel")
+        self.lbl_hmi_max_vel.setMinimumWidth(ui(320))
+        self.edit_hmi_max_vel = QLineEdit()
+        self.edit_hmi_max_vel.setMinimumHeight(ui(58))
+        self.edit_hmi_max_vel.setAlignment(Qt.AlignCenter)
+        self.edit_hmi_max_vel.setValidator(QDoubleValidator(VEL_MIN_RPM, VEL_MAX_RPM, 1, self.edit_hmi_max_vel))
+        self.btn_apply_hmi_max_vel = TouchButton("Apply HMI Limit", min_h=66, min_w=240)
+        hmi_max_row.addWidget(self.lbl_hmi_max_vel)
+        hmi_max_row.addWidget(self.edit_hmi_max_vel, 1)
+        hmi_max_row.addWidget(self.btn_apply_hmi_max_vel)
+        root.addLayout(hmi_max_row)
+
         self.area = QScrollArea()
         self.area.setWidgetResizable(True)
         self.area.setFrameShape(QFrame.NoFrame)
+        enable_touch_scrolling(self.area)
 
         self.container = QWidget()
         self.vbox = QVBoxLayout(self.container)
@@ -2319,6 +2530,7 @@ class ODriveConfigScreen(QWidget):
         for spec in ODRIVE_CONFIG_FIELDS:
             row = SettingRowWidget(spec)
             self._rows[spec.key] = row
+            row.editor.installEventFilter(self)
             self.vbox.insertWidget(self.vbox.count() - 1, row)
 
         actions = QHBoxLayout()
@@ -2341,6 +2553,8 @@ class ODriveConfigScreen(QWidget):
         self.btn_refresh.clicked.connect(self.request_refresh.emit)
         self.btn_export.clicked.connect(self.export_json_clicked.emit)
         self.cmb_motor_preset.currentIndexChanged.connect(self._on_motor_preset_changed)
+        self.btn_apply_hmi_max_vel.clicked.connect(self._emit_hmi_max_velocity)
+        self.edit_hmi_max_vel.editingFinished.connect(self._emit_hmi_max_velocity)
 
     def set_loading(self, text: str) -> None:
         self.status.setText(text)
@@ -2363,6 +2577,43 @@ class ODriveConfigScreen(QWidget):
 
     def gather_values(self) -> Dict[str, Any]:
         return {k: row.get_value() for k, row in self._rows.items() if row.editor.isEnabled()}
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        try:
+            if event.type() == QEvent.FocusIn:
+                for row in self._rows.values():
+                    if watched is row.editor:
+                        QTimer.singleShot(0, lambda r=row: self._scroll_row_near_top(r))
+                        break
+        except Exception:
+            pass
+        return super().eventFilter(watched, event)
+
+    def _scroll_row_near_top(self, row: SettingRowWidget) -> None:
+        try:
+            sb = self.area.verticalScrollBar()
+            y = row.pos().y()
+            top_margin = ui(80)
+            sb.setValue(max(0, int(y - top_margin)))
+        except Exception:
+            pass
+
+    def set_hmi_max_velocity(self, rpm: float, emit_signal: bool = False) -> None:
+        rpm = float(clamp(float(rpm), VEL_MIN_RPM, VEL_MAX_RPM))
+        with QSignalBlocker(self.edit_hmi_max_vel):
+            self.edit_hmi_max_vel.setText(f"{rpm:g}")
+        if emit_signal:
+            self.hmi_max_velocity_changed.emit(float(rpm))
+
+    def hmi_max_velocity(self) -> float:
+        try:
+            return float(clamp(float(self.edit_hmi_max_vel.text().strip() or HMI_MAX_VEL_DEFAULT_RPM), VEL_MIN_RPM, VEL_MAX_RPM))
+        except Exception:
+            return float(HMI_MAX_VEL_DEFAULT_RPM)
+
+    @Slot()
+    def _emit_hmi_max_velocity(self) -> None:
+        self.set_hmi_max_velocity(self.hmi_max_velocity(), emit_signal=True)
 
     @Slot(int)
     def _on_motor_preset_changed(self, _idx: int) -> None:
@@ -2429,11 +2680,11 @@ class SettingsHubScreen(QWidget):
 class HMISettingsScreen(QWidget):
     back_clicked = Signal()
     fullscreen_changed = Signal(bool)
-    max_velocity_changed = Signal(float)
     close_program_clicked = Signal()
 
     def __init__(self) -> None:
         super().__init__()
+        self._fullscreen_enabled = False
         root = QVBoxLayout(self)
         root.setContentsMargins(ui(18), ui(16), ui(18), ui(16))
         root.setSpacing(ui(12))
@@ -2451,24 +2702,8 @@ class HMISettingsScreen(QWidget):
         self.info.setObjectName("SectionTitle")
         root.addWidget(self.info)
 
-        self.chk_fullscreen = QCheckBox("Run in full screen")
-        self.chk_fullscreen.setMinimumHeight(ui(64))
-        root.addWidget(self.chk_fullscreen)
-
-        max_row = QHBoxLayout()
-        max_row.setSpacing(ui(12))
-        self.lbl_max_vel = QLabel("HMI max velocity (rpm)")
-        self.lbl_max_vel.setObjectName("FieldLabel")
-        self.lbl_max_vel.setMinimumWidth(ui(320))
-        self.edit_max_vel = QLineEdit()
-        self.edit_max_vel.setMinimumHeight(ui(66))
-        self.edit_max_vel.setAlignment(Qt.AlignCenter)
-        self.edit_max_vel.setValidator(QDoubleValidator(VEL_MIN_RPM, VEL_MAX_RPM, 1, self.edit_max_vel))
-        self.btn_apply_max_vel = TouchButton("Apply", min_h=80, min_w=200)
-        max_row.addWidget(self.lbl_max_vel)
-        max_row.addWidget(self.edit_max_vel, 1)
-        max_row.addWidget(self.btn_apply_max_vel)
-        root.addLayout(max_row)
+        self.btn_fullscreen_toggle = TouchButton("Switch to Full Screen", min_h=90, min_w=420)
+        root.addWidget(self.btn_fullscreen_toggle)
 
         self.note = QLabel("Press Esc to exit full screen at any time.")
         self.note.setObjectName("InfoLabel")
@@ -2480,33 +2715,22 @@ class HMISettingsScreen(QWidget):
         root.addStretch(1)
 
         self.btn_back.clicked.connect(self.back_clicked.emit)
-        self.chk_fullscreen.toggled.connect(self.fullscreen_changed.emit)
-        self.btn_apply_max_vel.clicked.connect(self._emit_max_velocity)
-        self.edit_max_vel.editingFinished.connect(self._emit_max_velocity)
+        self.btn_fullscreen_toggle.clicked.connect(self._toggle_fullscreen_clicked)
         self.btn_close_program.clicked.connect(self.close_program_clicked.emit)
+        self._refresh_fullscreen_button_text()
 
     def set_fullscreen_state(self, enabled: bool, emit_signal: bool = False) -> None:
-        with QSignalBlocker(self.chk_fullscreen):
-            self.chk_fullscreen.setChecked(bool(enabled))
+        self._fullscreen_enabled = bool(enabled)
+        self._refresh_fullscreen_button_text()
         if emit_signal:
             self.fullscreen_changed.emit(bool(enabled))
 
-    def set_max_velocity(self, rpm: float, emit_signal: bool = False) -> None:
-        rpm = float(clamp(float(rpm), VEL_MIN_RPM, VEL_MAX_RPM))
-        with QSignalBlocker(self.edit_max_vel):
-            self.edit_max_vel.setText(f"{rpm:g}")
-        if emit_signal:
-            self.max_velocity_changed.emit(float(rpm))
-
-    def max_velocity(self) -> float:
-        try:
-            return float(clamp(float(self.edit_max_vel.text().strip() or HMI_MAX_VEL_DEFAULT_RPM), VEL_MIN_RPM, VEL_MAX_RPM))
-        except Exception:
-            return float(HMI_MAX_VEL_DEFAULT_RPM)
-
     @Slot()
-    def _emit_max_velocity(self) -> None:
-        self.set_max_velocity(self.max_velocity(), emit_signal=True)
+    def _toggle_fullscreen_clicked(self) -> None:
+        self.set_fullscreen_state(not self._fullscreen_enabled, emit_signal=True)
+
+    def _refresh_fullscreen_button_text(self) -> None:
+        self.btn_fullscreen_toggle.setText("Switch to Windowed Mode" if self._fullscreen_enabled else "Switch to Full Screen")
 
 
 # ----------------------------
@@ -2963,6 +3187,7 @@ class RecipeRunMonitorScreen(QWidget):
         self.steps_area = QScrollArea()
         self.steps_area.setWidgetResizable(True)
         self.steps_area.setFrameShape(QFrame.NoFrame)
+        enable_touch_scrolling(self.steps_area)
         self.steps_container = QWidget()
         self.steps_layout = QVBoxLayout(self.steps_container)
         self.steps_layout.setContentsMargins(0, 0, 0, 0)
@@ -2975,6 +3200,7 @@ class RecipeRunMonitorScreen(QWidget):
         audit_title.setObjectName("SectionTitleCompact")
         left.addWidget(audit_title)
         self.audit_list = QListWidget()
+        enable_touch_scrolling(self.audit_list)
         self.audit_list.setMinimumHeight(ui(180))
         left.addWidget(self.audit_list, 1)
 
@@ -3055,6 +3281,7 @@ class HomeScreen(QWidget):
     recipe_select_clicked = Signal(str)
     recipe_edit_clicked = Signal(str)
     open_datalogger_clicked = Signal()
+    open_recipe_run_clicked = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -3081,6 +3308,7 @@ class HomeScreen(QWidget):
         self.time_ctl = TimeControl("Timer", TIME_STEP_S, compact=False)
         self.btn_builder = TouchButton("Recipe Builder", min_h=70, min_w=240)
         self.btn_datalogger = TouchButton("Data Logger", min_h=70, min_w=240)
+        self.btn_recipe_run = TouchButton("Recipe Run", min_h=70, min_w=240)
         self.btn_calibrate = TouchButton("Calibrate Motor", min_h=70, min_w=240)
 
         left.addWidget(self.rpm_ctl)
@@ -3088,6 +3316,7 @@ class HomeScreen(QWidget):
         left.addWidget(self.btn_calibrate)
         left.addWidget(self.btn_builder)
         left.addWidget(self.btn_datalogger)
+        left.addWidget(self.btn_recipe_run)
         left.addStretch(1)
         mid.addLayout(left, 1)
 
@@ -3100,6 +3329,7 @@ class HomeScreen(QWidget):
         self.recipes_area = QScrollArea()
         self.recipes_area.setWidgetResizable(True)
         self.recipes_area.setFrameShape(QFrame.NoFrame)
+        enable_touch_scrolling(self.recipes_area)
         self.recipes_container = QWidget()
         self.recipes_layout = QVBoxLayout(self.recipes_container)
         self.recipes_layout.setContentsMargins(0, 0, 0, 0)
@@ -3120,6 +3350,7 @@ class HomeScreen(QWidget):
         self.btn_settings.clicked.connect(self.open_settings_clicked.emit)
         self.btn_builder.clicked.connect(self.open_builder_clicked.emit)
         self.btn_datalogger.clicked.connect(self.open_datalogger_clicked.emit)
+        self.btn_recipe_run.clicked.connect(self.open_recipe_run_clicked.emit)
 
     def set_recipe_cards(self, recipes: List[Recipe], selected_id: Optional[str]) -> None:
         while self.recipes_layout.count() > 1:
@@ -3147,6 +3378,7 @@ class HomeScreen(QWidget):
         connected: bool,
         calibrated: bool,
         calibrating: bool,
+        recipe_run_active: bool = False,
     ) -> None:
         """
         Home-screen behaviors:
@@ -3187,6 +3419,7 @@ class HomeScreen(QWidget):
         self.btn_calibrate.setText("Calibrating..." if calibrating else ("Recalibrate Motor" if calibrated else "Calibrate Motor"))
         self.btn_builder.setEnabled(not running)
         self.btn_datalogger.setEnabled(True)
+        self.btn_recipe_run.setEnabled(bool(recipe_run_active))
         self.recipes_area.setEnabled(not running)
 
 
@@ -3310,6 +3543,7 @@ class AppController(QObject):
         self.home.recipe_select_clicked.connect(self.on_select_recipe)
         self.home.recipe_edit_clicked.connect(self.on_edit_recipe)
         self.home.open_datalogger_clicked.connect(self.on_open_datalogger)
+        self.home.open_recipe_run_clicked.connect(self.on_open_recipe_run)
 
         self.home.rpm_ctl.value_changed.connect(self._on_home_rpm_changed)
         self.home.time_ctl.value_changed.connect(self._on_home_time_changed)
@@ -3326,7 +3560,6 @@ class AppController(QObject):
         self.recipe_run.back_clicked.connect(self.on_back_home)
         self.recipe_run.stop_clicked.connect(self.on_stop)
         self.hmi_settings.fullscreen_changed.connect(self.on_hmi_fullscreen_changed)
-        self.hmi_settings.max_velocity_changed.connect(self.on_hmi_max_velocity_changed)
 
         self.cfg.back_clicked.connect(self.on_back_home)
         self.cfg.request_refresh.connect(self._refresh_odrive_config)
@@ -3334,6 +3567,7 @@ class AppController(QObject):
         self.cfg.save_reboot_clicked.connect(self._save_odrive_config)
         self.cfg.erase_reset_clicked.connect(self._erase_reset_odrive_config)
         self.cfg.export_json_clicked.connect(self._export_odrive_json)
+        self.cfg.hmi_max_velocity_changed.connect(self.on_hmi_max_velocity_changed)
 
         self.dlog.back_clicked.connect(self.on_back_home)
         self.dlog.start_clicked.connect(self.on_start)
@@ -3363,7 +3597,7 @@ class AppController(QObject):
         self._load_ui_state()
         self._loading_ui_state = False
         self.hmi_settings.set_fullscreen_state(self._hmi_fullscreen_pref, emit_signal=False)
-        self.hmi_settings.set_max_velocity(self._hmi_max_velocity_rpm, emit_signal=False)
+        self.cfg.set_hmi_max_velocity(self._hmi_max_velocity_rpm, emit_signal=False)
         self._apply_hmi_velocity_limit()
 
         self.worker_thread.start()
@@ -3430,6 +3664,7 @@ class AppController(QObject):
         r_selected = self._selected_recipe() is not None
         running = self.engine.is_running()
         motor_controls_enabled = bool(self.connected and self.motor_calibrated and (not self._calibration_busy))
+        recipe_run_active = bool(running and self._run_mode == "recipe" and self._recipe_monitor_recipe is not None)
 
         if running and self._run_mode == "single" and not r_selected:
             self.home.time_ctl.set_adjust_callback(self._adjust_time_from_home)
@@ -3444,6 +3679,7 @@ class AppController(QObject):
             connected=self.connected,
             calibrated=self.motor_calibrated,
             calibrating=self._calibration_busy,
+            recipe_run_active=recipe_run_active,
         )
         self.dlog.set_running_ui(running=running, motor_controls_enabled=motor_controls_enabled)
 
@@ -3922,6 +4158,13 @@ class AppController(QObject):
         self._refresh_datalogger_plot()
 
     @Slot()
+    def on_open_recipe_run(self) -> None:
+        if not (self.engine.is_running() and self._run_mode == "recipe" and self._recipe_monitor_recipe is not None):
+            return
+        self.stack.setCurrentWidget(self.recipe_run)
+        self._refresh_recipe_monitor_plot()
+
+    @Slot()
     def on_back_home(self) -> None:
         self.stack.setCurrentWidget(self.home)
         self._refresh_recipes()
@@ -4286,12 +4529,63 @@ def apply_style(app: QApplication) -> None:
     )
 
 
+def show_startup_splash(app: QApplication) -> QWidget:
+    splash = QWidget(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+    splash.setObjectName("StartupSplash")
+    splash.setAttribute(Qt.WA_ShowWithoutActivating, True)
+    splash.setFixedSize(460, 180)
+    splash.setStyleSheet(
+        """
+        QWidget#StartupSplash {
+            background: #101317;
+            color: #F2F5F7;
+            border: 2px solid #2A313A;
+            border-radius: 14px;
+        }
+        QLabel#SplashTitle { font-size: 28px; font-weight: 700; }
+        QLabel#SplashInfo { font-size: 16px; color: #D0D7DE; }
+        """
+    )
+
+    root = QVBoxLayout(splash)
+    root.setContentsMargins(20, 18, 20, 18)
+    root.setSpacing(8)
+
+    title = QLabel("Reactor Automation HMI")
+    title.setObjectName("SplashTitle")
+    info = QLabel("Opening program...")
+    info.setObjectName("SplashInfo")
+    info2 = QLabel("Loading UI and connecting background services")
+    info2.setObjectName("SplashInfo")
+
+    root.addStretch(1)
+    root.addWidget(title)
+    root.addWidget(info)
+    root.addWidget(info2)
+    root.addStretch(1)
+
+    try:
+        screen = app.primaryScreen()
+        if screen is not None:
+            g = screen.availableGeometry()
+            x = g.x() + (g.width() - splash.width()) // 2
+            y = g.y() + (g.height() - splash.height()) // 2
+            splash.move(x, y)
+    except Exception:
+        pass
+
+    splash.show()
+    app.processEvents()
+    return splash
+
+
 # ----------------------------
 # Entry Point
 # ----------------------------
 
 def main() -> int:
     app = QApplication(sys.argv)
+    splash = show_startup_splash(app)
 
     global UI_SCALE
     UI_SCALE = compute_ui_scale(app)
@@ -4302,6 +4596,8 @@ def main() -> int:
         w.showFullScreen()
     else:
         w.show()
+    splash.close()
+    app.processEvents()
     return app.exec()
 
 

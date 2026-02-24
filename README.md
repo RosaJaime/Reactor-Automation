@@ -12,7 +12,7 @@ It provides:
 
 ## What This Program Does
 
-The main app (`odrive_hmi.py`) is a PySide6 GUI that controls `axis0` on an ODrive.
+The main app (`odrive_hmi.pyw`) is a PySide6 GUI that controls `axis0` on an ODrive.
 
 Current motor control mode in the HMI:
 - Closed-loop velocity control
@@ -70,7 +70,7 @@ Note:
 1. Run the app:
 
 ```powershell
-python odrive_hmi.py
+python odrive_hmi.pyw
 ```
 
 1. Wait for the app to connect (it auto-retries).
@@ -81,7 +81,7 @@ python odrive_hmi.py
 
 The app supports a simulated backend for UI testing.
 
-In `odrive_hmi.py`, change:
+In `odrive_hmi.pyw`, change:
 
 ```python
 BACKEND = "real"  # "sim" or "real"
@@ -139,7 +139,7 @@ If calibration fails or times out:
 
 ## Files and What They Are For
 
-- `odrive_hmi.py`
+- `odrive_hmi.pyw`
   - Main application (GUI, run engine, worker thread, ODrive I/O)
 - `odrive_config.py`
   - Helper script/snippet for configuring ODrive velocity-control settings (typically used in `odrivetool`)
