@@ -107,8 +107,9 @@ WINDOW_W = 1280
 WINDOW_H = 800
 
 VEL_MIN_RPM = 0.0
-VEL_MAX_RPM = 2000.0
+VEL_MAX_RPM = 5000.0  # absolute UI limit; user-configurable HMI max defaults lower
 VEL_STEP_RPM = 1.0
+HMI_MAX_VEL_DEFAULT_RPM = 2400.0
 
 TIME_STEP_S = 10
 TIME_MAX_S = 24 * 60 * 60  # 24h cap
@@ -1669,6 +1670,15 @@ class RpmControl(QWidget):
         if emit_signal:
             self.value_changed.emit(v)
 
+    def set_range(self, vmin: float, vmax: float) -> None:
+        self._vmin = float(vmin)
+        self._vmax = float(max(vmin, vmax))
+        try:
+            self.edit.setValidator(QDoubleValidator(self._vmin, self._vmax, 2, self.edit))
+        except Exception:
+            pass
+        self.set_value(self.value(), emit_signal=False)
+
     def set_enabled(self, enabled: bool) -> None:
         self.btn_minus.setEnabled(enabled)
         self.btn_plus.setEnabled(enabled)
@@ -1974,6 +1984,7 @@ class RecipeBuilderScreen(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self._editing_id: Optional[str] = None
+        self._vel_max_rpm = float(HMI_MAX_VEL_DEFAULT_RPM)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(ui(18), ui(16), ui(18), ui(16))
@@ -2044,6 +2055,7 @@ class RecipeBuilderScreen(QWidget):
     def _add_row(self, step: Step) -> None:
         idx = len(self._rows())
         row = StepRow(idx, step)
+        row.vel.set_range(VEL_MIN_RPM, self._vel_max_rpm)
         row.remove_clicked.connect(self._on_remove)
         row.move_up_clicked.connect(self._on_move_up)
         row.move_down_clicked.connect(self._on_move_down)
@@ -2118,12 +2130,17 @@ class RecipeBuilderScreen(QWidget):
             if s.duration_s <= 0:
                 QMessageBox.warning(self, "Validation", f"Step {i}: duration must be > 0.")
                 return
-            if not (VEL_MIN_RPM <= float(s.velocity_rpm) <= VEL_MAX_RPM):
+            if not (VEL_MIN_RPM <= float(s.velocity_rpm) <= float(self._vel_max_rpm)):
                 QMessageBox.warning(self, "Validation", f"Step {i}: velocity out of range.")
                 return
 
         rid = self._editing_id or str(uuid.uuid4())
         self.save_clicked.emit(Recipe(id=rid, name=name, steps=steps))
+
+    def set_velocity_limit(self, vmax_rpm: float) -> None:
+        self._vel_max_rpm = float(clamp(float(vmax_rpm), VEL_MIN_RPM, VEL_MAX_RPM))
+        for row in self._rows():
+            row.vel.set_range(VEL_MIN_RPM, self._vel_max_rpm)
 
 
 # ----------------------------
@@ -2387,7 +2404,7 @@ class SettingsHubScreen(QWidget):
 
         top = QHBoxLayout()
         top.setSpacing(ui(12))
-        self.btn_back = TouchButton("Back", min_h=66, min_w=170)
+        self.btn_back = TouchButton("Back", min_h=80, min_w=210)
         self.title = QLabel("Settings")
         self.title.setObjectName("ScreenTitle")
         top.addWidget(self.btn_back)
@@ -2398,8 +2415,8 @@ class SettingsHubScreen(QWidget):
         self.info.setObjectName("InfoLabel")
         root.addWidget(self.info)
 
-        self.btn_hmi = TouchButton("HMI", min_h=86, min_w=260)
-        self.btn_odrive = TouchButton("ODrive", min_h=86, min_w=260)
+        self.btn_hmi = TouchButton("HMI", min_h=110, min_w=320)
+        self.btn_odrive = TouchButton("ODrive", min_h=110, min_w=320)
         root.addWidget(self.btn_hmi)
         root.addWidget(self.btn_odrive)
         root.addStretch(1)
@@ -2412,6 +2429,8 @@ class SettingsHubScreen(QWidget):
 class HMISettingsScreen(QWidget):
     back_clicked = Signal()
     fullscreen_changed = Signal(bool)
+    max_velocity_changed = Signal(float)
+    close_program_clicked = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -2421,7 +2440,7 @@ class HMISettingsScreen(QWidget):
 
         top = QHBoxLayout()
         top.setSpacing(ui(12))
-        self.btn_back = TouchButton("Back", min_h=66, min_w=170)
+        self.btn_back = TouchButton("Back", min_h=80, min_w=210)
         self.title = QLabel("HMI Settings")
         self.title.setObjectName("ScreenTitle")
         top.addWidget(self.btn_back)
@@ -2433,22 +2452,61 @@ class HMISettingsScreen(QWidget):
         root.addWidget(self.info)
 
         self.chk_fullscreen = QCheckBox("Run in full screen")
-        self.chk_fullscreen.setMinimumHeight(ui(52))
+        self.chk_fullscreen.setMinimumHeight(ui(64))
         root.addWidget(self.chk_fullscreen)
+
+        max_row = QHBoxLayout()
+        max_row.setSpacing(ui(12))
+        self.lbl_max_vel = QLabel("HMI max velocity (rpm)")
+        self.lbl_max_vel.setObjectName("FieldLabel")
+        self.lbl_max_vel.setMinimumWidth(ui(320))
+        self.edit_max_vel = QLineEdit()
+        self.edit_max_vel.setMinimumHeight(ui(66))
+        self.edit_max_vel.setAlignment(Qt.AlignCenter)
+        self.edit_max_vel.setValidator(QDoubleValidator(VEL_MIN_RPM, VEL_MAX_RPM, 1, self.edit_max_vel))
+        self.btn_apply_max_vel = TouchButton("Apply", min_h=80, min_w=200)
+        max_row.addWidget(self.lbl_max_vel)
+        max_row.addWidget(self.edit_max_vel, 1)
+        max_row.addWidget(self.btn_apply_max_vel)
+        root.addLayout(max_row)
 
         self.note = QLabel("Press Esc to exit full screen at any time.")
         self.note.setObjectName("InfoLabel")
         root.addWidget(self.note)
+
+        self.btn_close_program = TouchButton("Close Program", min_h=90, min_w=320)
+        self.btn_close_program.setObjectName("StopButton")
+        root.addWidget(self.btn_close_program)
         root.addStretch(1)
 
         self.btn_back.clicked.connect(self.back_clicked.emit)
         self.chk_fullscreen.toggled.connect(self.fullscreen_changed.emit)
+        self.btn_apply_max_vel.clicked.connect(self._emit_max_velocity)
+        self.edit_max_vel.editingFinished.connect(self._emit_max_velocity)
+        self.btn_close_program.clicked.connect(self.close_program_clicked.emit)
 
     def set_fullscreen_state(self, enabled: bool, emit_signal: bool = False) -> None:
         with QSignalBlocker(self.chk_fullscreen):
             self.chk_fullscreen.setChecked(bool(enabled))
         if emit_signal:
             self.fullscreen_changed.emit(bool(enabled))
+
+    def set_max_velocity(self, rpm: float, emit_signal: bool = False) -> None:
+        rpm = float(clamp(float(rpm), VEL_MIN_RPM, VEL_MAX_RPM))
+        with QSignalBlocker(self.edit_max_vel):
+            self.edit_max_vel.setText(f"{rpm:g}")
+        if emit_signal:
+            self.max_velocity_changed.emit(float(rpm))
+
+    def max_velocity(self) -> float:
+        try:
+            return float(clamp(float(self.edit_max_vel.text().strip() or HMI_MAX_VEL_DEFAULT_RPM), VEL_MIN_RPM, VEL_MAX_RPM))
+        except Exception:
+            return float(HMI_MAX_VEL_DEFAULT_RPM)
+
+    @Slot()
+    def _emit_max_velocity(self) -> None:
+        self.set_max_velocity(self.max_velocity(), emit_signal=True)
 
 
 # ----------------------------
@@ -2996,7 +3054,6 @@ class HomeScreen(QWidget):
     open_builder_clicked = Signal()
     recipe_select_clicked = Signal(str)
     recipe_edit_clicked = Signal(str)
-    open_config_clicked = Signal()
     open_datalogger_clicked = Signal()
 
     def __init__(self) -> None:
@@ -3023,7 +3080,6 @@ class HomeScreen(QWidget):
         self.rpm_ctl = RpmControl("Velocity", VEL_MIN_RPM, VEL_MAX_RPM, VEL_STEP_RPM, compact=False)
         self.time_ctl = TimeControl("Timer", TIME_STEP_S, compact=False)
         self.btn_builder = TouchButton("Recipe Builder", min_h=70, min_w=240)
-        self.btn_config = TouchButton("ODrive Configuration", min_h=70, min_w=240)
         self.btn_datalogger = TouchButton("Data Logger", min_h=70, min_w=240)
         self.btn_calibrate = TouchButton("Calibrate Motor", min_h=70, min_w=240)
 
@@ -3031,7 +3087,6 @@ class HomeScreen(QWidget):
         left.addWidget(self.time_ctl)
         left.addWidget(self.btn_calibrate)
         left.addWidget(self.btn_builder)
-        left.addWidget(self.btn_config)
         left.addWidget(self.btn_datalogger)
         left.addStretch(1)
         mid.addLayout(left, 1)
@@ -3064,7 +3119,6 @@ class HomeScreen(QWidget):
         self.btn_calibrate.clicked.connect(self.calibrate_clicked.emit)
         self.btn_settings.clicked.connect(self.open_settings_clicked.emit)
         self.btn_builder.clicked.connect(self.open_builder_clicked.emit)
-        self.btn_config.clicked.connect(self.open_config_clicked.emit)
         self.btn_datalogger.clicked.connect(self.open_datalogger_clicked.emit)
 
     def set_recipe_cards(self, recipes: List[Recipe], selected_id: Optional[str]) -> None:
@@ -3132,7 +3186,6 @@ class HomeScreen(QWidget):
         self.btn_calibrate.setEnabled((not running) and connected and (not calibrating))
         self.btn_calibrate.setText("Calibrating..." if calibrating else ("Recalibrate Motor" if calibrated else "Calibrate Motor"))
         self.btn_builder.setEnabled(not running)
-        self.btn_config.setEnabled(not running)
         self.btn_datalogger.setEnabled(True)
         self.recipes_area.setEnabled(not running)
 
@@ -3198,6 +3251,7 @@ class AppController(QObject):
         self._dlog_minutes = 10
         self._dlog_selected_tags: List[str] = list(DEFAULT_ENABLED_TAGS)
         self._hmi_fullscreen_pref = bool(START_FULLSCREEN)
+        self._hmi_max_velocity_rpm = float(HMI_MAX_VEL_DEFAULT_RPM)
         self._recipe_monitor_recipe: Optional[Recipe] = None
         self._recipe_monitor_step_idx = -1
         self._recipe_monitor_failed = False
@@ -3255,7 +3309,6 @@ class AppController(QObject):
         self.home.open_builder_clicked.connect(self.on_open_builder_new)
         self.home.recipe_select_clicked.connect(self.on_select_recipe)
         self.home.recipe_edit_clicked.connect(self.on_edit_recipe)
-        self.home.open_config_clicked.connect(self.on_open_config)
         self.home.open_datalogger_clicked.connect(self.on_open_datalogger)
 
         self.home.rpm_ctl.value_changed.connect(self._on_home_rpm_changed)
@@ -3273,6 +3326,7 @@ class AppController(QObject):
         self.recipe_run.back_clicked.connect(self.on_back_home)
         self.recipe_run.stop_clicked.connect(self.on_stop)
         self.hmi_settings.fullscreen_changed.connect(self.on_hmi_fullscreen_changed)
+        self.hmi_settings.max_velocity_changed.connect(self.on_hmi_max_velocity_changed)
 
         self.cfg.back_clicked.connect(self.on_back_home)
         self.cfg.request_refresh.connect(self._refresh_odrive_config)
@@ -3309,6 +3363,8 @@ class AppController(QObject):
         self._load_ui_state()
         self._loading_ui_state = False
         self.hmi_settings.set_fullscreen_state(self._hmi_fullscreen_pref, emit_signal=False)
+        self.hmi_settings.set_max_velocity(self._hmi_max_velocity_rpm, emit_signal=False)
+        self._apply_hmi_velocity_limit()
 
         self.worker_thread.start()
         self.request_connect.emit()
@@ -3446,6 +3502,10 @@ class AppController(QObject):
 
         fullscreen_pref = raw.get("hmi_fullscreen", START_FULLSCREEN)
         self._hmi_fullscreen_pref = bool(fullscreen_pref)
+        self._hmi_max_velocity_rpm = float(
+            clamp(safe_float(raw.get("hmi_max_velocity_rpm", HMI_MAX_VEL_DEFAULT_RPM), HMI_MAX_VEL_DEFAULT_RPM), VEL_MIN_RPM, VEL_MAX_RPM)
+        )
+        home_rpm = clamp(home_rpm, VEL_MIN_RPM, self._hmi_velocity_limit())
 
         self.home.rpm_ctl.set_value(home_rpm, emit_signal=False)
         self.home.time_ctl.set_text_mmss(timer_mmss, emit_signal=False)
@@ -3466,6 +3526,7 @@ class AppController(QObject):
         self.dlog.set_selected_tags(self._dlog_selected_tags)
         self.selected_recipe_id = None
         self._hmi_fullscreen_pref = bool(START_FULLSCREEN)
+        self._hmi_max_velocity_rpm = float(HMI_MAX_VEL_DEFAULT_RPM)
 
     def _schedule_ui_state_save(self) -> None:
         if self._loading_ui_state:
@@ -3476,7 +3537,7 @@ class AppController(QObject):
             self._ui_state_debounce.start()
 
     def _collect_ui_state(self) -> Dict[str, Any]:
-        home_rpm = clamp(self.home.rpm_ctl.value(), VEL_MIN_RPM, VEL_MAX_RPM)
+        home_rpm = clamp(self.home.rpm_ctl.value(), VEL_MIN_RPM, self._hmi_velocity_limit())
         secs = parse_mmss(self.home.time_ctl.text_mmss())
         if secs is None:
             secs = 0
@@ -3498,6 +3559,7 @@ class AppController(QObject):
             "dlog_minutes": int(minutes),
             "selected_recipe_id": recipe_id,
             "hmi_fullscreen": bool(self._hmi_fullscreen_pref),
+            "hmi_max_velocity_rpm": float(self._hmi_max_velocity_rpm),
         }
 
     def hmi_fullscreen_preference(self) -> bool:
@@ -3506,6 +3568,16 @@ class AppController(QObject):
     def set_hmi_fullscreen_preference(self, enabled: bool) -> None:
         self._hmi_fullscreen_pref = bool(enabled)
         self._schedule_ui_state_save()
+
+    def _hmi_velocity_limit(self) -> float:
+        return float(clamp(float(self._hmi_max_velocity_rpm), VEL_MIN_RPM, VEL_MAX_RPM))
+
+    def _apply_hmi_velocity_limit(self) -> None:
+        vmax = self._hmi_velocity_limit()
+        self.home.rpm_ctl.set_range(VEL_MIN_RPM, vmax)
+        self.builder.set_velocity_limit(vmax)
+        # Clamp current entry values to the new limit without emitting changes.
+        self.home.rpm_ctl.set_value(self.home.rpm_ctl.value(), emit_signal=False)
 
     @Slot()
     def _save_ui_state_now(self) -> None:
@@ -3735,7 +3807,7 @@ class AppController(QObject):
 
     @Slot(float)
     def _on_home_rpm_changed(self, rpm: float) -> None:
-        rpm = float(clamp(float(rpm), VEL_MIN_RPM, VEL_MAX_RPM))
+        rpm = float(clamp(float(rpm), VEL_MIN_RPM, self._hmi_velocity_limit()))
         if self.engine.is_running():
             self.engine.override_rpm(rpm)
         self._schedule_ui_state_save()
@@ -3763,7 +3835,7 @@ class AppController(QObject):
             QMessageBox.warning(self.home, "Calibration Required", "Cannot start: calibrate the motor before starting.")
             return
 
-        rpm = clamp(self.home.rpm_ctl.value(), VEL_MIN_RPM, VEL_MAX_RPM)
+        rpm = clamp(self.home.rpm_ctl.value(), VEL_MIN_RPM, self._hmi_velocity_limit())
         recipe = self._selected_recipe()
         if recipe is None:
             duration = self.home.time_ctl.seconds()
@@ -3827,6 +3899,12 @@ class AppController(QObject):
     @Slot(bool)
     def on_hmi_fullscreen_changed(self, enabled: bool) -> None:
         self._hmi_fullscreen_pref = bool(enabled)
+        self._schedule_ui_state_save()
+
+    @Slot(float)
+    def on_hmi_max_velocity_changed(self, rpm: float) -> None:
+        self._hmi_max_velocity_rpm = float(clamp(float(rpm), VEL_MIN_RPM, VEL_MAX_RPM))
+        self._apply_hmi_velocity_limit()
         self._schedule_ui_state_save()
 
     @Slot()
@@ -4063,6 +4141,7 @@ class MainWindow(QWidget):
             self.dlog,
         )
         self.hmi_settings.fullscreen_changed.connect(self._set_fullscreen_mode)
+        self.hmi_settings.close_program_clicked.connect(self.close)
 
     def closeEvent(self, event) -> None:
         self.controller.shutdown()
