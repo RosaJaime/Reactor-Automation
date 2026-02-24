@@ -1,14 +1,9 @@
 import math
 import odrive
 from odrive.enums import MotorType, ControlMode, InputMode, Protocol, EncoderId
+from odrive_configuration import apply_script_defaults
 
 odrv = odrv0
-odrv.config.dc_bus_overvoltage_trip_level = 25
-odrv.config.dc_bus_undervoltage_trip_level = 10.5
-odrv.config.dc_max_positive_current = math.inf
-odrv.config.dc_max_negative_current = -math.inf
-odrv.config.brake_resistor0.enable = True
-odrv.config.brake_resistor0.resistance = 2
 odrv.axis0.config.motor.motor_type = MotorType.PMSM_CURRENT_CONTROL
 odrv.axis0.config.motor.pole_pairs = 20
 odrv.axis0.config.motor.torque_constant = 0.0827
@@ -31,3 +26,4 @@ odrv.axis0.config.enable_watchdog = False
 odrv.axis0.config.load_encoder = EncoderId.ONBOARD_ENCODER0
 odrv.axis0.config.commutation_encoder = EncoderId.ONBOARD_ENCODER0
 odrv.config.enable_uart_a = False
+apply_script_defaults(odrv)

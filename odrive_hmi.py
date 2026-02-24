@@ -43,9 +43,15 @@ import sqlite3
 import sys
 import time
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+try:
+    from odrive_configuration import HMI_DEFAULT_CONFIG_VALUES, ODRIVE_MOTOR_PRESETS
+except Exception:
+    HMI_DEFAULT_CONFIG_VALUES = {}
+    ODRIVE_MOTOR_PRESETS = {}
 
 from PySide6.QtCore import (
     QObject,
@@ -117,6 +123,7 @@ TAG_IBUS_A = "ibus"
 TAG_PWR_W = "p_w"        # computed vbus*ibus
 TAG_CMD_RPM = "cmd_rpm"  # last commanded
 TAG_VEL_RPM = "vel_rpm"  # actual estimate
+TAG_TORQUE_NM = "torque_nm"  # actual/estimated torque
 
 DEFAULT_ENABLED_TAGS = [TAG_PWR_W, TAG_CMD_RPM]
 
@@ -126,6 +133,7 @@ TAG_DEADBAND: Dict[str, float] = {
     TAG_PWR_W: 0.05,
     TAG_CMD_RPM: 0.1,
     TAG_VEL_RPM: 0.1,
+    TAG_TORQUE_NM: 0.01,
 }
 TAG_HEARTBEAT_S: Dict[str, int] = {t: DB_HEARTBEAT_S_DEFAULT for t in TAG_DEADBAND}
 
@@ -133,6 +141,7 @@ TAG_LABELS: Dict[str, str] = {
     TAG_PWR_W: "Electrical input power (W)",
     TAG_CMD_RPM: "Commanded RPM",
     TAG_VEL_RPM: "Actual velocity RPM",
+    TAG_TORQUE_NM: "Actual torque (Nm)",
     TAG_VBUS_V: "Bus voltage (V)",
     TAG_IBUS_A: "Bus current (A)",
 }
@@ -140,6 +149,7 @@ TAG_UNITS: Dict[str, str] = {
     TAG_PWR_W: "W",
     TAG_CMD_RPM: "rpm",
     TAG_VEL_RPM: "rpm",
+    TAG_TORQUE_NM: "Nm",
     TAG_VBUS_V: "V",
     TAG_IBUS_A: "A",
 }
@@ -148,6 +158,7 @@ PLOT_GROUP_OTHER = "other"
 TAG_PLOT_GROUP: Dict[str, str] = {
     TAG_CMD_RPM: PLOT_GROUP_RPM,
     TAG_VEL_RPM: PLOT_GROUP_RPM,
+    TAG_TORQUE_NM: PLOT_GROUP_OTHER,
     TAG_PWR_W: PLOT_GROUP_OTHER,
     TAG_VBUS_V: PLOT_GROUP_OTHER,
     TAG_IBUS_A: PLOT_GROUP_OTHER,
@@ -315,7 +326,7 @@ class SettingSpec:
     max_value: Optional[float] = None
 
 
-IMPORTANT_SETTINGS: List[SettingSpec] = [
+ODRIVE_CONFIG_FIELDS: List[SettingSpec] = [
     SettingSpec("axis0.config.startup_motor_calibration", "Startup: motor calibration", "bool", False),
     SettingSpec("axis0.config.startup_encoder_offset_calibration", "Startup: encoder offset calibration", "bool", False),
     SettingSpec("axis0.config.startup_encoder_index_search", "Startup: encoder index search", "bool", False),
@@ -336,9 +347,6 @@ IMPORTANT_SETTINGS: List[SettingSpec] = [
     SettingSpec("config.dc_bus_undervoltage_trip_level", "DC bus: undervoltage trip (V)", "float", 10.0, 0.0, 60.0),
     SettingSpec("config.dc_bus_overvoltage_trip_level", "DC bus: overvoltage trip (V)", "float", 30.0, 0.0, 80.0),
 
-    SettingSpec("config.enable_brake_resistor", "Brake resistor: enabled", "bool", False),
-    SettingSpec("config.brake_resistance", "Brake resistor: resistance (ohm)", "float", 2.0, 0.1, 20.0),
-
     SettingSpec("axis0.config.motor.pole_pairs", "Motor: pole pairs", "int", 7, 1, 50),
     SettingSpec("axis0.config.motor.torque_constant", "Motor: torque constant (Nm/A)", "float", 0.0306, 0.0001, 1.0),
 
@@ -350,7 +358,11 @@ IMPORTANT_SETTINGS: List[SettingSpec] = [
     SettingSpec("axis0.config.enable_watchdog", "Safety: enable watchdog", "bool", False),
     SettingSpec("axis0.config.watchdog_timeout", "Safety: watchdog timeout (s)", "float", 1.0, 0.1, 10.0),
 ]
-DEFAULT_CONFIG_MAP: Dict[str, Any] = {s.key: s.default for s in IMPORTANT_SETTINGS}
+ODRIVE_CONFIG_FIELDS = [
+    replace(_spec, default=HMI_DEFAULT_CONFIG_VALUES.get(_spec.key, _spec.default))
+    for _spec in ODRIVE_CONFIG_FIELDS
+]
+DEFAULT_CONFIG_MAP: Dict[str, Any] = {s.key: s.default for s in ODRIVE_CONFIG_FIELDS}
 
 
 # ----------------------------
@@ -367,6 +379,8 @@ class OdriveInterface:
     def get_state(self) -> str: raise NotImplementedError
     def read_config(self, keys: List[str]) -> Tuple[Dict[str, Any], List[str]]: raise NotImplementedError
     def apply_config(self, values: Dict[str, Any]) -> Tuple[bool, str, List[str]]: raise NotImplementedError
+    def save_config(self, values: Dict[str, Any]) -> Tuple[bool, str, List[str]]: raise NotImplementedError
+    def erase_config(self) -> Tuple[bool, str]: raise NotImplementedError
     def get_tags(self, tags: Sequence[str]) -> Dict[str, float]: raise NotImplementedError
     def get_json(self) -> str: raise NotImplementedError
 
@@ -426,7 +440,16 @@ class SimulatedOdrive(OdriveInterface):
                 self._config[k] = v
             else:
                 missing.append(k)
-        return True, "Simulation config saved", missing
+        return True, "Simulation config applied (not saved)", missing
+
+    def save_config(self, values: Dict[str, Any]) -> Tuple[bool, str, List[str]]:
+        ok, _msg, missing = self.apply_config(values)
+        return ok, "Simulation config saved (no reboot)", missing
+
+    def erase_config(self) -> Tuple[bool, str]:
+        self._config = dict(DEFAULT_CONFIG_MAP)
+        self._state = "Idle"
+        return True, "Simulation config reset to defaults"
 
     def _update_actual(self) -> None:
         now = time.monotonic()
@@ -442,6 +465,7 @@ class SimulatedOdrive(OdriveInterface):
         self._update_actual()
         rpm_mag = abs(self._actual_rpm)
         ibus = 0.2 + (rpm_mag / max(1.0, VEL_MAX_RPM)) * 2.0
+        torque_nm = 0.02 * ibus + 0.0005 * rpm_mag
         out: Dict[str, float] = {}
         for t in tags:
             if t == TAG_VBUS_V:
@@ -450,6 +474,8 @@ class SimulatedOdrive(OdriveInterface):
                 out[t] = float(ibus)
             elif t == TAG_VEL_RPM:
                 out[t] = float(self._actual_rpm)
+            elif t == TAG_TORQUE_NM:
+                out[t] = float(torque_nm)
         return out
 
     def get_json(self) -> str:
@@ -536,8 +562,12 @@ class RealOdrive(OdriveInterface):
             self.stop()
             return
         turns_per_s = rpm / 60.0
-        self._axis.controller.input_vel = float(turns_per_s)
+        # Some firmware/hardware combinations ignore the first input_vel command if it is
+        # written before the axis finishes entering CLOSED_LOOP_CONTROL. Request state first,
+        # then write the target (twice) so the very first Start command moves the motor.
         self._axis.requested_state = self._AxisState.CLOSED_LOOP_CONTROL
+        self._axis.controller.input_vel = float(turns_per_s)
+        self._axis.controller.input_vel = float(turns_per_s)
         self._state = f"CLOSED_LOOP_CONTROL ({rpm:.0f} rpm)"
 
     def stop(self) -> None:
@@ -557,11 +587,31 @@ class RealOdrive(OdriveInterface):
         if not self._connected or self._axis is None:
             raise RuntimeError("ODrive not connected")
 
+        # Newer ODrive object models may not expose axis.encoder or motor.is_calibrated.
+        # On those firmwares, a valid commutation mapper offset is a practical indicator
+        # that calibration completed successfully for velocity control.
+        try:
+            active_errors = int(getattr(self._axis, "active_errors"))
+        except Exception:
+            active_errors = 0
+        try:
+            disarm_reason = int(getattr(self._axis, "disarm_reason"))
+        except Exception:
+            disarm_reason = 0
+
         motor_ok = False
         try:
             motor_ok = bool(getattr(self._axis.motor, "is_calibrated"))
         except Exception:
-            motor_ok = False
+            try:
+                motor_ok = bool(getattr(self._axis.motor.config, "pre_calibrated"))
+            except Exception:
+                motor_ok = False
+        if not motor_ok:
+            try:
+                motor_ok = bool(getattr(self._axis.commutation_mapper.config, "offset_valid"))
+            except Exception:
+                motor_ok = False
 
         encoder_ready = True
         try:
@@ -569,6 +619,11 @@ class RealOdrive(OdriveInterface):
         except Exception:
             # Some firmware variants expose calibration state differently; motor calibration is the minimum gate.
             encoder_ready = True
+        # If the newer mapper-based API exists, accept commutation mapper validity as sufficient
+        # for this app's velocity-control gating. pos_vel_mapper offset may remain invalid and
+        # closed-loop velocity can still work (as observed on some firmware/hardware combinations).
+        if motor_ok and active_errors == 0 and disarm_reason == 0:
+            return True, "Motor calibrated"
 
         if motor_ok and encoder_ready:
             return True, "Motor calibrated"
@@ -581,41 +636,158 @@ class RealOdrive(OdriveInterface):
     def is_calibrated(self) -> Tuple[bool, str]:
         return self._calibration_status()
 
+    def _error_summary(self) -> str:
+        if not self._connected or self._axis is None:
+            return ""
+        parts: List[str] = []
+        probes = [
+            ("axis.active_errors", lambda: getattr(self._axis, "active_errors")),
+            ("axis.disarm_reason", lambda: getattr(self._axis, "disarm_reason")),
+            ("axis.procedure_result", lambda: getattr(self._axis, "procedure_result")),
+            ("motor.active_errors", lambda: getattr(self._axis.motor, "active_errors")),
+            ("encoder.active_errors", lambda: getattr(self._axis.encoder, "active_errors")),
+        ]
+        if self._odrv is not None:
+            probes.insert(0, ("odrv.active_errors", lambda: getattr(self._odrv, "active_errors")))
+        for name, fn in probes:
+            try:
+                val = fn()
+            except Exception:
+                continue
+            try:
+                sval = str(val)
+            except Exception:
+                continue
+            if sval and sval not in ("0", "ODriveError.NONE", "AxisError.NONE", "ProcedureResult.SUCCESS"):
+                parts.append(f"{name}={sval}")
+        return "; ".join(parts)
+
+    def _clear_errors(self) -> None:
+        if self._axis is None:
+            return
+        for obj in (self._axis, self._odrv):
+            if obj is None:
+                continue
+            try:
+                clr = getattr(obj, "clear_errors", None)
+                if callable(clr):
+                    clr()
+            except Exception:
+                pass
+
+    def _wait_axis_idle(self, timeout_s: float) -> bool:
+        if self._axis is None or self._AxisState is None:
+            return False
+        deadline = time.monotonic() + float(timeout_s)
+        while time.monotonic() < deadline:
+            try:
+                cur = getattr(self._axis, "current_state")
+                if int(cur) == int(self._AxisState.IDLE):
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.1)
+        return False
+
+    def _run_state_sequence(self, state_name: str, timeout_s: float) -> Tuple[bool, str]:
+        if self._axis is None or self._AxisState is None:
+            return False, "ODrive not connected"
+        if not hasattr(self._AxisState, state_name):
+            return False, f"{state_name} is not available on this ODrive firmware"
+        try:
+            self._axis.requested_state = getattr(self._AxisState, state_name)
+        except Exception as e:
+            return False, f"Failed to request {state_name}: {e}"
+        if not self._wait_axis_idle(timeout_s):
+            return False, f"{state_name} timed out"
+        return True, f"{state_name} complete"
+
     def calibrate(self) -> Tuple[bool, str]:
         if not self._connected or self._axis is None or self._AxisState is None:
             raise RuntimeError("ODrive not connected")
 
-        if not hasattr(self._AxisState, "FULL_CALIBRATION_SEQUENCE"):
-            return False, "FULL_CALIBRATION_SEQUENCE is not available on this ODrive firmware"
-
         self._state = "Calibrating..."
+        old_soft_max: Optional[float] = None
+        old_hard_max: Optional[float] = None
+        old_dc_max_positive_current: Optional[float] = None
         try:
+            self._clear_errors()
+            # Calibration can legitimately require more current than the conservative
+            # runtime limits used after connect(). Raise them temporarily if needed.
+            try:
+                motor_cfg = self._axis.config.motor
+                cal_i = float(getattr(motor_cfg, "calibration_current"))
+                old_soft_max = float(getattr(motor_cfg, "current_soft_max"))
+                old_hard_max = float(getattr(motor_cfg, "current_hard_max"))
+                req_soft = max(old_soft_max, cal_i + 1.0)
+                req_hard = max(old_hard_max, cal_i + 3.0)
+                if req_hard <= req_soft:
+                    req_hard = req_soft + 1.0
+                motor_cfg.current_soft_max = req_soft
+                motor_cfg.current_hard_max = req_hard
+            except Exception:
+                pass
+            try:
+                if self._odrv is not None:
+                    old_dc_max_positive_current = float(getattr(self._odrv.config, "dc_max_positive_current"))
+                    # Bus current during calibration can exceed conservative runtime limits.
+                    req_dc_pos = max(old_dc_max_positive_current, 30.0, cal_i * 2.0)  # type: ignore[name-defined]
+                    self._odrv.config.dc_max_positive_current = float(req_dc_pos)
+            except Exception:
+                pass
             try:
                 self._axis.controller.input_vel = 0.0
             except Exception:
                 pass
             self._axis.requested_state = self._AxisState.IDLE
-            self._axis.requested_state = self._AxisState.FULL_CALIBRATION_SEQUENCE
+            time.sleep(0.1)
 
-            deadline = time.monotonic() + 90.0
-            while time.monotonic() < deadline:
-                try:
-                    cur = getattr(self._axis, "current_state")
-                    if int(cur) == int(self._AxisState.IDLE):
-                        break
-                except Exception:
-                    pass
-                time.sleep(0.1)
+            ran_any = False
+            errs: List[str] = []
+            if hasattr(self._AxisState, "FULL_CALIBRATION_SEQUENCE"):
+                ran_any = True
+                ok_full, msg_full = self._run_state_sequence("FULL_CALIBRATION_SEQUENCE", 120.0)
+                if not ok_full:
+                    errs.append(msg_full)
             else:
+                for state_name, timeout_s in (
+                    ("MOTOR_CALIBRATION", 60.0),
+                    ("ENCODER_OFFSET_CALIBRATION", 60.0),
+                ):
+                    if hasattr(self._AxisState, state_name):
+                        ran_any = True
+                        ok_seq, msg_seq = self._run_state_sequence(state_name, timeout_s)
+                        if not ok_seq:
+                            errs.append(msg_seq)
+                            break
+            if not ran_any:
                 self._state = "Idle"
-                return False, "Calibration timed out"
+                return False, "No supported calibration states found on this ODrive firmware"
 
             ok, msg = self._calibration_status()
             self._state = "Idle (velocity ready)" if ok else "Idle (not calibrated)"
-            return ok, ("Calibration complete" if ok else f"Calibration incomplete: {msg}")
+            if ok:
+                return True, "Calibration complete"
+            detail = f"Calibration incomplete: {msg}"
+            err_text = self._error_summary()
+            if errs:
+                detail += f" | Sequence: {'; '.join(errs)}"
+            if err_text:
+                detail += f" | ODrive: {err_text}"
+            return False, detail
         except Exception as e:
             self._state = "Idle"
             raise RuntimeError(f"Calibration failed: {e}")
+        finally:
+            try:
+                if old_soft_max is not None:
+                    self._axis.config.motor.current_soft_max = float(old_soft_max)
+                if old_hard_max is not None:
+                    self._axis.config.motor.current_hard_max = float(old_hard_max)
+                if old_dc_max_positive_current is not None and self._odrv is not None:
+                    self._odrv.config.dc_max_positive_current = float(old_dc_max_positive_current)
+            except Exception:
+                pass
 
     def get_state(self) -> str:
         return self._state
@@ -649,16 +821,17 @@ class RealOdrive(OdriveInterface):
     def apply_config(self, values: Dict[str, Any]) -> Tuple[bool, str, List[str]]:
         if not self._connected or self._odrv is None or self._axis is None or self._AxisState is None:
             raise RuntimeError("ODrive not connected")
-        missing: List[str] = []
-        try:
-            self._axis.requested_state = self._AxisState.IDLE
-        except Exception:
-            pass
-        for k, v in values.items():
-            try:
-                self._set_attr_path(self._odrv, k, v)
-            except Exception:
-                missing.append(k)
+        missing = self._apply_config_values(values)
+        self._state = "Config applied"
+        msg = "Config applied (not saved)"
+        if missing:
+            msg = f"Config applied; {len(missing)} unsupported field(s) skipped"
+        return True, msg, missing
+
+    def save_config(self, values: Dict[str, Any]) -> Tuple[bool, str, List[str]]:
+        if not self._connected or self._odrv is None or self._axis is None or self._AxisState is None:
+            raise RuntimeError("ODrive not connected")
+        missing = self._apply_config_values(values)
         msg = "Config saved (device rebooting)"
         try:
             self._state = "Saving config (rebooting)..."
@@ -669,6 +842,38 @@ class RealOdrive(OdriveInterface):
         if missing:
             msg = f"Config saved (device rebooting); {len(missing)} unsupported field(s) skipped"
         return True, msg, missing
+
+    def erase_config(self) -> Tuple[bool, str]:
+        if not self._connected or self._odrv is None or self._axis is None or self._AxisState is None:
+            raise RuntimeError("ODrive not connected")
+        try:
+            self._axis.requested_state = self._AxisState.IDLE
+        except Exception:
+            pass
+        if not hasattr(self._odrv, "erase_configuration"):
+            return False, "erase_configuration() is not available on this ODrive firmware"
+        try:
+            self._state = "Erasing config (rebooting)..."
+            self._odrv.erase_configuration()
+        except Exception as e:
+            raise RuntimeError(f"Erase config failed: {e}")
+        self._mark_disconnected("Rebooting (reconnecting)")
+        return True, "Configuration erased (device rebooting)"
+
+    def _apply_config_values(self, values: Dict[str, Any]) -> List[str]:
+        if not self._connected or self._odrv is None or self._axis is None or self._AxisState is None:
+            raise RuntimeError("ODrive not connected")
+        missing: List[str] = []
+        try:
+            self._axis.requested_state = self._AxisState.IDLE
+        except Exception:
+            pass
+        for k, v in values.items():
+            try:
+                self._set_attr_path(self._odrv, k, v)
+            except Exception:
+                missing.append(k)
+        return missing
 
     def get_tags(self, tags: Sequence[str]) -> Dict[str, float]:
         if not self._connected or self._odrv is None or self._axis is None:
@@ -683,6 +888,50 @@ class RealOdrive(OdriveInterface):
                 elif t == TAG_VEL_RPM:
                     turns_per_s = float(getattr(self._axis, "vel_estimate"))
                     out[t] = turns_per_s * 60.0
+                elif t == TAG_TORQUE_NM:
+                    torque_val = None
+                    # Firmware variants expose torque estimate/setpoint on different objects.
+                    for getter in (
+                        lambda: getattr(self._axis.controller, "torque_estimate"),
+                        lambda: getattr(self._axis.controller, "effective_torque_setpoint"),
+                        lambda: getattr(self._axis.controller, "torque_setpoint"),
+                        lambda: getattr(self._axis, "torque_estimate"),
+                        lambda: getattr(self._axis.motor, "torque_estimate"),
+                    ):
+                        try:
+                            torque_val = float(getter())
+                            break
+                        except Exception:
+                            continue
+                    # Fallback: estimate torque from q-axis current * torque constant.
+                    if torque_val is None:
+                        iq_val = None
+                        for getter in (
+                            lambda: getattr(getattr(self._axis.motor, "foc"), "Iq_measured"),
+                            lambda: getattr(getattr(self._axis.motor, "foc"), "Iq_setpoint"),
+                            lambda: getattr(getattr(self._axis.motor, "current_control"), "Iq_measured"),
+                            lambda: getattr(getattr(self._axis.motor, "current_control"), "Iq_setpoint"),
+                        ):
+                            try:
+                                iq_val = float(getter())
+                                break
+                            except Exception:
+                                continue
+                        if iq_val is not None:
+                            kt = None
+                            for getter in (
+                                lambda: getattr(getattr(self._axis.config, "motor"), "torque_constant"),
+                                lambda: getattr(self._axis.motor, "torque_constant"),
+                            ):
+                                try:
+                                    kt = float(getter())
+                                    break
+                                except Exception:
+                                    continue
+                            if kt is not None and math.isfinite(kt):
+                                torque_val = float(iq_val * kt)
+                    if torque_val is not None and math.isfinite(torque_val):
+                        out[t] = float(torque_val)
             except Exception:
                 pass
         return out
@@ -690,7 +939,53 @@ class RealOdrive(OdriveInterface):
     def get_json(self) -> str:
         if not self._connected or self._odrv is None:
             raise RuntimeError("ODrive not connected")
-        return str(self._odrv.get_json())
+        try:
+            getter = getattr(self._odrv, "get_json", None)
+            if callable(getter):
+                return str(getter())
+        except Exception:
+            pass
+
+        # Firmware/API fallback: export a practical snapshot when get_json() is unavailable.
+        snap: Dict[str, Any] = {
+            "export_kind": "odrive_snapshot_fallback",
+            "reason": "get_json() not available on this ODrive API object",
+            "backend_state": self._state,
+        }
+        try:
+            snap["vbus_voltage"] = float(getattr(self._odrv, "vbus_voltage"))
+        except Exception:
+            pass
+        try:
+            snap["ibus"] = float(getattr(self._odrv, "ibus"))
+        except Exception:
+            pass
+        try:
+            snap["axis0"] = {
+                "current_state": int(getattr(self._axis, "current_state")) if self._axis is not None else None,
+                "active_errors": str(getattr(self._axis, "active_errors")) if self._axis is not None else None,
+                "disarm_reason": str(getattr(self._axis, "disarm_reason")) if self._axis is not None else None,
+                "procedure_result": str(getattr(self._axis, "procedure_result")) if self._axis is not None else None,
+            }
+        except Exception:
+            pass
+
+        try:
+            keys = [s.key for s in ODRIVE_CONFIG_FIELDS]
+            values, missing = self.read_config(keys)
+            # Make sure everything is JSON serializable.
+            clean_values: Dict[str, Any] = {}
+            for k, v in values.items():
+                if isinstance(v, (str, int, float, bool)) or v is None:
+                    clean_values[k] = v
+                else:
+                    clean_values[k] = str(v)
+            snap["config_fields"] = clean_values
+            snap["unsupported_settings"] = list(missing)
+        except Exception as e:
+            snap["config_read_error"] = str(e)
+
+        return json.dumps(snap, indent=2)
 
 
 # ----------------------------
@@ -705,6 +1000,8 @@ class OdriveWorker(QObject):
 
     config_read = Signal(object, object)          # dict, missing list
     config_applied = Signal(bool, str, object)    # ok, message, missing list
+    config_saved = Signal(bool, str, object)      # ok, message, missing list
+    config_erased = Signal(bool, str)             # ok, message
     export_json_done = Signal(bool, str)          # ok, path/message
     tags_sample = Signal(int, object)             # ts, dict
     calibration_checked = Signal(bool, str)       # calibrated, detail
@@ -714,7 +1011,7 @@ class OdriveWorker(QObject):
         super().__init__()
         self._backend = backend
         self._poll_timer: Optional[QTimer] = None
-        self._polled_tags: List[str] = [TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM]
+        self._polled_tags: List[str] = [TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM, TAG_TORQUE_NM]
         self._supervisor_timer: Optional[QTimer] = None
 
         self._connecting = False
@@ -915,6 +1212,46 @@ class OdriveWorker(QObject):
             else:
                 self.error.emit(f"Apply config failed: {e}")
                 self.config_applied.emit(False, str(e), list(values.keys()))
+
+    @Slot(object)
+    def save_config(self, values: Dict[str, Any]) -> None:
+        if not self._backend.is_connected():
+            self.config_saved.emit(False, "ODrive not connected (reconnecting)", list(values.keys()))
+            return
+        try:
+            ok, msg, missing = self._backend.save_config(values)
+            self.config_saved.emit(bool(ok), str(msg), missing)
+            if not self._backend.is_connected():
+                self._set_connected(False, self._backend.get_state())
+            else:
+                self._emit_state(self._backend.get_state())
+        except Exception as e:
+            if self._is_disconnect_error(e):
+                self._mark_disconnected("Disconnected (reconnecting)")
+                self.config_saved.emit(False, "ODrive disconnected during save (reconnecting)", list(values.keys()))
+            else:
+                self.error.emit(f"Save config failed: {e}")
+                self.config_saved.emit(False, str(e), list(values.keys()))
+
+    @Slot()
+    def erase_config(self) -> None:
+        if not self._backend.is_connected():
+            self.config_erased.emit(False, "ODrive not connected (reconnecting)")
+            return
+        try:
+            ok, msg = self._backend.erase_config()
+            self.config_erased.emit(bool(ok), str(msg))
+            if not self._backend.is_connected():
+                self._set_connected(False, self._backend.get_state())
+            else:
+                self._emit_state(self._backend.get_state())
+        except Exception as e:
+            if self._is_disconnect_error(e):
+                self._mark_disconnected("Disconnected (reconnecting)")
+                self.config_erased.emit(False, "ODrive disconnected during erase (reconnecting)")
+            else:
+                self.error.emit(f"Erase config failed: {e}")
+                self.config_erased.emit(False, str(e))
 
     @Slot()
     def export_json(self) -> None:
@@ -1867,14 +2204,16 @@ class SettingRowWidget(QFrame):
 
 class ODriveConfigScreen(QWidget):
     back_clicked = Signal()
-    save_clicked = Signal(object)          # dict key->value
+    apply_clicked = Signal(object)         # dict key->value
+    save_reboot_clicked = Signal(object)   # dict key->value
+    erase_reset_clicked = Signal()
     request_refresh = Signal()
-    restore_defaults_clicked = Signal()
     export_json_clicked = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self._rows: Dict[str, SettingRowWidget] = {}
+        self._motor_presets: Dict[str, Dict[str, Any]] = dict(ODRIVE_MOTOR_PRESETS)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(ui(18), ui(16), ui(18), ui(16))
@@ -1897,6 +2236,20 @@ class ODriveConfigScreen(QWidget):
         self.status.setObjectName("InfoLabel")
         root.addWidget(self.status)
 
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(ui(12))
+        self.lbl_motor_preset = QLabel("Motor preset")
+        self.lbl_motor_preset.setObjectName("FieldLabel")
+        self.lbl_motor_preset.setMinimumWidth(ui(220))
+        self.cmb_motor_preset = QComboBox()
+        self.cmb_motor_preset.setMinimumHeight(ui(58))
+        self.cmb_motor_preset.addItem("Custom / no preset", "")
+        for name in self._motor_presets.keys():
+            self.cmb_motor_preset.addItem(name, name)
+        preset_row.addWidget(self.lbl_motor_preset)
+        preset_row.addWidget(self.cmb_motor_preset, 1)
+        root.addLayout(preset_row)
+
         self.area = QScrollArea()
         self.area.setWidgetResizable(True)
         self.area.setFrameShape(QFrame.NoFrame)
@@ -1909,27 +2262,31 @@ class ODriveConfigScreen(QWidget):
         self.area.setWidget(self.container)
         root.addWidget(self.area, 1)
 
-        for spec in IMPORTANT_SETTINGS:
+        for spec in ODRIVE_CONFIG_FIELDS:
             row = SettingRowWidget(spec)
             self._rows[spec.key] = row
             self.vbox.insertWidget(self.vbox.count() - 1, row)
 
         actions = QHBoxLayout()
         actions.setSpacing(ui(12))
-        self.btn_restore = TouchButton("Restore Defaults", min_h=66, min_w=260)
+        self.btn_apply = TouchButton("Apply", min_h=66, min_w=180)
+        self.btn_save = TouchButton("Save && Reboot", min_h=66, min_w=240)
+        self.btn_erase_reset = TouchButton("Erase && Reset Defaults", min_h=66, min_w=320)
         self.btn_cancel = TouchButton("Cancel", min_h=66, min_w=200)
-        self.btn_save = TouchButton("Save", min_h=66, min_w=200)
-        actions.addWidget(self.btn_restore, 1)
-        actions.addWidget(self.btn_cancel, 1)
+        actions.addWidget(self.btn_apply, 1)
         actions.addWidget(self.btn_save, 1)
+        actions.addWidget(self.btn_erase_reset, 1)
+        actions.addWidget(self.btn_cancel, 1)
         root.addLayout(actions)
 
         self.btn_back.clicked.connect(self.back_clicked.emit)
         self.btn_cancel.clicked.connect(self.back_clicked.emit)
-        self.btn_save.clicked.connect(lambda: self.save_clicked.emit(self.gather_values()))
-        self.btn_restore.clicked.connect(self.restore_defaults_clicked.emit)
+        self.btn_apply.clicked.connect(lambda: self.apply_clicked.emit(self.gather_values()))
+        self.btn_save.clicked.connect(lambda: self.save_reboot_clicked.emit(self.gather_values()))
+        self.btn_erase_reset.clicked.connect(self.erase_reset_clicked.emit)
         self.btn_refresh.clicked.connect(self.request_refresh.emit)
         self.btn_export.clicked.connect(self.export_json_clicked.emit)
+        self.cmb_motor_preset.currentIndexChanged.connect(self._on_motor_preset_changed)
 
     def set_loading(self, text: str) -> None:
         self.status.setText(text)
@@ -1948,10 +2305,32 @@ class ODriveConfigScreen(QWidget):
         for key, row in self._rows.items():
             row.set_value(DEFAULT_CONFIG_MAP.get(key, row.spec.default))
             row.set_missing(False)
-        self.status.setText("Defaults restored (not saved)")
+        self.status.setText("Defaults restored (not applied)")
 
     def gather_values(self) -> Dict[str, Any]:
         return {k: row.get_value() for k, row in self._rows.items() if row.editor.isEnabled()}
+
+    @Slot(int)
+    def _on_motor_preset_changed(self, _idx: int) -> None:
+        key = str(self.cmb_motor_preset.currentData() or "")
+        if not key:
+            return
+        preset = self._motor_presets.get(key, {})
+        hmi_values = dict(preset.get("hmi_values") or {})
+        if not hmi_values:
+            self.status.setText(f"Preset selected: {key} (no mapped HMI fields)")
+            return
+        applied = 0
+        skipped = 0
+        for field_key, value in hmi_values.items():
+            row = self._rows.get(field_key)
+            if row is None:
+                skipped += 1
+                continue
+            row.set_value(value)
+            applied += 1
+        suffix = f", {skipped} unmapped" if skipped else ""
+        self.status.setText(f"Loaded motor preset '{key}' into form ({applied} field(s){suffix}; not applied)")
 
 
 # ----------------------------
@@ -2212,7 +2591,7 @@ class DataLoggerScreen(QWidget):
         left.addWidget(lbl_tags)
 
         self._tag_checks: Dict[str, QCheckBox] = {}
-        for tag in [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_VBUS_V, TAG_IBUS_A]:
+        for tag in [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_VBUS_V, TAG_IBUS_A]:
             cb = QCheckBox(TAG_LABELS.get(tag, tag))
             cb.setChecked(tag in DEFAULT_ENABLED_TAGS)
             cb.setMinimumHeight(ui(44))
@@ -2439,7 +2818,9 @@ class AppController(QObject):
     request_check_calibration = Signal()
     request_run_calibration = Signal()
     request_read_config = Signal(object)          # list[str]
-    request_apply_config = Signal(object)         # dict
+    request_apply_config = Signal(object)         # dict (live apply, no save)
+    request_save_config = Signal(object)          # dict (save + reboot)
+    request_erase_config = Signal()               # erase + reboot
     request_export_json = Signal()
     request_set_polled_tags = Signal(object)      # list[str]
     request_start_poll = Signal()
@@ -2486,6 +2867,8 @@ class AppController(QObject):
         self.request_run_calibration.connect(self.worker.run_calibration)
         self.request_read_config.connect(self.worker.read_config)
         self.request_apply_config.connect(self.worker.apply_config)
+        self.request_save_config.connect(self.worker.save_config)
+        self.request_erase_config.connect(self.worker.erase_config)
         self.request_export_json.connect(self.worker.export_json)
         self.request_set_polled_tags.connect(self.worker.set_polled_tags)
         self.request_start_poll.connect(self.worker.start_tag_polling)
@@ -2497,6 +2880,8 @@ class AppController(QObject):
         self.worker.error.connect(self._on_worker_error)
         self.worker.config_read.connect(self._on_config_read)
         self.worker.config_applied.connect(self._on_config_applied)
+        self.worker.config_saved.connect(self._on_config_saved)
+        self.worker.config_erased.connect(self._on_config_erased)
         self.worker.export_json_done.connect(self._on_export_json_done)
         self.worker.tags_sample.connect(self._on_tags_sample)
         self.worker.calibration_checked.connect(self._on_calibration_checked)
@@ -2526,8 +2911,9 @@ class AppController(QObject):
 
         self.cfg.back_clicked.connect(self.on_back_home)
         self.cfg.request_refresh.connect(self._refresh_odrive_config)
-        self.cfg.save_clicked.connect(self._save_odrive_config)
-        self.cfg.restore_defaults_clicked.connect(self.cfg.set_defaults)
+        self.cfg.apply_clicked.connect(self._apply_odrive_config)
+        self.cfg.save_reboot_clicked.connect(self._save_odrive_config)
+        self.cfg.erase_reset_clicked.connect(self._erase_reset_odrive_config)
         self.cfg.export_json_clicked.connect(self._export_odrive_json)
 
         self.dlog.back_clicked.connect(self.on_back_home)
@@ -2560,7 +2946,7 @@ class AppController(QObject):
 
         self.worker_thread.start()
         self.request_connect.emit()
-        self.request_set_polled_tags.emit([TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM])
+        self.request_set_polled_tags.emit([TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM, TAG_TORQUE_NM])
 
         self._refresh_recipes()
         self._refresh_status_all()
@@ -2590,7 +2976,16 @@ class AppController(QObject):
         if (now_m - self._last_modal_error_mono) < self._modal_error_cooldown_s:
             return
         self._last_modal_error_mono = now_m
-        QMessageBox.critical(parent, title, msg)
+        box = QMessageBox(parent)
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle(title)
+        box.setText(str(msg))
+        try:
+            box.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        except Exception:
+            pass
+        box.setStandardButtons(QMessageBox.Ok)
+        box.exec()
 
     def _selected_recipe(self) -> Optional[Recipe]:
         if not self.selected_recipe_id:
@@ -2646,7 +3041,7 @@ class AppController(QObject):
     # ---- UI state persistence ----
 
     def _known_tags(self) -> List[str]:
-        return [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_VBUS_V, TAG_IBUS_A]
+        return [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_VBUS_V, TAG_IBUS_A]
 
     def _load_ui_state(self) -> None:
         if not self._ui_state_path.exists():
@@ -2817,8 +3212,30 @@ class AppController(QObject):
     def _on_config_applied(self, ok: bool, message: str, missing_obj: Any) -> None:
         missing = list(missing_obj or [])
         if ok:
-            QMessageBox.information(self.cfg, "Configuration", f"{message}\n\nUnsupported skipped: {len(missing)}")
+            self.cfg.set_loading("Applied (not saved)")
+            QMessageBox.information(self.cfg, "Configuration Applied", f"{message}\n\nUnsupported skipped: {len(missing)}")
+        else:
+            self._show_modal_error(self.cfg, "Configuration", message)
+
+    @Slot(bool, str, object)
+    def _on_config_saved(self, ok: bool, message: str, missing_obj: Any) -> None:
+        missing = list(missing_obj or [])
+        if ok:
+            QMessageBox.information(self.cfg, "Configuration Saved", f"{message}\n\nUnsupported skipped: {len(missing)}")
             self.on_back_home()
+        else:
+            self._show_modal_error(self.cfg, "Configuration", message)
+
+    @Slot(bool, str)
+    def _on_config_erased(self, ok: bool, message: str) -> None:
+        if ok:
+            self.cfg.set_defaults()
+            self.cfg.set_loading("Device erased (reconnecting) - form reset to project defaults")
+            QMessageBox.information(
+                self.cfg,
+                "Configuration Erased",
+                f"{message}\n\nThe form was reset to project defaults.\nReconnect and use 'Save & Reboot' to write these defaults to the device.",
+            )
         else:
             self._show_modal_error(self.cfg, "Configuration", message)
 
@@ -2841,7 +3258,7 @@ class AppController(QObject):
         values[TAG_CMD_RPM] = float(self._cmd_rpm)
 
         samples: List[Tuple[str, float, float, int]] = []
-        for tag in [TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM, TAG_PWR_W, TAG_CMD_RPM]:
+        for tag in [TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_PWR_W, TAG_CMD_RPM]:
             if tag in values and math.isfinite(values[tag]):
                 samples.append(
                     (
@@ -3014,7 +3431,7 @@ class AppController(QObject):
     # ---- ODrive Config actions ----
 
     def _refresh_odrive_config(self) -> None:
-        keys = [s.key for s in IMPORTANT_SETTINGS]
+        keys = [s.key for s in ODRIVE_CONFIG_FIELDS]
         self.cfg.set_loading("Loading from device…")
         if BACKEND == "real" and not self.connected:
             self.cfg.apply_values(DEFAULT_CONFIG_MAP, keys)
@@ -3023,12 +3440,39 @@ class AppController(QObject):
         self.request_read_config.emit(keys)
 
     @Slot(object)
+    def _apply_odrive_config(self, values_obj: Any) -> None:
+        if BACKEND == "real" and not self.connected:
+            QMessageBox.critical(self.cfg, "Configuration", "Cannot apply: ODrive is not connected.")
+            return
+        self.cfg.set_loading("Applying config (not saved)...")
+        self.request_apply_config.emit(dict(values_obj or {}))
+
+    @Slot(object)
     def _save_odrive_config(self, values_obj: Any) -> None:
         if BACKEND == "real" and not self.connected:
             QMessageBox.critical(self.cfg, "Configuration", "Cannot save: ODrive is not connected.")
             return
-        self.cfg.set_loading("Applying & saving config (device will reboot)…")
-        self.request_apply_config.emit(dict(values_obj or {}))
+        self.cfg.set_loading("Saving config (device will reboot)...")
+        self.request_save_config.emit(dict(values_obj or {}))
+
+    @Slot()
+    def _erase_reset_odrive_config(self) -> None:
+        self.cfg.set_defaults()
+        if BACKEND == "real" and not self.connected:
+            self.cfg.set_loading("Defaults restored (not applied) - connect ODrive to erase/reset")
+            return
+        ans = QMessageBox.warning(
+            self.cfg,
+            "Erase Configuration",
+            "This will erase the ODrive configuration and reboot the device.\n\nContinue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            self.cfg.set_loading("Erase canceled - form reset to defaults (not applied)")
+            return
+        self.cfg.set_loading("Erasing configuration (device will reboot)...")
+        self.request_erase_config.emit()
 
     @Slot()
     def _export_odrive_json(self) -> None:
@@ -3148,8 +3592,10 @@ def compute_ui_scale(app: QApplication) -> float:
 
 
 def apply_style(app: QApplication) -> None:
-    base_font = QFont()
-    base_font.setPointSize(max(10, int(round(12 * UI_SCALE))))
+    # Use pixel sizing here to avoid Qt point-size conversion warnings on some
+    # Windows/Qt builds where inherited fonts report pointSize == -1.
+    base_font = QFont(app.font())
+    base_font.setPixelSize(max(14, ui(20)))
     app.setFont(base_font)
 
     # Scale stylesheet px sizes so fixed-size window remains comfortably touch-friendly at OS scaling (e.g., 125%).
