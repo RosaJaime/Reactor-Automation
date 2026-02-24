@@ -9,17 +9,13 @@ Backends:
   - BACKEND = "real" (default)
   - BACKEND = "sim"  (available for testing)
 
-Real backend (open-loop LOCKIN_SPIN):
+Real backend (closed-loop velocity control):
   - UI uses RPM; backend converts to turns/s = rpm / 60
-  - On EVERY velocity change:
-      axis.config.general_lockin.vel = turns/s
-      axis.requested_state = AxisState.LOCKIN_SPIN
-    (firmware latches vel only on re-entry)
+  - Backend writes `axis.controller.input_vel` and requests `AxisState.CLOSED_LOOP_CONTROL`
   - connect() applies a safe baseline once:
-      IDLE, disable startup calibrations and closed-loop flags (when present),
-      conservative current limits, and a general_lockin profile (current/ramp_time/ramp_distance/accel,
-      finish_* False if available)
-  - stop() transitions to IDLE
+      IDLE, disable startup flags (when present), conservative current limits,
+      and velocity-control controller settings when available
+  - stop() zeros velocity command and transitions to IDLE
   - Backend methods do not sleep; timing is handled by the QTimer-driven run engine
 
 Screens:
@@ -366,6 +362,8 @@ class OdriveInterface:
     def is_connected(self) -> bool: raise NotImplementedError
     def set_velocity_rpm(self, rpm: float) -> None: raise NotImplementedError
     def stop(self) -> None: raise NotImplementedError
+    def is_calibrated(self) -> Tuple[bool, str]: raise NotImplementedError
+    def calibrate(self) -> Tuple[bool, str]: raise NotImplementedError
     def get_state(self) -> str: raise NotImplementedError
     def read_config(self, keys: List[str]) -> Tuple[Dict[str, Any], List[str]]: raise NotImplementedError
     def apply_config(self, values: Dict[str, Any]) -> Tuple[bool, str, List[str]]: raise NotImplementedError
@@ -401,6 +399,13 @@ class SimulatedOdrive(OdriveInterface):
     def stop(self) -> None:
         self._target_rpm = 0.0
         self._state = "Idle"
+
+    def is_calibrated(self) -> Tuple[bool, str]:
+        return True, "Simulation backend"
+
+    def calibrate(self) -> Tuple[bool, str]:
+        self._state = "Idle"
+        return True, "Simulation calibration complete"
 
     def get_state(self) -> str:
         return self._state
@@ -468,7 +473,7 @@ class RealOdrive(OdriveInterface):
     def connect(self) -> bool:
         try:
             import odrive
-            from odrive.enums import AxisState
+            from odrive.enums import AxisState, ControlMode, InputMode
 
             self._AxisState = AxisState
             self._state = "Connecting..."
@@ -500,25 +505,21 @@ class RealOdrive(OdriveInterface):
             except Exception:
                 pass
 
-            gl = self._axis.config.general_lockin
-            for name, val in (
-                ("current", 2.0),
-                ("ramp_time", 1.0),
-                ("ramp_distance", 1.0),
-                ("accel", 10.0),
-            ):
-                try:
-                    setattr(gl, name, val)
-                except Exception:
-                    pass
-            for name, val in (("finish_on_vel", False), ("finish_on_distance", False), ("vel", 0.0)):
-                try:
-                    setattr(gl, name, val)
-                except Exception:
-                    pass
+            try:
+                self._axis.controller.config.control_mode = ControlMode.VELOCITY_CONTROL
+            except Exception:
+                pass
+            try:
+                self._axis.controller.config.input_mode = InputMode.VEL_RAMP
+            except Exception:
+                pass
+            try:
+                self._axis.controller.input_vel = 0.0
+            except Exception:
+                pass
 
             self._connected = True
-            self._state = "Idle (LOCKIN ready)"
+            self._state = "Idle (velocity ready)"
             return True
         except Exception:
             self._mark_disconnected("Disconnected (reconnecting)")
@@ -535,10 +536,9 @@ class RealOdrive(OdriveInterface):
             self.stop()
             return
         turns_per_s = rpm / 60.0
-        gl = self._axis.config.general_lockin
-        gl.vel = float(turns_per_s)
-        self._axis.requested_state = self._AxisState.LOCKIN_SPIN
-        self._state = f"LOCKIN_SPIN ({rpm:.0f} rpm)"
+        self._axis.controller.input_vel = float(turns_per_s)
+        self._axis.requested_state = self._AxisState.CLOSED_LOOP_CONTROL
+        self._state = f"CLOSED_LOOP_CONTROL ({rpm:.0f} rpm)"
 
     def stop(self) -> None:
         if not self._connected or self._axis is None or self._AxisState is None:
@@ -546,12 +546,76 @@ class RealOdrive(OdriveInterface):
             return
         try:
             try:
-                self._axis.config.general_lockin.vel = 0.0
+                self._axis.controller.input_vel = 0.0
             except Exception:
                 pass
             self._axis.requested_state = self._AxisState.IDLE
         finally:
             self._state = "Idle"
+
+    def _calibration_status(self) -> Tuple[bool, str]:
+        if not self._connected or self._axis is None:
+            raise RuntimeError("ODrive not connected")
+
+        motor_ok = False
+        try:
+            motor_ok = bool(getattr(self._axis.motor, "is_calibrated"))
+        except Exception:
+            motor_ok = False
+
+        encoder_ready = True
+        try:
+            encoder_ready = bool(getattr(self._axis.encoder, "is_ready"))
+        except Exception:
+            # Some firmware variants expose calibration state differently; motor calibration is the minimum gate.
+            encoder_ready = True
+
+        if motor_ok and encoder_ready:
+            return True, "Motor calibrated"
+        if not motor_ok and not encoder_ready:
+            return False, "Motor and encoder are not calibrated"
+        if not motor_ok:
+            return False, "Motor is not calibrated"
+        return False, "Encoder is not calibrated"
+
+    def is_calibrated(self) -> Tuple[bool, str]:
+        return self._calibration_status()
+
+    def calibrate(self) -> Tuple[bool, str]:
+        if not self._connected or self._axis is None or self._AxisState is None:
+            raise RuntimeError("ODrive not connected")
+
+        if not hasattr(self._AxisState, "FULL_CALIBRATION_SEQUENCE"):
+            return False, "FULL_CALIBRATION_SEQUENCE is not available on this ODrive firmware"
+
+        self._state = "Calibrating..."
+        try:
+            try:
+                self._axis.controller.input_vel = 0.0
+            except Exception:
+                pass
+            self._axis.requested_state = self._AxisState.IDLE
+            self._axis.requested_state = self._AxisState.FULL_CALIBRATION_SEQUENCE
+
+            deadline = time.monotonic() + 90.0
+            while time.monotonic() < deadline:
+                try:
+                    cur = getattr(self._axis, "current_state")
+                    if int(cur) == int(self._AxisState.IDLE):
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.1)
+            else:
+                self._state = "Idle"
+                return False, "Calibration timed out"
+
+            ok, msg = self._calibration_status()
+            self._state = "Idle (velocity ready)" if ok else "Idle (not calibrated)"
+            return ok, ("Calibration complete" if ok else f"Calibration incomplete: {msg}")
+        except Exception as e:
+            self._state = "Idle"
+            raise RuntimeError(f"Calibration failed: {e}")
 
     def get_state(self) -> str:
         return self._state
@@ -643,6 +707,8 @@ class OdriveWorker(QObject):
     config_applied = Signal(bool, str, object)    # ok, message, missing list
     export_json_done = Signal(bool, str)          # ok, path/message
     tags_sample = Signal(int, object)             # ts, dict
+    calibration_checked = Signal(bool, str)       # calibrated, detail
+    calibration_done = Signal(bool, str)          # calibrated, detail
 
     def __init__(self, backend: OdriveInterface) -> None:
         super().__init__()
@@ -782,6 +848,38 @@ class OdriveWorker(QObject):
                 self._mark_disconnected("Disconnected (reconnecting)")
             else:
                 self.error.emit(f"Stop failed: {e}")
+
+    @Slot()
+    def check_calibration(self) -> None:
+        if not self._backend.is_connected():
+            self.calibration_checked.emit(False, "ODrive not connected")
+            return
+        try:
+            calibrated, detail = self._backend.is_calibrated()
+            self.calibration_checked.emit(bool(calibrated), str(detail))
+        except Exception as e:
+            if self._is_disconnect_error(e):
+                self._mark_disconnected("Disconnected (reconnecting)")
+                self.calibration_checked.emit(False, "Disconnected (reconnecting)")
+            else:
+                self.error.emit(f"Calibration check failed: {e}")
+                self.calibration_checked.emit(False, str(e))
+
+    @Slot()
+    def run_calibration(self) -> None:
+        if not self._backend.is_connected():
+            self.calibration_done.emit(False, "ODrive not connected")
+            return
+        try:
+            calibrated, detail = self._backend.calibrate()
+            self._emit_state(self._backend.get_state())
+            self.calibration_done.emit(bool(calibrated), str(detail))
+        except Exception as e:
+            if self._is_disconnect_error(e):
+                self._mark_disconnected("Disconnected (reconnecting)")
+                self.calibration_done.emit(False, "Disconnected (reconnecting)")
+            else:
+                self.calibration_done.emit(False, str(e))
 
     @Slot(object)
     def read_config(self, keys: List[str]) -> None:
@@ -1372,6 +1470,8 @@ class StartStopFooter(QWidget):
         self.btn_stop = TouchButton("Stop", min_h=76, min_w=240)
         self.btn_start.setObjectName("StartButton")
         self.btn_stop.setObjectName("StopButton")
+        self._running = False
+        self._motor_controls_enabled = True
 
         bottom.addWidget(self.btn_start, 1)
         bottom.addWidget(self.btn_stop, 1)
@@ -1380,8 +1480,16 @@ class StartStopFooter(QWidget):
         self.btn_stop.clicked.connect(self.stop_clicked.emit)
 
     def set_running_ui(self, running: bool) -> None:
-        self.btn_start.setEnabled(not running)
-        self.btn_stop.setEnabled(running)
+        self._running = bool(running)
+        self._apply_enable_state()
+
+    def set_motor_controls_enabled(self, enabled: bool) -> None:
+        self._motor_controls_enabled = bool(enabled)
+        self._apply_enable_state()
+
+    def _apply_enable_state(self) -> None:
+        self.btn_start.setEnabled((not self._running) and self._motor_controls_enabled)
+        self.btn_stop.setEnabled(self._running and self._motor_controls_enabled)
 
 
 # ----------------------------
@@ -2149,8 +2257,9 @@ class DataLoggerScreen(QWidget):
     def set_status(self, ui_state: str, rpm: float, remaining_s: int, recipe_name: str, step_info: str, backend: str) -> None:
         self.status.set_status(ui_state, rpm, remaining_s, recipe_name, step_info, backend)
 
-    def set_running_ui(self, running: bool) -> None:
+    def set_running_ui(self, running: bool, motor_controls_enabled: bool = True) -> None:
         self.footer.set_running_ui(running)
+        self.footer.set_motor_controls_enabled(motor_controls_enabled)
 
     def minutes_window(self) -> int:
         try:
@@ -2195,6 +2304,7 @@ class DataLoggerScreen(QWidget):
 class HomeScreen(QWidget):
     start_clicked = Signal()
     stop_clicked = Signal()
+    calibrate_clicked = Signal()
     open_builder_clicked = Signal()
     recipe_select_clicked = Signal(str)
     recipe_edit_clicked = Signal(str)
@@ -2220,9 +2330,11 @@ class HomeScreen(QWidget):
         self.btn_builder = TouchButton("Recipe Builder", min_h=70, min_w=240)
         self.btn_config = TouchButton("ODrive Configuration", min_h=70, min_w=240)
         self.btn_datalogger = TouchButton("Data Logger", min_h=70, min_w=240)
+        self.btn_calibrate = TouchButton("Calibrate Motor", min_h=70, min_w=240)
 
         left.addWidget(self.rpm_ctl)
         left.addWidget(self.time_ctl)
+        left.addWidget(self.btn_calibrate)
         left.addWidget(self.btn_builder)
         left.addWidget(self.btn_config)
         left.addWidget(self.btn_datalogger)
@@ -2254,6 +2366,7 @@ class HomeScreen(QWidget):
 
         self.footer.start_clicked.connect(self.start_clicked.emit)
         self.footer.stop_clicked.connect(self.stop_clicked.emit)
+        self.btn_calibrate.clicked.connect(self.calibrate_clicked.emit)
         self.btn_builder.clicked.connect(self.open_builder_clicked.emit)
         self.btn_config.clicked.connect(self.open_config_clicked.emit)
         self.btn_datalogger.clicked.connect(self.open_datalogger_clicked.emit)
@@ -2275,7 +2388,16 @@ class HomeScreen(QWidget):
     def set_status(self, ui_state: str, rpm: float, remaining_s: int, recipe_name: str, step_info: str, backend: str) -> None:
         self.status_bar.set_status(ui_state, rpm, remaining_s, recipe_name, step_info, backend)
 
-    def set_running_ui(self, running: bool, run_mode: str, recipe_selected: bool) -> None:
+    def set_running_ui(
+        self,
+        running: bool,
+        run_mode: str,
+        recipe_selected: bool,
+        motor_controls_enabled: bool,
+        connected: bool,
+        calibrated: bool,
+        calibrating: bool,
+    ) -> None:
         """
         Home-screen behaviors:
           - Start disabled while running
@@ -2288,17 +2410,20 @@ class HomeScreen(QWidget):
           - While running SINGLE mode: timer text disabled, +/- enabled (adjusts remaining)
         """
         self.footer.set_running_ui(running)
-        self.rpm_ctl.set_enabled(True)
+        self.footer.set_motor_controls_enabled(motor_controls_enabled)
+        self.rpm_ctl.set_enabled(motor_controls_enabled)
 
         if running:
             if run_mode == "single":
-                self.time_ctl.set_buttons_enabled(True)
+                self.time_ctl.set_buttons_enabled(motor_controls_enabled)
                 self.time_ctl.set_edit_enabled(False)
             else:
                 self.time_ctl.set_enabled(False)
         else:
             self.time_ctl.set_enabled(not recipe_selected)
 
+        self.btn_calibrate.setEnabled((not running) and connected and (not calibrating))
+        self.btn_calibrate.setText("Calibrating..." if calibrating else ("Recalibrate Motor" if calibrated else "Calibrate Motor"))
         self.btn_builder.setEnabled(not running)
         self.btn_config.setEnabled(not running)
         self.btn_datalogger.setEnabled(True)
@@ -2311,6 +2436,8 @@ class HomeScreen(QWidget):
 
 class AppController(QObject):
     request_connect = Signal()
+    request_check_calibration = Signal()
+    request_run_calibration = Signal()
     request_read_config = Signal(object)          # list[str]
     request_apply_config = Signal(object)         # dict
     request_export_json = Signal()
@@ -2328,6 +2455,9 @@ class AppController(QObject):
 
         self.connected = False
         self.backend_state = "Disconnected"
+        self.motor_calibrated = (BACKEND != "real")
+        self.calibration_detail = "Unknown"
+        self._calibration_busy = False
 
         self._ui_state = "Idle"
         self._ui_rpm = 0.0
@@ -2352,6 +2482,8 @@ class AppController(QObject):
         self.engine.request_stop.connect(self.worker.stop)
 
         self.request_connect.connect(self.worker.connect_backend)
+        self.request_check_calibration.connect(self.worker.check_calibration)
+        self.request_run_calibration.connect(self.worker.run_calibration)
         self.request_read_config.connect(self.worker.read_config)
         self.request_apply_config.connect(self.worker.apply_config)
         self.request_export_json.connect(self.worker.export_json)
@@ -2367,6 +2499,8 @@ class AppController(QObject):
         self.worker.config_applied.connect(self._on_config_applied)
         self.worker.export_json_done.connect(self._on_export_json_done)
         self.worker.tags_sample.connect(self._on_tags_sample)
+        self.worker.calibration_checked.connect(self._on_calibration_checked)
+        self.worker.calibration_done.connect(self._on_calibration_done)
 
         self.engine.status_changed.connect(lambda s: self._set_ui(status=s))
         self.engine.run_mode_changed.connect(lambda m: setattr(self, "_run_mode", m))
@@ -2376,6 +2510,7 @@ class AppController(QObject):
 
         self.home.start_clicked.connect(self.on_start)
         self.home.stop_clicked.connect(self.on_stop)
+        self.home.calibrate_clicked.connect(self.on_calibrate)
         self.home.open_builder_clicked.connect(self.on_open_builder_new)
         self.home.recipe_select_clicked.connect(self.on_select_recipe)
         self.home.recipe_edit_clicked.connect(self.on_edit_recipe)
@@ -2477,14 +2612,23 @@ class AppController(QObject):
     def _apply_controls(self) -> None:
         r_selected = self._selected_recipe() is not None
         running = self.engine.is_running()
+        motor_controls_enabled = bool(self.connected and self.motor_calibrated and (not self._calibration_busy))
 
         if running and self._run_mode == "single" and not r_selected:
             self.home.time_ctl.set_adjust_callback(self._adjust_time_from_home)
         else:
             self.home.time_ctl.set_adjust_callback(None)
 
-        self.home.set_running_ui(running=running, run_mode=self._run_mode, recipe_selected=r_selected)
-        self.dlog.set_running_ui(running=running)
+        self.home.set_running_ui(
+            running=running,
+            run_mode=self._run_mode,
+            recipe_selected=r_selected,
+            motor_controls_enabled=motor_controls_enabled,
+            connected=self.connected,
+            calibrated=self.motor_calibrated,
+            calibrating=self._calibration_busy,
+        )
+        self.dlog.set_running_ui(running=running, motor_controls_enabled=motor_controls_enabled)
 
     def _adjust_time_from_home(self, delta_s: int) -> None:
         if self._run_mode != "single":
@@ -2613,10 +2757,17 @@ class AppController(QObject):
         self.backend_state = state
 
         if connected:
+            self._calibration_busy = False
+            self.motor_calibrated = False if BACKEND == "real" else True
+            self.calibration_detail = "Checking calibration..."
             self.request_start_poll.emit()
+            self.request_check_calibration.emit()
             if self.stack.currentWidget() is self.cfg:
                 self._refresh_odrive_config()
         else:
+            self._calibration_busy = False
+            self.motor_calibrated = False if BACKEND == "real" else True
+            self.calibration_detail = "Disconnected"
             self.request_stop_poll.emit()
             if self.engine.is_running():
                 self.engine.stop(user_initiated=True)
@@ -2633,11 +2784,29 @@ class AppController(QObject):
 
     @Slot(str)
     def _on_worker_error(self, msg: str) -> None:
+        self._calibration_busy = False
         if self.engine.is_running():
             self.engine.stop(user_initiated=True)
         self._show_modal_error(self.stack.currentWidget(), "ODrive Error", msg)
         self._refresh_status_all()
         self._apply_controls()
+
+    @Slot(bool, str)
+    def _on_calibration_checked(self, calibrated: bool, detail: str) -> None:
+        self.motor_calibrated = bool(calibrated)
+        self.calibration_detail = str(detail)
+        self._apply_controls()
+
+    @Slot(bool, str)
+    def _on_calibration_done(self, calibrated: bool, detail: str) -> None:
+        self._calibration_busy = False
+        self.motor_calibrated = bool(calibrated)
+        self.calibration_detail = str(detail)
+        self._apply_controls()
+        if calibrated:
+            QMessageBox.information(self.home, "Calibration", detail)
+        else:
+            self._show_modal_error(self.home, "Calibration", detail)
 
     @Slot(object, object)
     def _on_config_read(self, values_obj: Any, missing_obj: Any) -> None:
@@ -2749,6 +2918,9 @@ class AppController(QObject):
         if BACKEND == "real" and not self.connected:
             QMessageBox.critical(self.home, "ODrive Not Connected", "Cannot start: ODrive is not connected.")
             return
+        if BACKEND == "real" and not self.motor_calibrated:
+            QMessageBox.warning(self.home, "Calibration Required", "Cannot start: calibrate the motor before starting.")
+            return
 
         rpm = clamp(self.home.rpm_ctl.value(), VEL_MIN_RPM, VEL_MAX_RPM)
         recipe = self._selected_recipe()
@@ -2768,6 +2940,19 @@ class AppController(QObject):
     @Slot()
     def on_stop(self) -> None:
         self.engine.stop(user_initiated=True)
+
+    @Slot()
+    def on_calibrate(self) -> None:
+        if self.engine.is_running() or self._calibration_busy:
+            return
+        if BACKEND == "real" and not self.connected:
+            QMessageBox.critical(self.home, "ODrive Not Connected", "Cannot calibrate: ODrive is not connected.")
+            return
+        self._calibration_busy = True
+        self.motor_calibrated = False if BACKEND == "real" else self.motor_calibrated
+        self.calibration_detail = "Calibrating..."
+        self._apply_controls()
+        self.request_run_calibration.emit()
 
     @Slot()
     def on_open_builder_new(self) -> None:
