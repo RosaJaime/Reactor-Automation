@@ -2538,6 +2538,14 @@ class StepRow(QFrame):
         header = QHBoxLayout()
         header.setSpacing(ui(10))
 
+        self.drag_handle = QLabel("☰")
+        self.drag_handle.setObjectName("StepIndex")
+        self.drag_handle.setMinimumWidth(ui(42))
+        self.drag_handle.setAlignment(Qt.AlignCenter)
+        self.drag_handle.setCursor(Qt.OpenHandCursor)
+        self.drag_handle.installEventFilter(self)
+        header.addWidget(self.drag_handle)
+
         self.lbl_num = QLabel(f"{index + 1}")
         self.lbl_num.setObjectName("StepIndex")
         self.lbl_num.setMinimumWidth(ui(36))
@@ -2655,16 +2663,31 @@ class StepRow(QFrame):
         self.name_edit.setVisible(not is_data)
 
     def mousePressEvent(self, event) -> None:
+        self._handle_drag_press_event(event)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        self._handle_drag_move_event(event)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._handle_drag_release_event(event)
+        super().mouseReleaseEvent(event)
+
+    def _handle_drag_press_event(self, event: Any) -> None:
         try:
             if event.button() == Qt.LeftButton:
+                try:
+                    self.drag_handle.setCursor(Qt.ClosedHandCursor)
+                except Exception:
+                    pass
                 self._drag_press_y = int(event.globalPosition().y())  # type: ignore[attr-defined]
                 self._dragging = False
         except Exception:
             self._drag_press_y = None
             self._dragging = False
-        super().mousePressEvent(event)
 
-    def mouseMoveEvent(self, event) -> None:
+    def _handle_drag_move_event(self, event: Any) -> None:
         try:
             if self._drag_press_y is not None and (event.buttons() & Qt.LeftButton):
                 gy = int(event.globalPosition().y())  # type: ignore[attr-defined]
@@ -2672,9 +2695,8 @@ class StepRow(QFrame):
                     self._dragging = True
         except Exception:
             pass
-        super().mouseMoveEvent(event)
 
-    def mouseReleaseEvent(self, event) -> None:
+    def _handle_drag_release_event(self, event: Any) -> None:
         try:
             if self._dragging and event.button() == Qt.LeftButton:
                 gy = int(event.globalPosition().y())  # type: ignore[attr-defined]
@@ -2683,10 +2705,23 @@ class StepRow(QFrame):
             pass
         self._drag_press_y = None
         self._dragging = False
-        super().mouseReleaseEvent(event)
+        try:
+            self.drag_handle.setCursor(Qt.OpenHandCursor)
+        except Exception:
+            pass
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         try:
+            if watched is self.drag_handle:
+                if event.type() == QEvent.MouseButtonPress:
+                    self._handle_drag_press_event(event)
+                    return True
+                if event.type() == QEvent.MouseMove:
+                    self._handle_drag_move_event(event)
+                    return True
+                if event.type() == QEvent.MouseButtonRelease:
+                    self._handle_drag_release_event(event)
+                    return True
             if watched in (self.name_edit, self.prompt_edit) and event.type() == QEvent.FocusIn:
                 self.text_field_focused.emit(watched)
         except Exception:
@@ -2718,8 +2753,6 @@ class RecipeBuilderScreen(QWidget):
         top.addWidget(self.btn_back)
         top.addWidget(self.title, 1)
         root.addLayout(top)
-        info_row = QHBoxLayout()
-        info_row.setSpacing(ui(10))
 
         name_row = QHBoxLayout()
         name_row.setSpacing(ui(12))
@@ -2791,7 +2824,10 @@ class RecipeBuilderScreen(QWidget):
         row.remove_clicked.connect(self._on_remove)
         row.drag_reorder_requested.connect(self._on_drag_reorder)
         row.text_field_focused.connect(self._on_step_text_field_focused)
-        self.steps_layout.insertWidget(self.steps_layout.count() - 1, row)
+        # Keep the extra spacer below the final step (for keyboard room),
+        # while preserving the stretch as the last layout item.
+        insert_idx = max(0, self.steps_layout.count() - 2)
+        self.steps_layout.insertWidget(insert_idx, row)
 
     def _reindex(self) -> None:
         for i, r in enumerate(self._rows()):
@@ -3000,6 +3036,7 @@ class SettingRowWidget(QFrame):
         root.addWidget(self.lbl, 2)
         root.addWidget(self.editor, 1)
         root.addWidget(self.note, 1)
+        self.editor.installEventFilter(self)
 
     def set_value(self, value: Any) -> None:
         self.note.setText("")
@@ -3079,6 +3116,16 @@ class SettingRowWidget(QFrame):
         except Exception:
             return float(self.spec.default)
 
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        try:
+            if watched is self.editor and event.type() == QEvent.Wheel:
+                # Prevent accidental value edits while scrolling the config page.
+                event.ignore()
+                return True
+        except Exception:
+            pass
+        return super().eventFilter(watched, event)
+
 
 class ODriveConfigScreen(QWidget):
     back_clicked = Signal()
@@ -3094,6 +3141,7 @@ class ODriveConfigScreen(QWidget):
         super().__init__()
         self._rows: Dict[str, SettingRowWidget] = {}
         self._motor_presets: Dict[str, Dict[str, Any]] = dict(ODRIVE_MOTOR_PRESETS)
+        self._loaded_values_snapshot: Dict[str, Any] = {}
         self._search_last_query = ""
         self._search_match_keys: List[str] = []
         self._search_match_idx = -1
@@ -3239,16 +3287,67 @@ class ODriveConfigScreen(QWidget):
             else:
                 row.set_value(DEFAULT_CONFIG_MAP.get(key, row.spec.default))
             row.set_missing(key in missing_set)
+        self._loaded_values_snapshot = {
+            k: row.get_value()
+            for k, row in self._rows.items()
+            if row.editor.isEnabled()
+        }
         self.status.setText(f"Loaded with {len(missing)} unsupported field(s) skipped" if missing else "Loaded")
 
     def set_defaults(self) -> None:
         for key, row in self._rows.items():
             row.set_value(DEFAULT_CONFIG_MAP.get(key, row.spec.default))
             row.set_missing(False)
+        self._loaded_values_snapshot = {
+            k: row.get_value()
+            for k, row in self._rows.items()
+            if row.editor.isEnabled()
+        }
         self.status.setText("Defaults restored (not applied)")
 
     def gather_values(self) -> Dict[str, Any]:
         return {k: row.get_value() for k, row in self._rows.items() if row.editor.isEnabled()}
+
+    def changed_values(self, new_values: Dict[str, Any]) -> List[Tuple[SettingSpec, Any, Any]]:
+        out: List[Tuple[SettingSpec, Any, Any]] = []
+        baseline = dict(self._loaded_values_snapshot or {})
+        for spec in ODRIVE_CONFIG_FIELDS:
+            key = spec.key
+            if key not in new_values:
+                continue
+            before = baseline.get(key, self._rows[key].get_value() if key in self._rows else None)
+            after = new_values.get(key)
+            if self._values_equal(spec, before, after):
+                continue
+            out.append((spec, before, after))
+        return out
+
+    def _values_equal(self, spec: SettingSpec, a: Any, b: Any) -> bool:
+        try:
+            if spec.kind in ("bool", "protocol"):
+                return str(a) == str(b) if spec.kind == "protocol" else (bool(a) == bool(b))
+            if spec.kind == "int":
+                return int(a) == int(b)
+            return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-9)
+        except Exception:
+            return a == b
+
+    def format_value_for_display(self, spec: SettingSpec, value: Any) -> str:
+        try:
+            if spec.kind == "bool":
+                return "True" if bool(value) else "False"
+            if spec.kind == "protocol":
+                raw = str(value)
+                if raw.endswith(".NONE") or raw == "0":
+                    return "Disabled (NONE)"
+                if raw.endswith(".SIMPLE") or raw == "1":
+                    return "Simple"
+                return raw
+            if spec.kind == "int":
+                return str(int(value))
+            return f"{float(value):g}"
+        except Exception:
+            return str(value)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         try:
@@ -5764,10 +5863,22 @@ class AppController(QObject):
     def on_generate_current_recipe_report(self) -> None:
         run: Optional[Dict[str, Any]] = None
         if self._current_recipe_run_record is not None:
+            now_ts = int(epoch_s())
             run = dict(self._current_recipe_run_record)
-            run.setdefault("status", "running")
-            run.setdefault("started_ts", int(epoch_s()))
-            run["ended_ts"] = int(epoch_s())
+            if self._recipe_monitor_error_paused:
+                snapshot_status = "paused (ODrive error)"
+            elif self.engine.is_paused():
+                snapshot_status = "paused"
+            elif self._run_mode == "recipe" and self.engine.is_running():
+                snapshot_status = "running"
+            elif self._recipe_monitor_failed:
+                snapshot_status = "error"
+            else:
+                snapshot_status = str(run.get("status") or "running")
+            run["status"] = snapshot_status
+            run.setdefault("started_ts", now_ts)
+            # For an in-progress report, ended_ts is treated as a snapshot cutoff time.
+            run["ended_ts"] = now_ts
         else:
             runs = self.run_store.runs()
             if runs:
@@ -5935,26 +6046,62 @@ class AppController(QObject):
             return
         self.request_read_config.emit(keys)
 
+    def _confirm_odrive_config_write(self, action_label: str, values: Dict[str, Any]) -> bool:
+        changes = self.cfg.changed_values(values)
+        if not changes:
+            ans = QMessageBox.question(
+                self.cfg,
+                f"{action_label} Configuration",
+                f"No field changes detected.\n\nProceed with {action_label.lower()} anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            return ans == QMessageBox.Yes
+
+        lines: List[str] = []
+        for spec, before, after in changes:
+            lines.append(f"{spec.label} ({spec.key})")
+            lines.append(f"  Current: {self.cfg.format_value_for_display(spec, before)}")
+            lines.append(f"  New:     {self.cfg.format_value_for_display(spec, after)}")
+            lines.append("")
+        detail = "\n".join(lines).rstrip()
+        ans = QMessageBox.question(
+            self.cfg,
+            f"{action_label} Configuration",
+            f"The following fields will be changed:\n\n{detail}\n\nContinue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return ans == QMessageBox.Yes
+
     @Slot(object)
     def _apply_odrive_config(self, values_obj: Any) -> None:
         if BACKEND == "real" and not self.connected:
             QMessageBox.critical(self.cfg, "Configuration", "Cannot apply: ODrive is not connected.")
             return
-        self._last_cfg_apply_values = dict(values_obj or {})
+        values = dict(values_obj or {})
+        if not self._confirm_odrive_config_write("Apply", values):
+            self.cfg.set_loading("Apply canceled")
+            return
+        self._last_cfg_apply_values = dict(values)
         self._cfg_runtime_fault_popup_suppressed = True
         self._cfg_op_in_progress = "apply"
         self.cfg.set_loading("Applying config (not saved)...")
-        self.request_apply_config.emit(dict(values_obj or {}))
+        self.request_apply_config.emit(values)
 
     @Slot(object)
     def _save_odrive_config(self, values_obj: Any) -> None:
         if BACKEND == "real" and not self.connected:
             QMessageBox.critical(self.cfg, "Configuration", "Cannot save: ODrive is not connected.")
             return
+        values = dict(values_obj or {})
+        if not self._confirm_odrive_config_write("Save && Reboot", values):
+            self.cfg.set_loading("Save canceled")
+            return
         self._cfg_runtime_fault_popup_suppressed = True
         self._cfg_op_in_progress = "save/reboot"
         self.cfg.set_loading("Saving config (device will reboot)...")
-        self.request_save_config.emit(dict(values_obj or {}))
+        self.request_save_config.emit(values)
 
     @Slot()
     def _erase_reset_odrive_config(self) -> None:
