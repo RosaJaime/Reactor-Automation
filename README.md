@@ -55,6 +55,12 @@ Before starting a run, the app checks whether the motor/encoder are calibrated. 
 - `ODrive Configuration`
   - Read/apply a curated list of common ODrive settings
   - Export `get_json()` to file
+
+  <p>
+    <img src="Images/ODrive%20Configuration.png" alt="ODrive configuration screen" width="85%" />
+    <br />
+    <em>ODrive Configuration: common settings editor with search/filter, presets, and apply/save actions.</em>
+  </p>
 - `Data Logger`
   - Live trend plots (voltage/current/power/commanded RPM/estimated RPM)
   - CSV export

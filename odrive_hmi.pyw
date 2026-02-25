@@ -2097,6 +2097,11 @@ class RpmControl(QWidget):
         super().__init__()
         self.setObjectName("RpmControl")
         self._vmin, self._vmax, self._step = float(vmin), float(vmax), float(step)
+        self._hold_dir = 0
+        self._hold_started_t = 0.0
+        self._hold_timer = QTimer(self)
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.timeout.connect(self._hold_tick)
 
         min_h = ui(70 if not compact else 58)
         btn_w = ui(110 if not compact else 90)
@@ -2134,8 +2139,10 @@ class RpmControl(QWidget):
         row.addWidget(self.btn_plus)
         root.addLayout(row)
 
-        self.btn_minus.clicked.connect(lambda: self.set_value(self.value() - self._step))
-        self.btn_plus.clicked.connect(lambda: self.set_value(self.value() + self._step))
+        self.btn_minus.pressed.connect(lambda: self._begin_hold(-1))
+        self.btn_minus.released.connect(self._end_hold)
+        self.btn_plus.pressed.connect(lambda: self._begin_hold(+1))
+        self.btn_plus.released.connect(self._end_hold)
         self.edit.editingFinished.connect(self._emit_if_valid)
         self.edit.installEventFilter(self)
         self._emit_if_valid()
@@ -2163,9 +2170,54 @@ class RpmControl(QWidget):
         self.set_value(self.value(), emit_signal=False)
 
     def set_enabled(self, enabled: bool) -> None:
+        if not enabled:
+            self._end_hold()
         self.btn_minus.setEnabled(enabled)
         self.btn_plus.setEnabled(enabled)
         self.edit.setEnabled(enabled)
+
+    def _begin_hold(self, direction: int) -> None:
+        try:
+            if not self.isEnabled():
+                return
+            self._hold_dir = -1 if int(direction) < 0 else 1
+            self._hold_started_t = time.monotonic()
+            self._nudge(self._hold_dir)
+            # Initial delay keeps short taps as single-step changes.
+            self._hold_timer.start(450)
+        except Exception:
+            self._hold_dir = 0
+
+    @Slot()
+    def _end_hold(self) -> None:
+        self._hold_dir = 0
+        try:
+            self._hold_timer.stop()
+        except Exception:
+            pass
+
+    def _hold_interval_ms(self, held_s: float) -> int:
+        if held_s >= 6.0:
+            return 40
+        if held_s >= 4.0:
+            return 80
+        if held_s >= 2.5:
+            return 140
+        return 220
+
+    def _nudge(self, direction: int) -> None:
+        self.set_value(self.value() + (float(direction) * self._step))
+
+    @Slot()
+    def _hold_tick(self) -> None:
+        try:
+            if int(self._hold_dir) == 0:
+                return
+            held_s = max(0.0, float(time.monotonic() - self._hold_started_t))
+            self._nudge(int(self._hold_dir))
+            self._hold_timer.start(int(self._hold_interval_ms(held_s)))
+        except Exception:
+            self._end_hold()
 
     @Slot()
     def _emit_if_valid(self) -> None:
@@ -2189,6 +2241,11 @@ class TimeControl(QWidget):
         self.setObjectName("TimeControl")
         self._step_s = int(step_s)
         self._adjust_cb: Optional[Callable[[int], None]] = None
+        self._hold_dir = 0
+        self._hold_started_t = 0.0
+        self._hold_timer = QTimer(self)
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.timeout.connect(self._hold_tick)
 
         min_h = ui(70 if not compact else 58)
         btn_w = ui(110 if not compact else 90)
@@ -2226,8 +2283,10 @@ class TimeControl(QWidget):
         row.addWidget(self.btn_plus)
         root.addLayout(row)
 
-        self.btn_minus.clicked.connect(lambda: self._adjust(-self._step_s))
-        self.btn_plus.clicked.connect(lambda: self._adjust(+self._step_s))
+        self.btn_minus.pressed.connect(lambda: self._begin_hold(-1))
+        self.btn_minus.released.connect(self._end_hold)
+        self.btn_plus.pressed.connect(lambda: self._begin_hold(+1))
+        self.btn_plus.released.connect(self._end_hold)
         self.edit.editingFinished.connect(self._emit_if_valid)
         self.edit.installEventFilter(self)
         self._emit_if_valid()
@@ -2257,10 +2316,14 @@ class TimeControl(QWidget):
         self.set_seconds(int(s), emit_signal=emit_signal)
 
     def set_enabled(self, enabled: bool) -> None:
+        if not enabled:
+            self._end_hold()
         self.set_buttons_enabled(enabled)
         self.set_edit_enabled(enabled)
 
     def set_buttons_enabled(self, enabled: bool) -> None:
+        if not enabled:
+            self._end_hold()
         self.btn_minus.setEnabled(enabled)
         self.btn_plus.setEnabled(enabled)
 
@@ -2279,6 +2342,45 @@ class TimeControl(QWidget):
             self._adjust_cb(int(delta_s))
             return
         self.set_seconds(self.seconds() + int(delta_s), emit_signal=True)
+
+    def _begin_hold(self, direction: int) -> None:
+        try:
+            if not self.isEnabled():
+                return
+            self._hold_dir = -1 if int(direction) < 0 else 1
+            self._hold_started_t = time.monotonic()
+            self._adjust(int(self._hold_dir) * int(self._step_s))
+            self._hold_timer.start(450)
+        except Exception:
+            self._hold_dir = 0
+
+    @Slot()
+    def _end_hold(self) -> None:
+        self._hold_dir = 0
+        try:
+            self._hold_timer.stop()
+        except Exception:
+            pass
+
+    def _hold_interval_ms(self, held_s: float) -> int:
+        if held_s >= 6.0:
+            return 40
+        if held_s >= 4.0:
+            return 80
+        if held_s >= 2.5:
+            return 140
+        return 220
+
+    @Slot()
+    def _hold_tick(self) -> None:
+        try:
+            if int(self._hold_dir) == 0:
+                return
+            held_s = max(0.0, float(time.monotonic() - self._hold_started_t))
+            self._adjust(int(self._hold_dir) * int(self._step_s))
+            self._hold_timer.start(int(self._hold_interval_ms(held_s)))
+        except Exception:
+            self._end_hold()
 
     @Slot()
     def _emit_if_valid(self) -> None:
@@ -2616,6 +2718,8 @@ class RecipeBuilderScreen(QWidget):
         top.addWidget(self.btn_back)
         top.addWidget(self.title, 1)
         root.addLayout(top)
+        info_row = QHBoxLayout()
+        info_row.setSpacing(ui(10))
 
         name_row = QHBoxLayout()
         name_row.setSpacing(ui(12))
@@ -2999,36 +3103,45 @@ class ODriveConfigScreen(QWidget):
         root.setSpacing(ui(12))
 
         top = QHBoxLayout()
-        top.setSpacing(ui(12))
-        self.btn_back = TouchButton("Back", min_h=66, min_w=170)
+        top.setSpacing(ui(10))
+        self.btn_back = TouchButton("Back", min_h=66, min_w=150)
         self.title = QLabel("ODrive Configuration")
         self.title.setObjectName("ScreenTitle")
-        self.btn_refresh = TouchButton("Refresh", min_h=66, min_w=170)
-        self.btn_export = TouchButton("Export JSON", min_h=66, min_w=190)
-        self.btn_odrive_gui = TouchButton("ODrive GUI", min_h=66, min_w=170)
-        self.btn_clear_errors = TouchButton("Clear Errors", min_h=66, min_w=190)
+        self.title.setMinimumWidth(ui(260))
+        self.title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.btn_refresh = TouchButton("Refresh", min_h=66, min_w=150)
+        self.btn_export = TouchButton("Export JSON", min_h=66, min_w=170)
+        self.btn_odrive_gui = TouchButton("ODrive GUI", min_h=66, min_w=150)
+        self.btn_clear_errors = TouchButton("Clear Errors", min_h=66, min_w=170)
         self.edit_search = QLineEdit()
         self.edit_search.setMinimumHeight(ui(58))
         self.edit_search.setPlaceholderText("Search label or odrivetool property")
-        self._search_w_collapsed = ui(180)
+        self._search_w_collapsed = ui(170)
         self._search_w_expanded = ui(520)
         self.edit_search.setMinimumWidth(self._search_w_collapsed)
         self.edit_search.setMaximumWidth(self._search_w_collapsed)
         top.addWidget(self.btn_back)
         top.addWidget(self.title, 1)
+        top.addStretch(1)
         top.addWidget(self.edit_search)
         top.addWidget(self.btn_odrive_gui)
-        top.addWidget(self.btn_clear_errors)
-        top.addWidget(self.btn_refresh)
-        top.addWidget(self.btn_export)
         root.addLayout(top)
 
+        info_row = QHBoxLayout()
+        info_row.setSpacing(ui(10))
         self.status = QLabel("Loading…")
         self.status.setObjectName("InfoLabel")
-        root.addWidget(self.status)
+        self.status.setMinimumWidth(ui(180))
+        info_row.addWidget(self.status)
         self.watchdog_status = QLabel("Watchdog: Unknown")
         self.watchdog_status.setObjectName("InfoLabel")
-        root.addWidget(self.watchdog_status)
+        self.watchdog_status.setMinimumWidth(ui(220))
+        info_row.addWidget(self.watchdog_status)
+        info_row.addStretch(1)
+        info_row.addWidget(self.btn_clear_errors)
+        info_row.addWidget(self.btn_refresh)
+        info_row.addWidget(self.btn_export)
+        root.addLayout(info_row)
 
         preset_row = QHBoxLayout()
         preset_row.setSpacing(ui(12))
