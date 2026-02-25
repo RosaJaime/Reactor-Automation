@@ -3035,14 +3035,49 @@ class ODriveConfigScreen(QWidget):
         try:
             self.edit_search.setMinimumWidth(w)
             self.edit_search.setMaximumWidth(w)
+            if expanded:
+                # Keep the expanded search bar visible above adjacent top-row buttons.
+                self.edit_search.raise_()
+                self.btn_search.raise_()
         except Exception:
             pass
 
     @Slot(str)
     def _on_search_text_edited(self, _text: str) -> None:
-        self._search_last_query = ""
-        self._search_match_keys = []
+        self._apply_search_filter(live=True)
+
+    def _apply_search_filter(self, live: bool = False) -> None:
+        query = str(self.edit_search.text() or "").strip().lower()
+        if not query:
+            self._search_last_query = ""
+            self._search_match_keys = []
+            self._search_match_idx = -1
+            for row in self._rows.values():
+                row.setVisible(True)
+            if live:
+                self.status.setText("Loaded")
+            return
+
+        self._search_last_query = query
         self._search_match_idx = -1
+        self._search_match_keys = [
+            spec.key
+            for spec in ODRIVE_CONFIG_FIELDS
+            if (query in str(spec.label).lower()) or (query in str(spec.key).lower())
+        ]
+        match_set = set(self._search_match_keys)
+        for key, row in self._rows.items():
+            row.setVisible(key in match_set)
+
+        if not self._search_match_keys:
+            self.status.setText(f"No config fields match '{query}'")
+            return
+
+        first_key = self._search_match_keys[0]
+        row = self._rows.get(first_key)
+        if row is not None:
+            QTimer.singleShot(0, lambda r=row: self._scroll_row_near_top(r))
+        self.status.setText(f"{len(self._search_match_keys)} match(es) for '{query}'")
 
     @Slot()
     def _on_search_trigger(self) -> None:
@@ -3052,13 +3087,7 @@ class ODriveConfigScreen(QWidget):
             return
 
         if query != self._search_last_query:
-            self._search_last_query = query
-            self._search_match_idx = -1
-            self._search_match_keys = [
-                spec.key
-                for spec in ODRIVE_CONFIG_FIELDS
-                if (query in str(spec.label).lower()) or (query in str(spec.key).lower())
-            ]
+            self._apply_search_filter(live=False)
 
         if not self._search_match_keys:
             self.status.setText(f"No config fields match '{query}'")
