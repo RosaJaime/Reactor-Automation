@@ -2418,12 +2418,14 @@ class RecipeCard(QFrame):
 
 class StepRow(QFrame):
     remove_clicked = Signal(int)
-    move_up_clicked = Signal(int)
-    move_down_clicked = Signal(int)
+    drag_reorder_requested = Signal(int, int)  # from_idx, drop_global_y
+    text_field_focused = Signal(object)  # QWidget
 
     def __init__(self, index: int, step: Step) -> None:
         super().__init__()
         self._index = index
+        self._drag_press_y: Optional[int] = None
+        self._dragging = False
         self.setObjectName("StepRow")
         self.setFrameShape(QFrame.StyledPanel)
 
@@ -2450,24 +2452,17 @@ class StepRow(QFrame):
         self.kind_combo.addItem("Data Entry", "data_entry")
         header.addWidget(self.kind_combo)
 
-        btn_h, btn_w = ui(54), ui(120)
-        self.btn_up = TouchButton("Up", min_h=btn_h, min_w=btn_w)
-        self.btn_down = TouchButton("Down", min_h=btn_h, min_w=btn_w)
-        self.btn_remove = TouchButton("Remove", min_h=btn_h, min_w=btn_w)
-        header.addWidget(self.btn_up)
-        header.addWidget(self.btn_down)
-        header.addWidget(self.btn_remove)
-        root.addLayout(header)
-
         self.name_edit = QLineEdit()
         self.name_edit.setMinimumHeight(ui(54))
         self.name_edit.setPlaceholderText(f"Step {index + 1}")
         self.name_edit.setText(str(step.name or f"Step {index + 1}"))
+        self.name_edit.installEventFilter(self)
+        header.addWidget(self.name_edit, 2)
 
-        name_row = QHBoxLayout()
-        name_row.setSpacing(ui(12))
-        name_row.addWidget(self.name_edit, 1)
-        root.addLayout(name_row)
+        btn_h, btn_w = ui(54), ui(120)
+        self.btn_remove = TouchButton("Remove", min_h=btn_h, min_w=btn_w)
+        header.addWidget(self.btn_remove)
+        root.addLayout(header)
 
         self.motor_controls = QWidget()
         controls = QHBoxLayout(self.motor_controls)
@@ -2493,6 +2488,7 @@ class StepRow(QFrame):
         self.prompt_edit.setMinimumHeight(ui(54))
         self.prompt_edit.setPlaceholderText("Prompt (shown during run)")
         self.prompt_edit.setText(str(step.prompt or ""))
+        self.prompt_edit.installEventFilter(self)
         self.response_combo = QComboBox()
         self.response_combo.setMinimumHeight(ui(54))
         self.response_combo.addItem("Text", "text")
@@ -2507,9 +2503,9 @@ class StepRow(QFrame):
         root.addWidget(self.data_controls)
 
         self.btn_remove.clicked.connect(lambda: self.remove_clicked.emit(self._index))
-        self.btn_up.clicked.connect(lambda: self.move_up_clicked.emit(self._index))
-        self.btn_down.clicked.connect(lambda: self.move_down_clicked.emit(self._index))
         self.kind_combo.currentIndexChanged.connect(self._refresh_kind_ui)
+        self.vel.edit_focused.connect(lambda: self.text_field_focused.emit(self.vel.edit))
+        self.tim.edit_focused.connect(lambda: self.text_field_focused.emit(self.tim.edit))
 
         kind = str(getattr(step, "kind", "motor") or "motor")
         self.kind_combo.setCurrentIndex(1 if kind == "data_entry" else 0)
@@ -2531,12 +2527,13 @@ class StepRow(QFrame):
         name = self.name_edit.text().strip() or f"Step {self._index + 1}"
         kind = str(self.kind_combo.currentData() or "motor")
         if kind == "data_entry":
+            prompt_txt = self.prompt_edit.text().strip()
             return Step(
                 velocity_rpm=0.0,
                 duration_s=0,
-                name=name,
+                name=prompt_txt or name,
                 kind="data_entry",
-                prompt=self.prompt_edit.text().strip(),
+                prompt=prompt_txt,
                 response_kind=str(self.response_combo.currentData() or "text"),
                 allow_skip=bool(self.chk_allow_skip.isChecked()),
             )
@@ -2553,6 +2550,46 @@ class StepRow(QFrame):
         is_data = str(self.kind_combo.currentData() or "motor") == "data_entry"
         self.motor_controls.setVisible(not is_data)
         self.data_controls.setVisible(is_data)
+        self.name_edit.setVisible(not is_data)
+
+    def mousePressEvent(self, event) -> None:
+        try:
+            if event.button() == Qt.LeftButton:
+                self._drag_press_y = int(event.globalPosition().y())  # type: ignore[attr-defined]
+                self._dragging = False
+        except Exception:
+            self._drag_press_y = None
+            self._dragging = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        try:
+            if self._drag_press_y is not None and (event.buttons() & Qt.LeftButton):
+                gy = int(event.globalPosition().y())  # type: ignore[attr-defined]
+                if abs(gy - int(self._drag_press_y)) >= QApplication.startDragDistance():
+                    self._dragging = True
+        except Exception:
+            pass
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        try:
+            if self._dragging and event.button() == Qt.LeftButton:
+                gy = int(event.globalPosition().y())  # type: ignore[attr-defined]
+                self.drag_reorder_requested.emit(int(self._index), int(gy))
+        except Exception:
+            pass
+        self._drag_press_y = None
+        self._dragging = False
+        super().mouseReleaseEvent(event)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        try:
+            if watched in (self.name_edit, self.prompt_edit) and event.type() == QEvent.FocusIn:
+                self.text_field_focused.emit(watched)
+        except Exception:
+            pass
+        return super().eventFilter(watched, event)
 
 
 class RecipeBuilderScreen(QWidget):
@@ -2600,6 +2637,9 @@ class RecipeBuilderScreen(QWidget):
         self.steps_layout = QVBoxLayout(self.steps_container)
         self.steps_layout.setContentsMargins(0, 0, 0, 0)
         self.steps_layout.setSpacing(ui(10))
+        self._steps_bottom_spacer = QWidget()
+        self._steps_bottom_spacer.setFixedHeight(ui(280))
+        self.steps_layout.addWidget(self._steps_bottom_spacer)
         self.steps_layout.addStretch(1)
         self.steps_area.setWidget(self.steps_container)
         root.addWidget(self.steps_area, 1)
@@ -2629,26 +2669,24 @@ class RecipeBuilderScreen(QWidget):
 
     def _rows(self) -> List[StepRow]:
         rows: List[StepRow] = []
-        for i in range(self.steps_layout.count() - 1):
+        for i in range(self.steps_layout.count()):
             w = self.steps_layout.itemAt(i).widget()
             if isinstance(w, StepRow):
                 rows.append(w)
         return rows
 
     def _clear_rows(self) -> None:
-        while self.steps_layout.count() > 1:
-            item = self.steps_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
+        for row in self._rows():
+            self.steps_layout.removeWidget(row)
+            row.deleteLater()
 
     def _add_row(self, step: Step) -> None:
         idx = len(self._rows())
         row = StepRow(idx, step)
         row.vel.set_range(VEL_MIN_RPM, self._vel_max_rpm)
         row.remove_clicked.connect(self._on_remove)
-        row.move_up_clicked.connect(self._on_move_up)
-        row.move_down_clicked.connect(self._on_move_down)
+        row.drag_reorder_requested.connect(self._on_drag_reorder)
+        row.text_field_focused.connect(self._on_step_text_field_focused)
         self.steps_layout.insertWidget(self.steps_layout.count() - 1, row)
 
     def _reindex(self) -> None:
@@ -2696,26 +2734,27 @@ class RecipeBuilderScreen(QWidget):
         self.steps_layout.takeAt(idx)
         self._reindex()
 
-    @Slot(int)
-    def _on_move_up(self, idx: int) -> None:
-        if idx <= 0:
-            return
+    @Slot(int, int)
+    def _on_drag_reorder(self, from_idx: int, drop_global_y: int) -> None:
         rows = self._rows()
-        if idx >= len(rows):
+        if not (0 <= int(from_idx) < len(rows)):
             return
-        w = rows[idx]
-        self.steps_layout.removeWidget(w)
-        self.steps_layout.insertWidget(idx - 1, w)
-        self._reindex()
-
-    @Slot(int)
-    def _on_move_down(self, idx: int) -> None:
-        rows = self._rows()
-        if not (0 <= idx < len(rows) - 1):
+        target_idx = int(from_idx)
+        best_dist = None
+        for i, row in enumerate(rows):
+            try:
+                cy = int(row.mapToGlobal(row.rect().center()).y())
+            except Exception:
+                continue
+            dist = abs(int(drop_global_y) - cy)
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                target_idx = i
+        if target_idx == int(from_idx):
             return
-        w = rows[idx]
+        w = rows[int(from_idx)]
         self.steps_layout.removeWidget(w)
-        self.steps_layout.insertWidget(idx + 1, w)
+        self.steps_layout.insertWidget(int(target_idx), w)
         self._reindex()
 
     @Slot()
@@ -2737,6 +2776,24 @@ class RecipeBuilderScreen(QWidget):
         if not self._editing_id:
             return
         self.delete_clicked.emit(str(self._editing_id))
+
+    @Slot(object)
+    def _on_step_text_field_focused(self, widget: object) -> None:
+        try:
+            if not isinstance(widget, QWidget):
+                return
+            QTimer.singleShot(0, lambda w=widget: self._scroll_widget_near_top(w))
+        except Exception:
+            pass
+
+    def _scroll_widget_near_top(self, widget: QWidget) -> None:
+        try:
+            sb = self.steps_area.verticalScrollBar()
+            top_margin = ui(90)
+            y = int(widget.mapTo(self.steps_container, widget.rect().topLeft()).y())
+            sb.setValue(max(0, y - top_margin))
+        except Exception:
+            pass
 
     def _build_recipe_from_form(self) -> Optional[Recipe]:
         name = self.name_edit.text().strip()
@@ -3045,6 +3102,12 @@ class ODriveConfigScreen(QWidget):
         self.edit_search.returnPressed.connect(self._on_search_trigger)
         self.edit_search.textEdited.connect(self._on_search_text_edited)
         self.edit_search.installEventFilter(self)
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self)
+        except Exception:
+            pass
         self.cmb_motor_preset.currentIndexChanged.connect(self._on_motor_preset_changed)
         self.btn_apply_hmi_max_vel.clicked.connect(self._emit_hmi_max_velocity)
         self.edit_hmi_max_vel.editingFinished.connect(self._emit_hmi_max_velocity)
@@ -3076,6 +3139,17 @@ class ODriveConfigScreen(QWidget):
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         try:
+            if (
+                self.isVisible()
+                and event.type() == QEvent.MouseButtonPress
+                and self.edit_search.hasFocus()
+                and watched is not self.edit_search
+                and isinstance(watched, QWidget)
+            ):
+                # Clicking any other widget on the config screen should collapse
+                # the expanded search box, even if the target is non-focusable.
+                if (watched is self) or self.isAncestorOf(watched):
+                    self.edit_search.clearFocus()
             if watched is self.edit_search:
                 if event.type() == QEvent.FocusIn:
                     self._set_search_expanded(True)
@@ -5170,6 +5244,7 @@ class AppController(QObject):
             dlg.setWindowTitle(f"Recipe Data Entry ({int(step_idx)+1}/{int(total_steps)})")
             dlg.setModal(True)
             dlg.setMinimumWidth(ui(700))
+            dlg.setWindowFlag(Qt.WindowCloseButtonHint, False)
 
             root = QVBoxLayout(dlg)
             root.setContentsMargins(ui(16), ui(16), ui(16), ui(16))
@@ -5249,21 +5324,9 @@ class AppController(QObject):
             action = str(result.get("action", "cancel"))
             if action == "cancel":
                 if allow_skip:
-                    # Treat closing/cancel as skip when skipping is allowed.
                     action = "skip"
                 else:
-                    ans = QMessageBox.question(
-                        parent,
-                        "Data Entry Required",
-                        "This step requires a response.\n\nRetry entry or stop the run?",
-                        QMessageBox.Retry | QMessageBox.Abort,
-                        QMessageBox.Retry,
-                    )
-                    if ans == QMessageBox.Retry:
-                        continue
-                    self._recipe_run_audit(f"Step {int(step_idx)+1} data entry aborted by user")
-                    self.on_stop()
-                    return
+                    continue
 
             if action == "skip":
                 self._recipe_run_audit(f"Step {int(step_idx)+1} data entry skipped: {prompt}")
