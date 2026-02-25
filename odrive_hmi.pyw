@@ -44,6 +44,7 @@ import sqlite3
 import sys
 import time
 import uuid
+import webbrowser
 from dataclasses import dataclass, asdict, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -75,6 +76,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -351,6 +353,15 @@ class RecipeStore:
                 return
         self._recipes.append(recipe)
         self.save()
+
+    def delete(self, recipe_id: str) -> bool:
+        rid = str(recipe_id)
+        old_n = len(self._recipes)
+        self._recipes = [r for r in self._recipes if str(r.id) != rid]
+        changed = len(self._recipes) != old_n
+        if changed:
+            self.save()
+        return bool(changed)
 
     @staticmethod
     def _seed() -> List[Recipe]:
@@ -1785,6 +1796,31 @@ class RunEngine(QObject):
             self._timer.start()
         self._tick()
 
+    @Slot()
+    def skip_current_recipe_step(self) -> None:
+        if self._mode != "recipe" or self._recipe is None:
+            return
+        if self._waiting_data_entry:
+            self.continue_after_data_entry()
+            return
+        now = time.monotonic()
+        self._step_idx += 1
+        if self._step_idx >= len(self._recipe.steps):
+            self.request_stop.emit()
+            self._set_mode("idle")
+            self._active_rpm = 0.0
+            self.active_rpm_changed.emit(0.0)
+            self.remaining_changed.emit(0)
+            self.step_info_changed.emit("")
+            self._set_status("Idle")
+            self._timer.stop()
+            return
+        self._recipe_override_rpm = None
+        self._start_current_step(now)
+        if not self._timer.isActive() and not self._paused:
+            self._timer.start()
+        self._tick()
+
     @Slot(float)
     def override_rpm(self, rpm: float) -> None:
         """
@@ -2398,6 +2434,12 @@ class StepRow(QFrame):
         header = QHBoxLayout()
         header.setSpacing(ui(10))
 
+        self.lbl_num = QLabel(f"{index + 1}")
+        self.lbl_num.setObjectName("StepIndex")
+        self.lbl_num.setMinimumWidth(ui(36))
+        self.lbl_num.setAlignment(Qt.AlignCenter)
+        header.addWidget(self.lbl_num)
+
         self.lbl = QLabel(f"Step {index + 1}")
         self.lbl.setObjectName("StepIndex")
         header.addWidget(self.lbl, 1)
@@ -2437,6 +2479,10 @@ class StepRow(QFrame):
         self.tim.set_seconds(int(step.duration_s), emit_signal=False)
         controls.addWidget(self.vel, 1)
         controls.addWidget(self.tim, 1)
+        self.chk_motor_allow_skip = QCheckBox("Allow skip")
+        self.chk_motor_allow_skip.setMinimumHeight(ui(54))
+        self.chk_motor_allow_skip.setChecked(bool(getattr(step, "allow_skip", True)))
+        controls.addWidget(self.chk_motor_allow_skip)
         root.addWidget(self.motor_controls)
 
         self.data_controls = QWidget()
@@ -2476,6 +2522,7 @@ class StepRow(QFrame):
 
     def set_index(self, idx: int) -> None:
         self._index = idx
+        self.lbl_num.setText(f"{idx + 1}")
         self.lbl.setText(f"Step {idx + 1}")
         if not self.name_edit.text().strip() or self.name_edit.text().startswith("Step "):
             self.name_edit.setPlaceholderText(f"Step {idx + 1}")
@@ -2498,7 +2545,7 @@ class StepRow(QFrame):
             duration_s=int(self.tim.seconds()),
             name=name,
             kind="motor",
-            allow_skip=True,
+            allow_skip=bool(self.chk_motor_allow_skip.isChecked()),
         )
 
     @Slot()
@@ -2512,6 +2559,8 @@ class RecipeBuilderScreen(QWidget):
     back_clicked = Signal()
     cancel_clicked = Signal()
     save_clicked = Signal(Recipe)
+    export_clicked = Signal(Recipe)
+    delete_clicked = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -2558,9 +2607,14 @@ class RecipeBuilderScreen(QWidget):
         actions = QHBoxLayout()
         actions.setSpacing(ui(12))
         self.btn_add = TouchButton("Add Step", min_h=66, min_w=220)
+        self.btn_export = TouchButton("Export JSON", min_h=66, min_w=220)
+        self.btn_delete = TouchButton("Delete Recipe", min_h=66, min_w=220)
+        self.btn_delete.setObjectName("StopButton")
         self.btn_cancel = TouchButton("Cancel", min_h=66, min_w=220)
         self.btn_save = TouchButton("Save", min_h=66, min_w=220)
         actions.addWidget(self.btn_add, 1)
+        actions.addWidget(self.btn_export, 1)
+        actions.addWidget(self.btn_delete, 1)
         actions.addWidget(self.btn_cancel, 1)
         actions.addWidget(self.btn_save, 1)
         root.addLayout(actions)
@@ -2568,7 +2622,10 @@ class RecipeBuilderScreen(QWidget):
         self.btn_back.clicked.connect(self.back_clicked.emit)
         self.btn_cancel.clicked.connect(self.cancel_clicked.emit)
         self.btn_add.clicked.connect(self._on_add_step)
+        self.btn_export.clicked.connect(self._on_export)
+        self.btn_delete.clicked.connect(self._on_delete)
         self.btn_save.clicked.connect(self._on_save)
+        self.btn_delete.setEnabled(False)
 
     def _rows(self) -> List[StepRow]:
         rows: List[StepRow] = []
@@ -2604,12 +2661,14 @@ class RecipeBuilderScreen(QWidget):
             self._editing_id = None
             self.title.setText("Recipe Builder (New)")
             self.name_edit.setText("")
+            self.btn_delete.setEnabled(False)
             self._add_row(Step(name="Run Name", kind="data_entry", prompt="Run name", response_kind="text", allow_skip=True))
             self._add_row(Step(120.0, 60, "Step 2", kind="motor"))
             return
         self._editing_id = recipe.id
         self.title.setText("Recipe Builder (Edit)")
         self.name_edit.setText(recipe.name)
+        self.btn_delete.setEnabled(True)
         for s in recipe.steps:
             self._add_row(
                 Step(
@@ -2661,6 +2720,25 @@ class RecipeBuilderScreen(QWidget):
 
     @Slot()
     def _on_save(self) -> None:
+        recipe = self._build_recipe_from_form()
+        if recipe is None:
+            return
+        self.save_clicked.emit(recipe)
+
+    @Slot()
+    def _on_export(self) -> None:
+        recipe = self._build_recipe_from_form()
+        if recipe is None:
+            return
+        self.export_clicked.emit(recipe)
+
+    @Slot()
+    def _on_delete(self) -> None:
+        if not self._editing_id:
+            return
+        self.delete_clicked.emit(str(self._editing_id))
+
+    def _build_recipe_from_form(self) -> Optional[Recipe]:
         name = self.name_edit.text().strip()
         steps = [r.get_step() for r in self._rows()]
 
@@ -2687,7 +2765,7 @@ class RecipeBuilderScreen(QWidget):
                     return
 
         rid = self._editing_id or str(uuid.uuid4())
-        self.save_clicked.emit(Recipe(id=rid, name=name, steps=steps))
+        return Recipe(id=rid, name=name, steps=steps)
 
     def set_velocity_limit(self, vmax_rpm: float) -> None:
         self._vel_max_rpm = float(clamp(float(vmax_rpm), VEL_MIN_RPM, VEL_MAX_RPM))
@@ -2870,6 +2948,7 @@ class ODriveConfigScreen(QWidget):
         self.title.setObjectName("ScreenTitle")
         self.btn_refresh = TouchButton("Refresh", min_h=66, min_w=170)
         self.btn_export = TouchButton("Export JSON", min_h=66, min_w=190)
+        self.btn_odrive_gui = TouchButton("ODrive GUI", min_h=66, min_w=170)
         self.btn_clear_errors = TouchButton("Clear Errors", min_h=66, min_w=190)
         self.edit_search = QLineEdit()
         self.edit_search.setMinimumHeight(ui(58))
@@ -2881,6 +2960,7 @@ class ODriveConfigScreen(QWidget):
         top.addWidget(self.btn_back)
         top.addWidget(self.title, 1)
         top.addWidget(self.edit_search)
+        top.addWidget(self.btn_odrive_gui)
         top.addWidget(self.btn_clear_errors)
         top.addWidget(self.btn_refresh)
         top.addWidget(self.btn_export)
@@ -2961,6 +3041,7 @@ class ODriveConfigScreen(QWidget):
         self.btn_clear_errors.clicked.connect(self.clear_errors_clicked.emit)
         self.btn_refresh.clicked.connect(self.request_refresh.emit)
         self.btn_export.clicked.connect(self.export_json_clicked.emit)
+        self.btn_odrive_gui.clicked.connect(self._open_odrive_gui)
         self.edit_search.returnPressed.connect(self._on_search_trigger)
         self.edit_search.textEdited.connect(self._on_search_text_edited)
         self.edit_search.installEventFilter(self)
@@ -3094,6 +3175,16 @@ class ODriveConfigScreen(QWidget):
         self.status.setText(
             f"Search {self._search_match_idx + 1}/{len(self._search_match_keys)}: {row.spec.label} [{row.spec.key}]"
         )
+
+    @Slot()
+    def _open_odrive_gui(self) -> None:
+        url = "https://gui.odriverobotics.com/configuration"
+        try:
+            ok = bool(webbrowser.open(url))
+        except Exception:
+            ok = False
+        if not ok:
+            self.status.setText(f"Failed to open browser: {url}")
 
     def set_hmi_max_velocity(self, rpm: float, emit_signal: bool = False) -> None:
         rpm = float(clamp(float(rpm), VEL_MIN_RPM, VEL_MAX_RPM))
@@ -3391,18 +3482,32 @@ class QtChartsPlot(QWidget):
 
     def _attach_series_axes(self, series: QLineSeries, tag: str) -> None:
         try:
-            series.attachAxis(self._x)
+            attached = list(series.attachedAxes())
+        except Exception:
+            attached = []
+        try:
+            if self._x not in attached:
+                series.attachAxis(self._x)
         except Exception:
             pass
         for axis in self._y_axes.values():
             try:
-                series.detachAxis(axis)
+                if axis in attached:
+                    series.detachAxis(axis)
             except Exception:
                 pass
         grp = self._axis_group_for_tag(tag)
         axis = self._y_axes.get(grp)
         if axis is not None:
-            series.attachAxis(axis)
+            try:
+                attached_after = list(series.attachedAxes())
+            except Exception:
+                attached_after = []
+            try:
+                if axis not in attached_after:
+                    series.attachAxis(axis)
+            except Exception:
+                pass
 
     def set_series_data(self, data: Dict[str, List[Tuple[int, float]]], tags: List[str], minutes: int) -> None:
         self._minutes = int(minutes)
@@ -3654,10 +3759,13 @@ class DataLoggerScreen(QWidget):
 # ----------------------------
 
 class RecipeRunStepBox(QFrame):
+    skip_clicked = Signal(int)
+
     def __init__(self, index: int, step: Step) -> None:
         super().__init__()
         self._index = int(index)
         self._base_duration = int(max(0, step.duration_s))
+        self._can_skip = bool(getattr(step, "allow_skip", True) and (not is_data_entry_step(step)))
         self.setObjectName("RecipeRunStepBox")
         self.setProperty("status", "pending")
         self.setFrameShape(QFrame.StyledPanel)
@@ -3675,11 +3783,15 @@ class RecipeRunStepBox(QFrame):
         self.lbl_error = QLabel("")
         self.lbl_error.setObjectName("InfoLabel")
         self.lbl_error.setWordWrap(True)
+        self.btn_skip = TouchButton("Skip", min_h=58, min_w=140)
+        self.btn_skip.setVisible(False)
+        self.btn_skip.clicked.connect(lambda: self.skip_clicked.emit(self._index))
 
         root.addWidget(self.lbl_title)
         root.addWidget(self.lbl_meta)
         root.addWidget(self.lbl_status)
         root.addWidget(self.lbl_error)
+        root.addWidget(self.btn_skip, 0, Qt.AlignLeft)
 
     def set_state(self, status: str, remaining_s: Optional[int] = None, error_text: str = "") -> None:
         status = str(status)
@@ -3696,12 +3808,20 @@ class RecipeRunStepBox(QFrame):
         else:
             self.lbl_status.setText("Pending")
         self.lbl_error.setText(str(error_text or ""))
+        self.btn_skip.setVisible(bool(status == "running" and self._can_skip))
+
+    def hide_skip(self) -> None:
+        self.btn_skip.setVisible(False)
+
+    def can_skip(self) -> bool:
+        return bool(self._can_skip)
 
 
 class RecipeRunMonitorScreen(QWidget):
     back_clicked = Signal()
     stop_clicked = Signal()
     pause_resume_clicked = Signal()
+    skip_step_clicked = Signal(int)
     tags_changed = Signal(object)  # list[str]
     generate_report_clicked = Signal()
 
@@ -3801,6 +3921,7 @@ class RecipeRunMonitorScreen(QWidget):
         self._step_boxes = []
         for i, step in enumerate(recipe.steps):
             box = RecipeRunStepBox(i, step)
+            box.skip_clicked.connect(self.skip_step_clicked.emit)
             self._step_boxes.append(box)
             self.steps_layout.insertWidget(self.steps_layout.count() - 1, box)
 
@@ -3813,6 +3934,8 @@ class RecipeRunMonitorScreen(QWidget):
         for i, box in enumerate(self._step_boxes):
             if i == idx:
                 box.set_state("running", remaining_s=int(remaining_s))
+            else:
+                box.hide_skip()
         if 0 <= idx < len(self._step_boxes):
             self.steps_area.ensureWidgetVisible(self._step_boxes[idx])
 
@@ -3899,6 +4022,7 @@ class HomeScreen(QWidget):
     calibrate_clicked = Signal()
     open_settings_clicked = Signal()
     open_builder_clicked = Signal()
+    import_recipe_clicked = Signal()
     recipe_select_clicked = Signal(str)
     recipe_edit_clicked = Signal(str)
     open_datalogger_clicked = Signal()
@@ -3959,8 +4083,13 @@ class HomeScreen(QWidget):
         self.recipes_layout.addStretch(1)
         self.recipes_area.setWidget(self.recipes_container)
         recipes_col.addWidget(self.recipes_area, 1)
-        self.btn_add_recipe = TouchButton("+ New Recipe", min_h=66, min_w=240)
-        recipes_col.addWidget(self.btn_add_recipe)
+        import_row = QHBoxLayout()
+        import_row.setSpacing(ui(10))
+        self.btn_import_recipe = TouchButton("Import JSON", min_h=66, min_w=220)
+        self.btn_add_recipe = TouchButton("+ New Recipe", min_h=66, min_w=220)
+        import_row.addWidget(self.btn_import_recipe, 1)
+        import_row.addWidget(self.btn_add_recipe, 1)
+        recipes_col.addLayout(import_row)
 
         mid.addLayout(recipes_col, 2)
         root.addLayout(mid, 1)
@@ -3975,6 +4104,7 @@ class HomeScreen(QWidget):
         self.btn_datalogger.clicked.connect(self.open_datalogger_clicked.emit)
         self.btn_recipe_run.clicked.connect(self.open_recipe_run_clicked.emit)
         self.btn_previous_runs.clicked.connect(self.open_previous_runs_clicked.emit)
+        self.btn_import_recipe.clicked.connect(self.import_recipe_clicked.emit)
         self.btn_add_recipe.clicked.connect(self.open_builder_clicked.emit)
 
     def set_recipe_cards(self, recipes: List[Recipe], selected_id: Optional[str]) -> None:
@@ -4045,6 +4175,7 @@ class HomeScreen(QWidget):
         self.btn_datalogger.setEnabled(True)
         self.btn_recipe_run.setEnabled(bool(recipe_run_active))
         self.btn_previous_runs.setEnabled(not running)
+        self.btn_import_recipe.setEnabled(not running)
         self.btn_add_recipe.setEnabled(not running)
         self.recipes_area.setEnabled(not running)
 
@@ -4123,6 +4254,9 @@ class AppController(QObject):
         self._recipe_resume_after_clear_error = False
         self._recipe_monitor_plot_tags: List[str] = [TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM]
         self._current_recipe_run_record: Optional[Dict[str, Any]] = None
+        self._cfg_runtime_fault_popup_suppressed = False
+        self._cfg_op_in_progress = ""
+        self._last_cfg_apply_values: Dict[str, Any] = {}
 
         self.history_db = HistoryDB(app_config_dir() / "history.sqlite")
 
@@ -4178,6 +4312,7 @@ class AppController(QObject):
         self.home.calibrate_clicked.connect(self.on_calibrate)
         self.home.open_settings_clicked.connect(self.on_open_settings)
         self.home.open_builder_clicked.connect(self.on_open_builder_new)
+        self.home.import_recipe_clicked.connect(self.on_import_recipe)
         self.home.recipe_select_clicked.connect(self.on_select_recipe)
         self.home.recipe_edit_clicked.connect(self.on_edit_recipe)
         self.home.open_datalogger_clicked.connect(self.on_open_datalogger)
@@ -4192,6 +4327,8 @@ class AppController(QObject):
         self.builder.back_clicked.connect(self.on_back_home)
         self.builder.cancel_clicked.connect(self.on_back_home)
         self.builder.save_clicked.connect(self.on_builder_save)
+        self.builder.export_clicked.connect(self.on_builder_export)
+        self.builder.delete_clicked.connect(self.on_builder_delete)
 
         self.settings.back_clicked.connect(self.on_back_home)
         self.settings.open_hmi_clicked.connect(self.on_open_hmi_settings)
@@ -4201,6 +4338,7 @@ class AppController(QObject):
         self.recipe_run.back_clicked.connect(self.on_back_home)
         self.recipe_run.stop_clicked.connect(self.on_stop)
         self.recipe_run.pause_resume_clicked.connect(self.on_recipe_pause_resume)
+        self.recipe_run.skip_step_clicked.connect(self.on_recipe_skip_step)
         self.recipe_run.tags_changed.connect(self._on_recipe_run_tags_changed)
         self.recipe_run.generate_report_clicked.connect(self.on_generate_current_recipe_report)
         self.hmi_settings.fullscreen_changed.connect(self.on_hmi_fullscreen_changed)
@@ -4547,6 +4685,11 @@ class AppController(QObject):
     @Slot(str)
     def _on_worker_error(self, msg: str) -> None:
         msg = str(msg or "")
+        if self._cfg_runtime_fault_popup_suppressed and msg.lower().startswith("odrive runtime fault:"):
+            # Config apply/save/erase can transiently report INVALID_STATE while writes succeed.
+            if self.stack.currentWidget() is self.cfg:
+                self.cfg.set_loading(f"Config op in progress ({self._cfg_op_in_progress or 'odrive'}): transient runtime fault suppressed")
+            return
         self._calibration_busy = False
         if self._run_mode == "recipe" and self._recipe_monitor_recipe is not None:
             self._recipe_monitor_error_paused = True
@@ -4844,24 +4987,39 @@ class AppController(QObject):
 
     @Slot(bool, str, object)
     def _on_config_applied(self, ok: bool, message: str, missing_obj: Any) -> None:
-        missing = list(missing_obj or [])
+        self._cfg_runtime_fault_popup_suppressed = False
+        self._cfg_op_in_progress = ""
+        _missing = list(missing_obj or [])
         if ok:
             self.cfg.set_loading("Applied (not saved)")
-            QMessageBox.information(self.cfg, "Configuration Applied", f"{message}\n\nUnsupported skipped: {len(missing)}")
+            ans = QMessageBox.question(
+                self.cfg,
+                "Configuration Applied",
+                f"{message}\n\nSave to ODrive and reboot now?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if ans == QMessageBox.Yes:
+                values = dict(self._last_cfg_apply_values or self.cfg.gather_values())
+                self._save_odrive_config(values)
         else:
             self._show_modal_error(self.cfg, "Configuration", message)
 
     @Slot(bool, str, object)
     def _on_config_saved(self, ok: bool, message: str, missing_obj: Any) -> None:
-        missing = list(missing_obj or [])
+        self._cfg_runtime_fault_popup_suppressed = False
+        self._cfg_op_in_progress = ""
+        _missing = list(missing_obj or [])
         if ok:
-            QMessageBox.information(self.cfg, "Configuration Saved", f"{message}\n\nUnsupported skipped: {len(missing)}")
+            QMessageBox.information(self.cfg, "Configuration Saved", str(message))
             self.on_back_home()
         else:
             self._show_modal_error(self.cfg, "Configuration", message)
 
     @Slot(bool, str)
     def _on_config_erased(self, ok: bool, message: str) -> None:
+        self._cfg_runtime_fault_popup_suppressed = False
+        self._cfg_op_in_progress = ""
         if ok:
             self.cfg.set_defaults()
             self.cfg.set_loading("Device erased (reconnecting) - form reset to project defaults")
@@ -5045,7 +5203,7 @@ class AppController(QObject):
                 editor = edit
                 root.addWidget(edit)
 
-            buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+            buttons = QDialogButtonBox()
             btn_submit = buttons.addButton("Submit", QDialogButtonBox.AcceptRole)
             btn_submit.setMinimumHeight(ui(58))
             btn_skip = None
@@ -5083,7 +5241,6 @@ class AppController(QObject):
                 dlg.accept()
 
             buttons.accepted.connect(on_accept)
-            buttons.rejected.connect(dlg.reject)
             if btn_skip is not None:
                 btn_skip.clicked.connect(lambda: (result.update({"action": "skip", "value": None}), dlg.accept()))
 
@@ -5257,6 +5414,25 @@ class AppController(QObject):
             self.engine.pause()
         self._refresh_status_all()
         self._apply_controls()
+
+    @Slot(int)
+    def on_recipe_skip_step(self, step_idx: int) -> None:
+        if self._run_mode != "recipe" or self._recipe_monitor_recipe is None:
+            return
+        if self.engine.is_paused():
+            return
+        if int(step_idx) != int(self._recipe_monitor_step_idx):
+            return
+        try:
+            step = self._recipe_monitor_recipe.steps[int(step_idx)]
+        except Exception:
+            return
+        if is_data_entry_step(step):
+            return
+        if not bool(getattr(step, "allow_skip", True)):
+            return
+        self._recipe_run_audit(f"Step {int(step_idx)+1} skipped by user")
+        self.engine.skip_current_recipe_step()
 
     @Slot()
     def on_calibrate(self) -> None:
@@ -5461,6 +5637,117 @@ class AppController(QObject):
         self.on_back_home()
         self._schedule_ui_state_save()
 
+    @Slot(Recipe)
+    def on_builder_export(self, recipe: Recipe) -> None:
+        try:
+            safe_name = "".join(ch if (ch.isalnum() or ch in (" ", "-", "_")) else "_" for ch in str(recipe.name or "recipe"))
+            safe_name = "_".join(safe_name.strip().split()) or "recipe"
+            out = downloads_dir() / f"recipe_{safe_name}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+            payload = {
+                "export_kind": "recipe",
+                "recipe": {
+                    "id": str(recipe.id),
+                    "name": str(recipe.name),
+                    "steps": [asdict(s) for s in recipe.steps],
+                },
+            }
+            out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            QMessageBox.information(self.builder, "Recipe Export", f"Saved:\n{out}")
+        except Exception as e:
+            self._show_modal_error(self.builder, "Recipe Export", f"Failed to export recipe:\n{e}")
+
+    @Slot(str)
+    def on_builder_delete(self, recipe_id: str) -> None:
+        rid = str(recipe_id or "").strip()
+        if not rid:
+            return
+        recipe = next((r for r in self.store.recipes() if str(r.id) == rid), None)
+        if recipe is None:
+            self._show_modal_error(self.builder, "Delete Recipe", "Recipe not found.")
+            return
+        ans = QMessageBox.warning(
+            self.builder,
+            "Delete Recipe",
+            f"Delete recipe '{recipe.name}'?\n\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+        if not self.store.delete(rid):
+            self._show_modal_error(self.builder, "Delete Recipe", "Recipe could not be deleted.")
+            return
+        if self.selected_recipe_id == rid:
+            self.selected_recipe_id = None
+        self._refresh_recipes()
+        self._refresh_status_all()
+        self._apply_controls()
+        self._schedule_ui_state_save()
+        QMessageBox.information(self.home, "Delete Recipe", f"Deleted recipe:\n{recipe.name}")
+        self.on_back_home()
+
+    @Slot()
+    def on_import_recipe(self) -> None:
+        if self.engine.is_running():
+            return
+        try:
+            path, _flt = QFileDialog.getOpenFileName(
+                self.home,
+                "Import Recipe JSON",
+                str(downloads_dir()),
+                "JSON Files (*.json);;All Files (*)",
+            )
+        except Exception as e:
+            self._show_modal_error(self.home, "Import Recipe", f"Failed to open file picker:\n{e}")
+            return
+        if not path:
+            return
+        try:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+            rj = dict(raw.get("recipe")) if isinstance(raw, dict) and isinstance(raw.get("recipe"), dict) else dict(raw)
+            name = str(rj.get("name") or "").strip()
+            if not name:
+                raise ValueError("Recipe name is missing")
+            steps_in = list(rj.get("steps") or [])
+            if not steps_in:
+                raise ValueError("Recipe has no steps")
+            steps: List[Step] = []
+            for i, s in enumerate(steps_in, start=1):
+                if not isinstance(s, dict):
+                    raise ValueError(f"Step {i} is not an object")
+                kind = str(s.get("kind") or "motor")
+                step = Step(
+                    velocity_rpm=float(s.get("velocity_rpm", 0.0)),
+                    duration_s=int(s.get("duration_s", 0)),
+                    name=str(s.get("name") or f"Step {i}"),
+                    kind=kind,
+                    prompt=str(s.get("prompt") or ""),
+                    response_kind=str(s.get("response_kind") or "text"),
+                    allow_skip=bool(s.get("allow_skip", True)),
+                )
+                if is_data_entry_step(step):
+                    if not step.prompt.strip():
+                        raise ValueError(f"Step {i}: data entry prompt is required")
+                else:
+                    if int(step.duration_s) <= 0:
+                        raise ValueError(f"Step {i}: duration must be > 0")
+                steps.append(step)
+
+            imported_id = str(rj.get("id") or uuid.uuid4())
+            existing_ids = {r.id for r in self.store.recipes()}
+            if imported_id in existing_ids:
+                imported_id = str(uuid.uuid4())
+            recipe = Recipe(id=imported_id, name=name, steps=steps)
+            self.store.upsert(recipe)
+            self.selected_recipe_id = recipe.id
+            self._refresh_recipes()
+            self._refresh_status_all()
+            self._apply_controls()
+            self._schedule_ui_state_save()
+            QMessageBox.information(self.home, "Import Recipe", f"Imported recipe:\n{recipe.name}")
+        except Exception as e:
+            self._show_modal_error(self.home, "Import Recipe", f"Failed to import recipe:\n{e}")
+
     # ---- ODrive Config actions ----
 
     def _refresh_odrive_config(self) -> None:
@@ -5477,6 +5764,9 @@ class AppController(QObject):
         if BACKEND == "real" and not self.connected:
             QMessageBox.critical(self.cfg, "Configuration", "Cannot apply: ODrive is not connected.")
             return
+        self._last_cfg_apply_values = dict(values_obj or {})
+        self._cfg_runtime_fault_popup_suppressed = True
+        self._cfg_op_in_progress = "apply"
         self.cfg.set_loading("Applying config (not saved)...")
         self.request_apply_config.emit(dict(values_obj or {}))
 
@@ -5485,6 +5775,8 @@ class AppController(QObject):
         if BACKEND == "real" and not self.connected:
             QMessageBox.critical(self.cfg, "Configuration", "Cannot save: ODrive is not connected.")
             return
+        self._cfg_runtime_fault_popup_suppressed = True
+        self._cfg_op_in_progress = "save/reboot"
         self.cfg.set_loading("Saving config (device will reboot)...")
         self.request_save_config.emit(dict(values_obj or {}))
 
@@ -5504,6 +5796,8 @@ class AppController(QObject):
         if ans != QMessageBox.Yes:
             self.cfg.set_loading("Erase canceled - form reset to defaults (not applied)")
             return
+        self._cfg_runtime_fault_popup_suppressed = True
+        self._cfg_op_in_progress = "erase/reset"
         self.cfg.set_loading("Erasing configuration (device will reboot)...")
         self.request_erase_config.emit()
 
