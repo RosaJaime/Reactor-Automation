@@ -2560,6 +2560,7 @@ class StepRow(QFrame):
     move_up_requested = Signal(int)
     move_down_requested = Signal(int)
     move_to_requested = Signal(int)
+    duplicate_requested = Signal(int)
     text_field_focused = Signal(object)  # QWidget
 
     def __init__(self, index: int, step: Step) -> None:
@@ -2787,6 +2788,7 @@ class StepRow(QFrame):
             a_up = menu.addAction("Move Up")
             a_down = menu.addAction("Move Down")
             a_to = menu.addAction("Move to Step #")
+            a_dup = menu.addAction("Duplicate Step")
             chosen = menu.exec(self.btn_more.mapToGlobal(self.btn_more.rect().bottomLeft()))
             if chosen is a_up:
                 self.move_up_requested.emit(int(self._index))
@@ -2794,6 +2796,8 @@ class StepRow(QFrame):
                 self.move_down_requested.emit(int(self._index))
             elif chosen is a_to:
                 self.move_to_requested.emit(int(self._index))
+            elif chosen is a_dup:
+                self.duplicate_requested.emit(int(self._index))
         except Exception:
             pass
 
@@ -2820,6 +2824,7 @@ class RecipeBuilderScreen(QWidget):
     back_clicked = Signal()
     cancel_clicked = Signal()
     save_clicked = Signal(Recipe)
+    duplicate_recipe_clicked = Signal(Recipe)
     export_clicked = Signal(Recipe)
     delete_clicked = Signal(str)
 
@@ -2881,12 +2886,14 @@ class RecipeBuilderScreen(QWidget):
         actions.setSpacing(ui(12))
         self.btn_add = TouchButton("Add Step", min_h=66, min_w=220)
         self.btn_export = TouchButton("Export JSON", min_h=66, min_w=220)
+        self.btn_duplicate_recipe = TouchButton("Duplicate Recipe", min_h=66, min_w=220)
         self.btn_delete = TouchButton("Delete Recipe", min_h=66, min_w=220)
         self.btn_delete.setObjectName("StopButton")
         self.btn_cancel = TouchButton("Cancel", min_h=66, min_w=220)
         self.btn_save = TouchButton("Save", min_h=66, min_w=220)
         actions.addWidget(self.btn_add, 1)
         actions.addWidget(self.btn_export, 1)
+        actions.addWidget(self.btn_duplicate_recipe, 1)
         actions.addWidget(self.btn_delete, 1)
         actions.addWidget(self.btn_cancel, 1)
         actions.addWidget(self.btn_save, 1)
@@ -2896,6 +2903,7 @@ class RecipeBuilderScreen(QWidget):
         self.btn_cancel.clicked.connect(self.cancel_clicked.emit)
         self.btn_add.clicked.connect(self._on_add_step)
         self.btn_export.clicked.connect(self._on_export)
+        self.btn_duplicate_recipe.clicked.connect(self._on_duplicate_recipe)
         self.btn_delete.clicked.connect(self._on_delete)
         self.btn_save.clicked.connect(self._on_save)
         self.btn_delete.setEnabled(False)
@@ -2925,6 +2933,7 @@ class RecipeBuilderScreen(QWidget):
         row.move_up_requested.connect(self._on_move_row_up)
         row.move_down_requested.connect(self._on_move_row_down)
         row.move_to_requested.connect(self._on_move_row_to_prompt)
+        row.duplicate_requested.connect(self._on_duplicate_row)
         row.text_field_focused.connect(self._on_step_text_field_focused)
         # Keep the extra spacer below the final step (for keyboard room),
         # while preserving the stretch as the last layout item.
@@ -2940,7 +2949,7 @@ class RecipeBuilderScreen(QWidget):
         if recipe is None:
             self._editing_id = None
             self.title.setText("Recipe Builder (New)")
-            self.name_edit.setText("")
+            self.name_edit.setText("New Recipe")
             self.btn_delete.setEnabled(False)
             self._add_row(Step(name="Run Name", kind="data_entry", prompt="Run name", response_kind="text", allow_skip=True))
             self._add_row(Step(120.0, 60, "Step 2", kind="motor"))
@@ -3046,6 +3055,39 @@ class RecipeBuilderScreen(QWidget):
         if not ok:
             return
         self._move_row_to_index(int(idx), int(dest) - 1)
+
+    @Slot(int)
+    def _on_duplicate_row(self, idx: int) -> None:
+        if self._drag_active:
+            return
+        rows = self._rows()
+        if not (0 <= int(idx) < len(rows)):
+            return
+        try:
+            step_copy = rows[int(idx)].get_step()
+        except Exception:
+            return
+        row = StepRow(int(idx) + 1, step_copy)
+        row.vel.set_range(VEL_MIN_RPM, self._vel_max_rpm)
+        row.remove_clicked.connect(self._on_remove)
+        row.drag_reorder_requested.connect(self._on_drag_reorder)
+        row.drag_started.connect(self._on_row_drag_started)
+        row.drag_moved.connect(self._on_row_drag_moved)
+        row.drag_finished.connect(self._on_row_drag_finished)
+        row.move_up_requested.connect(self._on_move_row_up)
+        row.move_down_requested.connect(self._on_move_row_down)
+        row.move_to_requested.connect(self._on_move_row_to_prompt)
+        row.duplicate_requested.connect(self._on_duplicate_row)
+        row.text_field_focused.connect(self._on_step_text_field_focused)
+        self.steps_layout.insertWidget(int(idx) + 1, row)
+        self._reindex()
+
+    @Slot()
+    def _on_duplicate_recipe(self) -> None:
+        recipe = self._build_recipe_from_form()
+        if recipe is None:
+            return
+        self.duplicate_recipe_clicked.emit(recipe)
 
     @Slot(int, int, int)
     def _on_row_drag_started(self, idx: int, gx: int, gy: int) -> None:
@@ -5038,6 +5080,7 @@ class AppController(QObject):
         self.builder.back_clicked.connect(self.on_back_home)
         self.builder.cancel_clicked.connect(self.on_back_home)
         self.builder.save_clicked.connect(self.on_builder_save)
+        self.builder.duplicate_recipe_clicked.connect(self.on_builder_duplicate_recipe)
         self.builder.export_clicked.connect(self.on_builder_export)
         self.builder.delete_clicked.connect(self.on_builder_delete)
 
@@ -6467,12 +6510,45 @@ class AppController(QObject):
 
     @Slot(Recipe)
     def on_builder_save(self, recipe: Recipe) -> None:
+        if self._recipe_name_exists(str(recipe.name), exclude_id=str(recipe.id)):
+            QMessageBox.warning(self.builder, "Recipe Name", f"A recipe named '{recipe.name}' already exists.\n\nChoose a unique name.")
+            return
         self.store.upsert(recipe)
         # If the selected recipe was edited or newly created, keep selection stable where possible
         if self.selected_recipe_id == recipe.id or self.selected_recipe_id is None:
             self.selected_recipe_id = recipe.id if self.selected_recipe_id == recipe.id else self.selected_recipe_id
         self.on_back_home()
         self._schedule_ui_state_save()
+
+    @Slot(Recipe)
+    def on_builder_duplicate_recipe(self, recipe: Recipe) -> None:
+        base_name = str(recipe.name or "New Recipe").strip() or "New Recipe"
+        dup_name = self._unique_recipe_copy_name(base_name)
+        dup = Recipe(
+            id=str(uuid.uuid4()),
+            name=dup_name,
+            steps=[
+                Step(
+                    velocity_rpm=float(getattr(s, "velocity_rpm", 0.0)),
+                    duration_s=int(getattr(s, "duration_s", 0)),
+                    name=str(getattr(s, "name", "") or ""),
+                    kind=str(getattr(s, "kind", "motor") or "motor"),
+                    prompt=str(getattr(s, "prompt", "") or ""),
+                    response_kind=str(getattr(s, "response_kind", "text") or "text"),
+                    allow_skip=bool(getattr(s, "allow_skip", True)),
+                )
+                for s in recipe.steps
+            ],
+        )
+        self.store.upsert(dup)
+        self.selected_recipe_id = dup.id
+        self._refresh_recipes()
+        self._refresh_status_all()
+        self._apply_controls()
+        self._schedule_ui_state_save()
+        self.builder.load_recipe(dup)
+        self.stack.setCurrentWidget(self.builder)
+        QMessageBox.information(self.builder, "Duplicate Recipe", f"Created copy:\n{dup.name}")
 
     @Slot(Recipe)
     def on_builder_export(self, recipe: Recipe) -> None:
@@ -6545,6 +6621,8 @@ class AppController(QObject):
             name = str(rj.get("name") or "").strip()
             if not name:
                 raise ValueError("Recipe name is missing")
+            if self._recipe_name_exists(name):
+                raise ValueError(f"A recipe named '{name}' already exists")
             steps_in = list(rj.get("steps") or [])
             if not steps_in:
                 raise ValueError("Recipe has no steps")
@@ -6584,6 +6662,28 @@ class AppController(QObject):
             QMessageBox.information(self.home, "Import Recipe", f"Imported recipe:\n{recipe.name}")
         except Exception as e:
             self._show_modal_error(self.home, "Import Recipe", f"Failed to import recipe:\n{e}")
+
+    def _recipe_name_exists(self, name: str, exclude_id: Optional[str] = None) -> bool:
+        target = str(name or "").strip().casefold()
+        if not target:
+            return False
+        ex = str(exclude_id or "").strip()
+        for r in self.store.recipes():
+            if ex and str(r.id) == ex:
+                continue
+            if str(r.name or "").strip().casefold() == target:
+                return True
+        return False
+
+    def _unique_recipe_copy_name(self, base_name: str) -> str:
+        base = str(base_name or "New Recipe").strip() or "New Recipe"
+        candidates = [f"{base} (Copy)"]
+        for i in range(2, 1000):
+            candidates.append(f"{base} (Copy {i})")
+        for name in candidates:
+            if not self._recipe_name_exists(name):
+                return name
+        return f"{base} ({uuid.uuid4().hex[:6]})"
 
     # ---- ODrive Config actions ----
 
