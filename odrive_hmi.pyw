@@ -472,6 +472,7 @@ class OdriveInterface:
     def connect(self) -> bool: raise NotImplementedError
     def is_connected(self) -> bool: raise NotImplementedError
     def feed_watchdog(self) -> str: raise NotImplementedError
+    def get_runtime_fault(self) -> str: raise NotImplementedError
     def set_velocity_rpm(self, rpm: float) -> None: raise NotImplementedError
     def stop(self) -> None: raise NotImplementedError
     def is_calibrated(self) -> Tuple[bool, str]: raise NotImplementedError
@@ -510,6 +511,9 @@ class SimulatedOdrive(OdriveInterface):
     def feed_watchdog(self) -> str:
         # Simulation backend has no watchdog; no-op for API compatibility.
         return "Simulation"
+
+    def get_runtime_fault(self) -> str:
+        return ""
 
     def set_velocity_rpm(self, rpm: float) -> None:
         self._target_rpm = float(rpm)
@@ -682,6 +686,58 @@ class RealOdrive(OdriveInterface):
             # expose watchdog feed in the same way.
             return "Feed error"
 
+    def get_runtime_fault(self) -> str:
+        if not self._connected or self._axis is None:
+            return ""
+        runtime_fault = False
+        parts: List[str] = []
+        probes = [
+            ("odrv.active_errors", (lambda: getattr(self._odrv, "active_errors")) if self._odrv is not None else None),
+            ("axis.active_errors", lambda: getattr(self._axis, "active_errors")),
+            ("axis.disarm_reason", lambda: getattr(self._axis, "disarm_reason")),
+            ("axis.procedure_result", lambda: getattr(self._axis, "procedure_result")),
+            ("motor.active_errors", lambda: getattr(self._axis.motor, "active_errors")),
+            ("encoder.active_errors", lambda: getattr(self._axis.encoder, "active_errors")),
+        ]
+        for name, fn in probes:
+            if fn is None:
+                continue
+            try:
+                val = fn()
+            except Exception:
+                continue
+            sval = self._format_runtime_error_value(name, val)
+            if not sval:
+                continue
+            if name != "axis.procedure_result" and self._is_active_fault_value(name, sval, val):
+                runtime_fault = True
+            if sval not in ("0", "ODriveError.NONE", "AxisError.NONE", "ProcedureResult.SUCCESS"):
+                parts.append(f"{name}={sval}")
+        if not runtime_fault:
+            return ""
+        return f"ODrive runtime fault: {'; '.join(parts)}"
+
+    @staticmethod
+    def _is_active_fault_value(name: str, sval: str, raw_val: Any) -> bool:
+        if name == "axis.procedure_result":
+            return False
+        txt = str(sval or "").strip().lower()
+        if not txt:
+            return False
+        if txt in {"0", "none", "no error", "axiserror.none", "odriveerror.none", "motorerror.none", "encodererror.none"}:
+            return False
+        if "no error" in txt:
+            return False
+        if "error(s):" in txt and "none" in txt and "violation" not in txt:
+            return False
+        try:
+            iv = int(raw_val)
+            if iv == 0:
+                return False
+        except Exception:
+            pass
+        return True
+
     def set_velocity_rpm(self, rpm: float) -> None:
         if not self._connected or self._axis is None or self._AxisState is None:
             raise RuntimeError("ODrive not connected")
@@ -782,13 +838,60 @@ class RealOdrive(OdriveInterface):
                 val = fn()
             except Exception:
                 continue
-            try:
-                sval = str(val)
-            except Exception:
-                continue
+            sval = self._format_runtime_error_value(name, val)
             if sval and sval not in ("0", "ODriveError.NONE", "AxisError.NONE", "ProcedureResult.SUCCESS"):
                 parts.append(f"{name}={sval}")
         return "; ".join(parts)
+
+    @staticmethod
+    def _format_runtime_error_value(name: str, val: Any) -> str:
+        try:
+            sval = str(val)
+        except Exception:
+            return ""
+        if not sval:
+            return ""
+        # If firmware already returns a symbolic enum string, keep it.
+        if "." in sval and not sval.isdigit():
+            return sval
+        try:
+            iv = int(val)
+        except Exception:
+            return sval
+        enum_candidates: List[str] = []
+        if name == "axis.procedure_result":
+            enum_candidates = ["ProcedureResult"]
+        elif name == "axis.disarm_reason":
+            enum_candidates = ["ODriveError"]
+        elif name == "axis.active_errors":
+            enum_candidates = ["AxisError", "ODriveError"]
+        elif name == "motor.active_errors":
+            enum_candidates = ["MotorError"]
+        elif name == "encoder.active_errors":
+            enum_candidates = ["EncoderError"]
+        elif name == "odrv.active_errors":
+            enum_candidates = ["ODriveError"]
+        if not enum_candidates:
+            return sval
+        try:
+            from odrive import enums as odrive_enums  # type: ignore
+        except Exception:
+            return sval
+        for enum_name in enum_candidates:
+            enum_type = getattr(odrive_enums, enum_name, None)
+            if enum_type is None:
+                continue
+            try:
+                resolved = enum_type(iv)
+                rtxt = str(resolved)
+                if rtxt and rtxt != str(iv):
+                    return rtxt
+                # Some enum/flag types stringify to the raw number even when valid.
+                if hasattr(resolved, "name") and getattr(resolved, "name", None):
+                    return f"{enum_name}.{resolved.name}"
+            except Exception:
+                continue
+        return sval
 
     def _clear_errors(self) -> None:
         if self._axis is None:
@@ -1170,6 +1273,7 @@ class OdriveWorker(QObject):
         super().__init__()
         self._backend = backend
         self._poll_timer: Optional[QTimer] = None
+        self._fault_poll_timer: Optional[QTimer] = None
         self._polled_tags: List[str] = [TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM, TAG_TORQUE_NM]
         self._supervisor_timer: Optional[QTimer] = None
 
@@ -1181,6 +1285,7 @@ class OdriveWorker(QObject):
         self._last_poll_error_mono = 0.0
         self._poll_error_cooldown_s = 5.0
         self._watchdog_status_cache = "Unknown"
+        self._last_runtime_fault_msg = ""
 
     @Slot()
     def on_thread_started(self) -> None:
@@ -1189,6 +1294,11 @@ class OdriveWorker(QObject):
             self._supervisor_timer.setInterval(SUPERVISOR_TICK_MS)
             self._supervisor_timer.timeout.connect(self._supervise_connection)
             self._supervisor_timer.start()
+        if self._fault_poll_timer is None:
+            self._fault_poll_timer = QTimer(self)
+            self._fault_poll_timer.setInterval(100)  # non-invasive runtime fault polling
+            self._fault_poll_timer.timeout.connect(self._poll_runtime_fault)
+            self._fault_poll_timer.start()
 
     def _is_disconnect_error(self, e: Exception) -> bool:
         s = str(e).lower()
@@ -1229,6 +1339,22 @@ class OdriveWorker(QObject):
             self._watchdog_status_cache = status
             self.watchdog_status_changed.emit(status)
 
+    def _poll_runtime_fault(self) -> None:
+        if not self._backend.is_connected():
+            self._last_runtime_fault_msg = ""
+            return
+        try:
+            msg = str(self._backend.get_runtime_fault() or "").strip()
+        except Exception:
+            return
+        if not msg:
+            self._last_runtime_fault_msg = ""
+            return
+        if msg == self._last_runtime_fault_msg:
+            return
+        self._last_runtime_fault_msg = msg
+        self.error.emit(msg)
+
     def _mark_disconnected(self, reason: str) -> None:
         try:
             self.stop_tag_polling()
@@ -1241,6 +1367,7 @@ class OdriveWorker(QObject):
             pass
         self._set_connected(False, reason)
         self._emit_watchdog_status("Disconnected")
+        self._last_runtime_fault_msg = ""
 
     @Slot()
     def _supervise_connection(self) -> None:
@@ -1250,6 +1377,7 @@ class OdriveWorker(QObject):
                     self._emit_watchdog_status(self._backend.feed_watchdog())
                 except Exception:
                     pass
+                self._poll_runtime_fault()
                 self._set_connected(True, self._backend.get_state())
                 return
         except Exception:
@@ -1488,6 +1616,7 @@ class OdriveWorker(QObject):
                 self._emit_watchdog_status(self._backend.feed_watchdog())
             except Exception:
                 pass
+            self._poll_runtime_fault()
             values = self._backend.get_tags(self._polled_tags)
             self.tags_sample.emit(epoch_s(), values)
         except Exception as e:
@@ -1842,6 +1971,7 @@ class TouchButton(QPushButton):
 
 class RpmControl(QWidget):
     value_changed = Signal(float)
+    edit_focused = Signal()
 
     def __init__(self, title: str, vmin: float, vmax: float, step: float, compact: bool = False) -> None:
         super().__init__()
@@ -1887,6 +2017,7 @@ class RpmControl(QWidget):
         self.btn_minus.clicked.connect(lambda: self.set_value(self.value() - self._step))
         self.btn_plus.clicked.connect(lambda: self.set_value(self.value() + self._step))
         self.edit.editingFinished.connect(self._emit_if_valid)
+        self.edit.installEventFilter(self)
         self._emit_if_valid()
 
     def value(self) -> float:
@@ -1920,9 +2051,18 @@ class RpmControl(QWidget):
     def _emit_if_valid(self) -> None:
         self.set_value(self.value(), emit_signal=True)
 
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        try:
+            if watched is self.edit and event.type() == QEvent.FocusIn:
+                self.edit_focused.emit()
+        except Exception:
+            pass
+        return super().eventFilter(watched, event)
+
 
 class TimeControl(QWidget):
     value_changed = Signal(int)
+    edit_focused = Signal()
 
     def __init__(self, title: str, step_s: int, compact: bool = False) -> None:
         super().__init__()
@@ -1969,6 +2109,7 @@ class TimeControl(QWidget):
         self.btn_minus.clicked.connect(lambda: self._adjust(-self._step_s))
         self.btn_plus.clicked.connect(lambda: self._adjust(+self._step_s))
         self.edit.editingFinished.connect(self._emit_if_valid)
+        self.edit.installEventFilter(self)
         self._emit_if_valid()
 
     def set_adjust_callback(self, cb: Optional[Callable[[int], None]]) -> None:
@@ -2022,6 +2163,14 @@ class TimeControl(QWidget):
     @Slot()
     def _emit_if_valid(self) -> None:
         self.set_seconds(self.seconds(), emit_signal=True)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        try:
+            if watched is self.edit and event.type() == QEvent.FocusIn:
+                self.edit_focused.emit()
+        except Exception:
+            pass
+        return super().eventFilter(watched, event)
 
 
 # ----------------------------
@@ -3836,6 +3985,8 @@ class AppController(QObject):
 
         self.home.rpm_ctl.value_changed.connect(self._on_home_rpm_changed)
         self.home.time_ctl.value_changed.connect(self._on_home_time_changed)
+        self.home.rpm_ctl.edit_focused.connect(self._on_home_manual_field_focused)
+        self.home.time_ctl.edit_focused.connect(self._on_home_manual_field_focused)
 
         self.builder.back_clicked.connect(self.on_back_home)
         self.builder.cancel_clicked.connect(self.on_back_home)
@@ -3870,13 +4021,10 @@ class AppController(QObject):
 
         self.stack.currentChanged.connect(self._on_screen_changed)
 
-        self._cmd_log_timer = QTimer(self)
-        self._cmd_log_timer.setInterval(LOG_POLL_MS)
-        self._cmd_log_timer.timeout.connect(self._log_cmd_rpm)
-        self._cmd_log_timer.start()
-
         self._last_modal_error_mono = 0.0
         self._modal_error_cooldown_s = 8.0
+        self._last_odrive_error_modal_mono = 0.0
+        self._odrive_error_modal_cooldown_s = 1.0
 
         self._ui_state_path = app_config_dir() / "ui_state.json"
         self._ui_state_saving = False
@@ -3938,9 +4086,9 @@ class AppController(QObject):
 
     def _show_odrive_error_with_clear(self, parent: QWidget, msg: str) -> None:
         now_m = time.monotonic()
-        if (now_m - self._last_modal_error_mono) < self._modal_error_cooldown_s:
+        if (now_m - self._last_odrive_error_modal_mono) < self._odrive_error_modal_cooldown_s:
             return
-        self._last_modal_error_mono = now_m
+        self._last_odrive_error_modal_mono = now_m
         box = QMessageBox(parent)
         box.setIcon(QMessageBox.Critical)
         box.setWindowTitle("ODrive Error")
@@ -4186,11 +4334,12 @@ class AppController(QObject):
 
     @Slot(str)
     def _on_worker_error(self, msg: str) -> None:
+        msg = str(msg or "")
         self._calibration_busy = False
         if self._run_mode == "recipe" and self._recipe_monitor_recipe is not None:
             self._recipe_monitor_failed = True
             if self._recipe_monitor_step_idx >= 0:
-                self.recipe_run.set_step_error(self._recipe_monitor_step_idx, str(msg))
+                self.recipe_run.set_step_error(self._recipe_monitor_step_idx, msg)
             self._recipe_run_audit(f"Error: {msg}")
         if self.engine.is_running():
             self.engine.stop(user_initiated=True)
@@ -4573,6 +4722,7 @@ class AppController(QObject):
     def _on_engine_rpm(self, rpm: float) -> None:
         self._ui_rpm = float(rpm)
         self._cmd_rpm = float(rpm)
+        self._log_cmd_rpm()
 
         # Only force the Home RPM entry to follow the engine while running.
         # When stopped, keep whatever the user last typed (don't overwrite to 0).
@@ -4784,6 +4934,7 @@ class AppController(QObject):
     @Slot(float)
     def _on_home_rpm_changed(self, rpm: float) -> None:
         rpm = float(clamp(float(rpm), VEL_MIN_RPM, self._hmi_velocity_limit()))
+        self._switch_home_to_manual_timer_mode()
         if self.engine.is_running():
             self.engine.override_rpm(rpm)
         self._schedule_ui_state_save()
@@ -4791,11 +4942,22 @@ class AppController(QObject):
     @Slot(int)
     def _on_home_time_changed(self, _seconds: int) -> None:
         # Save the entry text (mm:ss) when edited while stopped. During a run, the entry is disabled.
-        if (not self.engine.is_running()) and (self.selected_recipe_id is not None):
-            self.selected_recipe_id = None
-            self._refresh_recipes()
-            self._refresh_status_all()
-            self._apply_controls()
+        self._switch_home_to_manual_timer_mode()
+        self._schedule_ui_state_save()
+
+    @Slot()
+    def _on_home_manual_field_focused(self) -> None:
+        self._switch_home_to_manual_timer_mode()
+
+    def _switch_home_to_manual_timer_mode(self) -> None:
+        if self.engine.is_running():
+            return
+        if self.selected_recipe_id is None:
+            return
+        self.selected_recipe_id = None
+        self._refresh_recipes()
+        self._refresh_status_all()
+        self._apply_controls()
         self._schedule_ui_state_save()
 
     # ---- Home actions ----
