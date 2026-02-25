@@ -4135,6 +4135,20 @@ class RecipeRunMonitorScreen(QWidget):
         top.addWidget(self.btn_options)
         root.addLayout(top)
 
+        stats = QHBoxLayout()
+        stats.setSpacing(ui(12))
+        self.lbl_curr_rpm = QLabel("Current RPM: --")
+        self.lbl_curr_rpm.setObjectName("InfoLabel")
+        self.lbl_recipe_elapsed = QLabel("Elapsed: 00:00")
+        self.lbl_recipe_elapsed.setObjectName("InfoLabel")
+        self.lbl_recipe_remaining = QLabel("Remaining: 00:00")
+        self.lbl_recipe_remaining.setObjectName("InfoLabel")
+        stats.addWidget(self.lbl_curr_rpm)
+        stats.addWidget(self.lbl_recipe_elapsed)
+        stats.addWidget(self.lbl_recipe_remaining)
+        stats.addStretch(1)
+        root.addLayout(stats)
+
         body = QHBoxLayout()
         body.setSpacing(ui(12))
 
@@ -4256,6 +4270,14 @@ class RecipeRunMonitorScreen(QWidget):
             txt = "Pause"
         self.btn_pause_resume.setText(txt)
         self.btn_pause_resume.setEnabled(bool(enabled))
+
+    def set_header_metrics(self, current_rpm: Optional[float], elapsed_s: int, remaining_s: int) -> None:
+        if current_rpm is None or (isinstance(current_rpm, float) and (not math.isfinite(current_rpm))):
+            self.lbl_curr_rpm.setText("Current RPM: --")
+        else:
+            self.lbl_curr_rpm.setText(f"Current RPM: {float(current_rpm):.0f}")
+        self.lbl_recipe_elapsed.setText(f"Elapsed: {format_mmss(max(0, int(elapsed_s)))}")
+        self.lbl_recipe_remaining.setText(f"Remaining: {format_mmss(max(0, int(remaining_s)))}")
 
     @Slot()
     def _open_options_dialog(self) -> None:
@@ -4521,6 +4543,7 @@ class AppController(QObject):
 
         self._ui_state = "Idle"
         self._ui_rpm = 0.0
+        self._actual_vel_rpm = float("nan")
         self._ui_remaining = 0
         self._ui_step_info = ""
         self._run_mode = "idle"
@@ -4754,6 +4777,42 @@ class AppController(QObject):
         rname = r.name if r else "(none)"
         self.home.set_status(self._ui_state, self._ui_rpm, self._ui_remaining, rname, self._ui_step_info, self.backend_state)
         self.dlog.set_status(self._ui_state, self._ui_rpm, self._ui_remaining, rname, self._ui_step_info, self.backend_state)
+        recipe_elapsed_s, recipe_remaining_s = self._recipe_program_times()
+        current_rpm = self._actual_vel_rpm if math.isfinite(self._actual_vel_rpm) else self._ui_rpm
+        self.recipe_run.set_header_metrics(current_rpm, recipe_elapsed_s, recipe_remaining_s)
+
+    def _recipe_program_times(self) -> Tuple[int, int]:
+        recipe = self._recipe_monitor_recipe
+        if recipe is None:
+            return (0, 0)
+
+        total_s = int(max(0, recipe_total_seconds(recipe)))
+        if total_s <= 0:
+            return (0, 0)
+
+        step_idx = int(self._recipe_monitor_step_idx)
+        if step_idx < 0:
+            return (0, total_s)
+
+        elapsed_s = 0
+        for i, step in enumerate(recipe.steps):
+            if is_data_entry_step(step):
+                if i >= step_idx:
+                    break
+                continue
+            dur = max(0, int(getattr(step, "duration_s", 0)))
+            if i < step_idx:
+                elapsed_s += dur
+                continue
+            if i == step_idx:
+                rem = int(clamp(int(self._ui_remaining), 0, dur))
+                elapsed_s += max(0, dur - rem)
+                break
+            break
+
+        elapsed_s = int(clamp(int(elapsed_s), 0, total_s))
+        remaining_s = int(max(0, total_s - elapsed_s))
+        return (elapsed_s, remaining_s)
 
     def _apply_controls(self) -> None:
         r_selected = self._selected_recipe() is not None
@@ -5351,6 +5410,11 @@ class AppController(QObject):
     @Slot(int, object)
     def _on_tags_sample(self, ts: int, values_obj: Any) -> None:
         values: Dict[str, float] = {str(k): safe_float(v) for k, v in dict(values_obj or {}).items()}
+        try:
+            v_actual = float(values.get(TAG_VEL_RPM, float("nan")))
+            self._actual_vel_rpm = v_actual if math.isfinite(v_actual) else self._actual_vel_rpm
+        except Exception:
+            pass
 
         vbus, ibus = values.get(TAG_VBUS_V, float("nan")), values.get(TAG_IBUS_A, float("nan"))
         if math.isfinite(vbus) and math.isfinite(ibus):
