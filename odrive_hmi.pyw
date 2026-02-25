@@ -3601,21 +3601,9 @@ class ODriveConfigScreen(QWidget):
         info_row.addWidget(self.btn_export)
         root.addLayout(info_row)
 
-        preset_row = QHBoxLayout()
-        preset_row.setSpacing(ui(12))
-        self.lbl_motor_preset = QLabel("Motor preset")
-        self.lbl_motor_preset.setObjectName("FieldLabel")
-        self.lbl_motor_preset.setMinimumWidth(ui(220))
-        self.cmb_motor_preset = QComboBox()
-        self.cmb_motor_preset.setMinimumHeight(ui(58))
-        self.cmb_motor_preset.addItem("Custom / no preset", "")
-        for name in self._motor_presets.keys():
-            self.cmb_motor_preset.addItem(name, name)
-        preset_row.addWidget(self.lbl_motor_preset)
-        preset_row.addWidget(self.cmb_motor_preset, 1)
-        root.addLayout(preset_row)
-
-        hmi_max_row = QHBoxLayout()
+        self.hmi_max_row_widget = QWidget()
+        hmi_max_row = QHBoxLayout(self.hmi_max_row_widget)
+        hmi_max_row.setContentsMargins(0, 0, 0, 0)
         hmi_max_row.setSpacing(ui(12))
         self.lbl_hmi_max_vel = QLabel("HMI max velocity (rpm)")
         self.lbl_hmi_max_vel.setObjectName("FieldLabel")
@@ -3628,7 +3616,6 @@ class ODriveConfigScreen(QWidget):
         hmi_max_row.addWidget(self.lbl_hmi_max_vel)
         hmi_max_row.addWidget(self.edit_hmi_max_vel, 1)
         hmi_max_row.addWidget(self.btn_apply_hmi_max_vel)
-        root.addLayout(hmi_max_row)
 
         self.area = QScrollArea()
         self.area.setWidgetResizable(True)
@@ -3642,6 +3629,8 @@ class ODriveConfigScreen(QWidget):
         self.vbox.addStretch(1)
         self.area.setWidget(self.container)
         root.addWidget(self.area, 1)
+
+        self.vbox.insertWidget(self.vbox.count() - 1, self.hmi_max_row_widget)
 
         for spec in ODRIVE_CONFIG_FIELDS:
             row = SettingRowWidget(spec)
@@ -3679,7 +3668,6 @@ class ODriveConfigScreen(QWidget):
                 app.installEventFilter(self)
         except Exception:
             pass
-        self.cmb_motor_preset.currentIndexChanged.connect(self._on_motor_preset_changed)
         self.btn_apply_hmi_max_vel.clicked.connect(self._emit_hmi_max_velocity)
         self.edit_hmi_max_vel.editingFinished.connect(self._emit_hmi_max_velocity)
 
