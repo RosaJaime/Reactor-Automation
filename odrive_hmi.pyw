@@ -136,6 +136,7 @@ TAG_CMD_RPM = "cmd_rpm"  # last commanded
 TAG_VEL_RPM = "vel_rpm"  # actual estimate
 TAG_TORQUE_NM = "torque_nm"  # actual/estimated torque
 TAG_MOTOR_TEMP_C = "motor_temp_c"  # motor thermistor temperature
+TAG_ODRIVE_TEMP_C = "odrive_temp_c"  # onboard/FET thermistor temperature
 
 DEFAULT_ENABLED_TAGS = [TAG_PWR_W, TAG_CMD_RPM]
 
@@ -147,6 +148,7 @@ TAG_DEADBAND: Dict[str, float] = {
     TAG_VEL_RPM: 0.1,
     TAG_TORQUE_NM: 0.01,
     TAG_MOTOR_TEMP_C: 0.2,
+    TAG_ODRIVE_TEMP_C: 0.2,
 }
 TAG_HEARTBEAT_S: Dict[str, int] = {t: DB_HEARTBEAT_S_DEFAULT for t in TAG_DEADBAND}
 
@@ -158,6 +160,7 @@ TAG_LABELS: Dict[str, str] = {
     TAG_VBUS_V: "Bus voltage (V)",
     TAG_IBUS_A: "Bus current (A)",
     TAG_MOTOR_TEMP_C: "Motor thermistor temperature (C)",
+    TAG_ODRIVE_TEMP_C: "ODrive onboard temperature (C)",
 }
 TAG_UNITS: Dict[str, str] = {
     TAG_PWR_W: "W",
@@ -167,6 +170,7 @@ TAG_UNITS: Dict[str, str] = {
     TAG_VBUS_V: "V",
     TAG_IBUS_A: "A",
     TAG_MOTOR_TEMP_C: "C",
+    TAG_ODRIVE_TEMP_C: "C",
 }
 PLOT_GROUP_RPM = "rpm"
 PLOT_GROUP_OTHER = "other"
@@ -178,6 +182,7 @@ TAG_PLOT_GROUP: Dict[str, str] = {
     TAG_VBUS_V: PLOT_GROUP_OTHER,
     TAG_IBUS_A: PLOT_GROUP_OTHER,
     TAG_MOTOR_TEMP_C: PLOT_GROUP_OTHER,
+    TAG_ODRIVE_TEMP_C: PLOT_GROUP_OTHER,
 }
 
 # DPI/UI scaling: keep fixed window size but scale fonts/margins so content remains touch-friendly
@@ -596,6 +601,7 @@ class SimulatedOdrive(OdriveInterface):
         ibus = 0.2 + (rpm_mag / max(1.0, VEL_MAX_RPM)) * 2.0
         torque_nm = 0.02 * ibus + 0.0005 * rpm_mag
         motor_temp_c = 25.0 + min(45.0, rpm_mag * 0.02 + ibus * 1.5)
+        odrive_temp_c = 27.0 + min(35.0, rpm_mag * 0.012 + ibus * 1.0)
         out: Dict[str, float] = {}
         for t in tags:
             if t == TAG_VBUS_V:
@@ -608,6 +614,8 @@ class SimulatedOdrive(OdriveInterface):
                 out[t] = float(torque_nm)
             elif t == TAG_MOTOR_TEMP_C:
                 out[t] = float(motor_temp_c)
+            elif t == TAG_ODRIVE_TEMP_C:
+                out[t] = float(odrive_temp_c)
         return out
 
     def get_json(self) -> str:
@@ -1207,7 +1215,23 @@ class RealOdrive(OdriveInterface):
                     for getter in (
                         lambda: getattr(getattr(self._axis.motor, "motor_thermistor"), "temperature"),
                         lambda: getattr(getattr(self._axis.motor, "motor_thermistor"), "temp"),
+                    ):
+                        try:
+                            temp_val = float(getter())
+                            break
+                        except Exception:
+                            continue
+                    if temp_val is not None and math.isfinite(temp_val):
+                        out[t] = float(temp_val)
+                elif t == TAG_ODRIVE_TEMP_C:
+                    temp_val = None
+                    for getter in (
+                        lambda: getattr(getattr(self._odrv, "fet_thermistor"), "temperature"),
+                        lambda: getattr(getattr(self._odrv, "fet_thermistor"), "temp"),
                         lambda: getattr(getattr(self._axis.motor, "fet_thermistor"), "temperature"),
+                        lambda: getattr(getattr(self._axis.motor, "fet_thermistor"), "temp"),
+                        lambda: getattr(getattr(self._odrv, "thermistor"), "temperature"),
+                        lambda: getattr(getattr(self._odrv, "thermistor"), "temp"),
                     ):
                         try:
                             temp_val = float(getter())
@@ -3954,7 +3978,7 @@ class DataLoggerScreen(QWidget):
 
     def set_selected_tags(self, tags: List[str]) -> None:
         known = {
-            TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_VBUS_V, TAG_IBUS_A
+            TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_ODRIVE_TEMP_C, TAG_VBUS_V, TAG_IBUS_A
         }
         out = [t for t in (tags or []) if t in known]
         self._selected_tags = list(out or DEFAULT_ENABLED_TAGS)
@@ -3993,7 +4017,7 @@ class DataLoggerScreen(QWidget):
         root.addWidget(lbl_tags)
 
         tag_checks: Dict[str, QCheckBox] = {}
-        ordered_tags = [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_VBUS_V, TAG_IBUS_A]
+        ordered_tags = [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_ODRIVE_TEMP_C, TAG_VBUS_V, TAG_IBUS_A]
         wanted = set(self._selected_tags)
         for tag in ordered_tags:
             cb = QCheckBox(TAG_LABELS.get(tag, tag))
@@ -4106,6 +4130,7 @@ class RecipeRunStepBox(QFrame):
 class RecipeRunMonitorScreen(QWidget):
     back_clicked = Signal()
     stop_clicked = Signal()
+    run_again_clicked = Signal()
     pause_resume_clicked = Signal()
     skip_step_clicked = Signal(int)
     tags_changed = Signal(object)  # list[str]
@@ -4116,6 +4141,7 @@ class RecipeRunMonitorScreen(QWidget):
         self._plot_minutes = 10
         self._step_boxes: List[RecipeRunStepBox] = []
         self._active_step_idx = -1
+        self._stop_button_mode = "stop"
 
         root = QVBoxLayout(self)
         root.setContentsMargins(ui(18), ui(16), ui(18), ui(16))
@@ -4194,17 +4220,18 @@ class RecipeRunMonitorScreen(QWidget):
         root.addLayout(footer_row)
 
         self.btn_back.clicked.connect(self.back_clicked.emit)
-        self.btn_stop.clicked.connect(self.stop_clicked.emit)
+        self.btn_stop.clicked.connect(self._on_stop_button_clicked)
         self.btn_pause_resume.clicked.connect(self.pause_resume_clicked.emit)
         self.btn_options.clicked.connect(self._open_options_dialog)
         self.btn_report.clicked.connect(self.generate_report_clicked.emit)
         self.set_pause_resume_action("pause", enabled=False)
+        self.set_stop_action("stop", enabled=True)
 
     def selected_tags(self) -> List[str]:
         return list(getattr(self, "_selected_tags", [TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM]))
 
     def set_selected_tags(self, tags: List[str]) -> None:
-        known = {TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_VBUS_V, TAG_IBUS_A}
+        known = {TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_ODRIVE_TEMP_C, TAG_VBUS_V, TAG_IBUS_A}
         out = [t for t in (tags or []) if t in known]
         self._selected_tags = list(out or [TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM])
 
@@ -4271,6 +4298,22 @@ class RecipeRunMonitorScreen(QWidget):
         self.btn_pause_resume.setText(txt)
         self.btn_pause_resume.setEnabled(bool(enabled))
 
+    def set_stop_action(self, mode: str, enabled: bool = True) -> None:
+        m = str(mode or "stop").strip().lower()
+        self._stop_button_mode = "run_again" if m in ("run_again", "run-again", "again") else "stop"
+        if self._stop_button_mode == "run_again":
+            self.btn_stop.setText("Run Again")
+            self.btn_stop.setObjectName("")
+        else:
+            self.btn_stop.setText("Stop")
+            self.btn_stop.setObjectName("StopButton")
+        self.btn_stop.setEnabled(bool(enabled))
+        try:
+            self.btn_stop.style().unpolish(self.btn_stop)
+            self.btn_stop.style().polish(self.btn_stop)
+        except Exception:
+            pass
+
     def set_header_metrics(self, current_rpm: Optional[float], elapsed_s: int, remaining_s: int) -> None:
         if current_rpm is None or (isinstance(current_rpm, float) and (not math.isfinite(current_rpm))):
             self.lbl_curr_rpm.setText("Current RPM: --")
@@ -4278,6 +4321,13 @@ class RecipeRunMonitorScreen(QWidget):
             self.lbl_curr_rpm.setText(f"Current RPM: {float(current_rpm):.0f}")
         self.lbl_recipe_elapsed.setText(f"Elapsed: {format_mmss(max(0, int(elapsed_s)))}")
         self.lbl_recipe_remaining.setText(f"Remaining: {format_mmss(max(0, int(remaining_s)))}")
+
+    @Slot()
+    def _on_stop_button_clicked(self) -> None:
+        if str(getattr(self, "_stop_button_mode", "stop")) == "run_again":
+            self.run_again_clicked.emit()
+            return
+        self.stop_clicked.emit()
 
     @Slot()
     def _open_options_dialog(self) -> None:
@@ -4295,7 +4345,7 @@ class RecipeRunMonitorScreen(QWidget):
         root.addWidget(lbl_tags)
 
         tag_checks: Dict[str, QCheckBox] = {}
-        ordered_tags = [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_VBUS_V, TAG_IBUS_A]
+        ordered_tags = [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_ODRIVE_TEMP_C, TAG_VBUS_V, TAG_IBUS_A]
         wanted = set(self.selected_tags())
         for tag in ordered_tags:
             cb = QCheckBox(TAG_LABELS.get(tag, tag))
@@ -4562,6 +4612,10 @@ class AppController(QObject):
         self._recipe_monitor_error_paused = False
         self._recipe_resume_after_clear_error = False
         self._recipe_monitor_plot_tags: List[str] = [TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM]
+        self._recipe_run_restart_candidate_id: Optional[str] = None
+        self._recipe_run_completed_ready_restart = False
+        self._home_manual_rpm_snapshot = 120.0
+        self._home_manual_timer_snapshot = "00:00"
         self._current_recipe_run_record: Optional[Dict[str, Any]] = None
         self._cfg_runtime_fault_popup_suppressed = False
         self._cfg_op_in_progress = ""
@@ -4646,6 +4700,7 @@ class AppController(QObject):
         self.hmi_settings.back_clicked.connect(self.on_back_settings)
         self.recipe_run.back_clicked.connect(self.on_back_home)
         self.recipe_run.stop_clicked.connect(self.on_stop)
+        self.recipe_run.run_again_clicked.connect(self.on_recipe_run_again)
         self.recipe_run.pause_resume_clicked.connect(self.on_recipe_pause_resume)
         self.recipe_run.skip_step_clicked.connect(self.on_recipe_skip_step)
         self.recipe_run.tags_changed.connect(self._on_recipe_run_tags_changed)
@@ -4847,6 +4902,13 @@ class AppController(QObject):
         else:
             self.recipe_run.set_pause_resume_action("pause", enabled=True)
 
+        can_run_again = bool(
+            (not running)
+            and self._recipe_run_completed_ready_restart
+            and self._recipe_run_restart_candidate_id
+        )
+        self.recipe_run.set_stop_action("run_again" if can_run_again else "stop", enabled=True)
+
     def _adjust_time_from_home(self, delta_s: int) -> None:
         if self._run_mode != "single":
             return
@@ -4863,7 +4925,7 @@ class AppController(QObject):
     # ---- UI state persistence ----
 
     def _known_tags(self) -> List[str]:
-        return [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_VBUS_V, TAG_IBUS_A]
+        return [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_ODRIVE_TEMP_C, TAG_VBUS_V, TAG_IBUS_A]
 
     def _load_ui_state(self) -> None:
         if not self._ui_state_path.exists():
@@ -5422,7 +5484,7 @@ class AppController(QObject):
         values[TAG_CMD_RPM] = float(self._cmd_rpm)
 
         samples: List[Tuple[str, float, float, int]] = []
-        for tag in [TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_PWR_W, TAG_CMD_RPM]:
+        for tag in [TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_ODRIVE_TEMP_C, TAG_PWR_W, TAG_CMD_RPM]:
             if tag in values and math.isfinite(values[tag]):
                 samples.append(
                     (
@@ -5471,7 +5533,7 @@ class AppController(QObject):
 
         # Only force the Home RPM entry to follow the engine while running.
         # When stopped, keep whatever the user last typed (don't overwrite to 0).
-        if self.engine.is_running() and not self.home.rpm_ctl.edit.hasFocus():
+        if self.engine.is_running() and self._run_mode == "single" and not self.home.rpm_ctl.edit.hasFocus():
             self.home.rpm_ctl.set_value(float(rpm), emit_signal=False)
 
         self._refresh_status_all()
@@ -5719,10 +5781,32 @@ class AppController(QObject):
         if len(recipe.steps) < 1:
             QMessageBox.warning(self.home, "Start", "Selected recipe has no steps.")
             return
+        # Preserve manual mode entries so recipe step commands don't overwrite them.
+        self._home_manual_rpm_snapshot = float(self.home.rpm_ctl.value())
+        self._home_manual_timer_snapshot = str(self.home.time_ctl.text_mmss() or "00:00")
+        self._recipe_run_completed_ready_restart = False
         self._recipe_monitor_error_paused = False
         self._recipe_resume_after_clear_error = False
         self._recipe_monitor_begin(recipe)
         self.engine.start_recipe(recipe)
+
+    @Slot()
+    def on_recipe_run_again(self) -> None:
+        if self.engine.is_running():
+            return
+        rid = str(self._recipe_run_restart_candidate_id or "").strip()
+        if not rid:
+            return
+        recipe = next((r for r in self.store.recipes() if str(r.id) == rid), None)
+        if recipe is None:
+            QMessageBox.warning(self.recipe_run, "Run Again", "Recipe is no longer available.")
+            self._recipe_run_completed_ready_restart = False
+            self._recipe_run_restart_candidate_id = None
+            self._apply_controls()
+            return
+        self.selected_recipe_id = str(recipe.id)
+        self._refresh_recipes()
+        self.on_start()
 
     @Slot()
     def on_stop(self) -> None:
@@ -6312,6 +6396,14 @@ class AppController(QObject):
             self._current_recipe_run_record["status"] = status
             self.run_store.add_run(self._current_recipe_run_record)
             self._current_recipe_run_record = None
+        # Restore manual Home entries after any recipe run ends.
+        try:
+            if not self.home.rpm_ctl.edit.hasFocus():
+                self.home.rpm_ctl.set_value(float(self._home_manual_rpm_snapshot), emit_signal=False)
+            if not self.home.time_ctl.edit.hasFocus():
+                self.home.time_ctl.set_text_mmss(str(self._home_manual_timer_snapshot or "00:00"), emit_signal=False)
+        except Exception:
+            pass
         self._recipe_monitor_recipe = None
         self._recipe_monitor_step_idx = -1
 
