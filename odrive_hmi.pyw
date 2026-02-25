@@ -1661,9 +1661,15 @@ class RunEngine(QObject):
         self._step_end_t = 0.0
         self._recipe_override_rpm: Optional[float] = None
         self._waiting_data_entry = False
+        self._paused = False
+        self._single_remaining_s = 0
+        self._recipe_step_remaining_s = 0
 
     def is_running(self) -> bool:
         return self._mode in ("single", "recipe")
+
+    def is_paused(self) -> bool:
+        return bool(self._paused)
 
     def run_mode(self) -> str:
         return self._mode
@@ -1678,10 +1684,16 @@ class RunEngine(QObject):
             self._mode = mode
             self.run_mode_changed.emit(mode)
 
+    def _clear_pause(self) -> None:
+        self._paused = False
+        self._single_remaining_s = 0
+        self._recipe_step_remaining_s = 0
+
     @Slot(float, int)
     def start_single(self, rpm: float, duration_s: int) -> None:
         self.stop(user_initiated=False)
         self._set_mode("single")
+        self._clear_pause()
         self._recipe_override_rpm = None
         self._active_rpm = float(rpm)
         now = time.monotonic()
@@ -1699,6 +1711,7 @@ class RunEngine(QObject):
     def start_recipe(self, recipe: Recipe) -> None:
         self.stop(user_initiated=False)
         self._set_mode("recipe")
+        self._clear_pause()
         self._recipe = recipe
         self._step_idx = 0
         self._recipe_override_rpm = None
@@ -1739,6 +1752,7 @@ class RunEngine(QObject):
     def continue_after_data_entry(self) -> None:
         if self._mode != "recipe" or self._recipe is None or not self._waiting_data_entry:
             return
+        self._paused = False
         self._waiting_data_entry = False
         now = time.monotonic()
         self._step_idx += 1
@@ -1782,10 +1796,58 @@ class RunEngine(QObject):
     def adjust_single_remaining(self, delta_s: int) -> None:
         if self._mode != "single":
             return
+        if self._paused:
+            self._single_remaining_s = int(clamp(int(self._single_remaining_s) + int(delta_s), 0, TIME_MAX_S))
+            self.remaining_changed.emit(int(self._single_remaining_s))
+            return
         now = time.monotonic()
         remaining = int(round(self._single_end_t - now))
         new_remaining = int(clamp(remaining + int(delta_s), 0, TIME_MAX_S))
         self._single_end_t = now + new_remaining
+        self._tick()
+
+    @Slot()
+    def pause(self) -> None:
+        if self._paused or self._mode not in ("single", "recipe"):
+            return
+        now = time.monotonic()
+        if self._mode == "single":
+            self._single_remaining_s = max(0, int(round(self._single_end_t - now)))
+        elif self._mode == "recipe":
+            if self._waiting_data_entry:
+                self._recipe_step_remaining_s = 0
+            else:
+                self._recipe_step_remaining_s = max(0, int(round(self._step_end_t - now)))
+        self._paused = True
+        if self._timer.isActive():
+            self._timer.stop()
+        self.request_stop.emit()
+        self._set_status("Paused")
+        if self._mode == "single":
+            self.remaining_changed.emit(int(self._single_remaining_s))
+        elif self._mode == "recipe":
+            self.remaining_changed.emit(int(self._recipe_step_remaining_s if not self._waiting_data_entry else 0))
+
+    @Slot()
+    def resume(self) -> None:
+        if not self._paused or self._mode not in ("single", "recipe"):
+            return
+        now = time.monotonic()
+        if self._mode == "single":
+            self._single_end_t = now + max(0, int(self._single_remaining_s))
+            if abs(self._active_rpm) > 1e-9:
+                self.request_set_rpm.emit(self._active_rpm)
+                self.active_rpm_changed.emit(self._active_rpm)
+        elif self._mode == "recipe":
+            if not self._waiting_data_entry:
+                self._step_end_t = now + max(0, int(self._recipe_step_remaining_s))
+                if abs(self._active_rpm) > 1e-9:
+                    self.request_set_rpm.emit(self._active_rpm)
+                    self.active_rpm_changed.emit(self._active_rpm)
+        self._paused = False
+        self._set_status("Running")
+        if not self._timer.isActive():
+            self._timer.start()
         self._tick()
 
     @Slot(bool)
@@ -1799,6 +1861,7 @@ class RunEngine(QObject):
         self._recipe = None
         self._step_idx = -1
         self._active_rpm = 0.0
+        self._clear_pause()
         self._recipe_override_rpm = None
         self._waiting_data_entry = False
 
@@ -1809,6 +1872,8 @@ class RunEngine(QObject):
 
     @Slot()
     def _tick(self) -> None:
+        if self._paused:
+            return
         now = time.monotonic()
 
         if self._mode == "single":
@@ -1888,6 +1953,12 @@ class HistoryDB:
             return True
         return False
 
+    def insert_force(self, ts: int, tag: str, value: float) -> None:
+        v = float(value)
+        self._conn.execute("INSERT INTO samples(ts, tag, value) VALUES(?, ?, ?)", (int(ts), str(tag), v))
+        self._conn.commit()
+        self._last[str(tag)] = (int(ts), v)
+
     def insert_many_if_needed(self, ts: int, samples: Sequence[Tuple[str, float, float, int]]) -> List[str]:
         inserted: List[str] = []
         rows: List[Tuple[int, str, float]] = []
@@ -1912,7 +1983,7 @@ class HistoryDB:
     def query_window(self, now_ts: int, tag: str, minutes: int) -> List[Tuple[int, float]]:
         start_ts = now_ts - max(1, int(minutes)) * 60
         cur = self._conn.execute(
-            "SELECT ts, value FROM samples WHERE tag=? AND ts>=? AND ts<=? ORDER BY ts ASC",
+            "SELECT ts, value FROM samples WHERE tag=? AND ts>=? AND ts<=? ORDER BY ts ASC, rowid ASC",
             (tag, start_ts, now_ts),
         )
         return [(int(r[0]), float(r[1])) for r in cur.fetchall()]
@@ -1924,7 +1995,7 @@ class HistoryDB:
         lo = int(min(start_ts, end_ts))
         hi = int(max(start_ts, end_ts))
         cur = self._conn.execute(
-            "SELECT ts, value FROM samples WHERE tag=? AND ts>=? AND ts<=? ORDER BY ts ASC",
+            "SELECT ts, value FROM samples WHERE tag=? AND ts>=? AND ts<=? ORDER BY ts ASC, rowid ASC",
             (tag, lo, hi),
         )
         return [(int(r[0]), float(r[1])) for r in cur.fetchall()]
@@ -3521,6 +3592,7 @@ class RecipeRunStepBox(QFrame):
 class RecipeRunMonitorScreen(QWidget):
     back_clicked = Signal()
     stop_clicked = Signal()
+    pause_resume_clicked = Signal()
     tags_changed = Signal(object)  # list[str]
     generate_report_clicked = Signal()
 
@@ -3584,16 +3656,20 @@ class RecipeRunMonitorScreen(QWidget):
         footer_row.setSpacing(ui(12))
         footer_row.addStretch(1)
         self.btn_report = TouchButton("Generate Report", min_h=72, min_w=260)
+        self.btn_pause_resume = TouchButton("Pause", min_h=72, min_w=260)
         self.btn_stop = TouchButton("Stop", min_h=72, min_w=220)
         self.btn_stop.setObjectName("StopButton")
         footer_row.addWidget(self.btn_report)
+        footer_row.addWidget(self.btn_pause_resume)
         footer_row.addWidget(self.btn_stop)
         root.addLayout(footer_row)
 
         self.btn_back.clicked.connect(self.back_clicked.emit)
         self.btn_stop.clicked.connect(self.stop_clicked.emit)
+        self.btn_pause_resume.clicked.connect(self.pause_resume_clicked.emit)
         self.btn_options.clicked.connect(self._open_options_dialog)
         self.btn_report.clicked.connect(self.generate_report_clicked.emit)
+        self.set_pause_resume_action("pause", enabled=False)
 
     def selected_tags(self) -> List[str]:
         return list(getattr(self, "_selected_tags", [TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM]))
@@ -3648,6 +3724,17 @@ class RecipeRunMonitorScreen(QWidget):
 
     def append_points(self, points: List[Tuple[str, int, float]], tags: List[str]) -> None:
         self.plot.append_points(points, tags, self._plot_minutes)  # type: ignore[attr-defined]
+
+    def set_pause_resume_action(self, mode: str, enabled: bool = True) -> None:
+        m = str(mode or "pause").strip().lower()
+        if m == "resume":
+            txt = "Resume"
+        elif m in ("clear_error_resume", "clear-error-resume"):
+            txt = "Clear Error && Resume"
+        else:
+            txt = "Pause"
+        self.btn_pause_resume.setText(txt)
+        self.btn_pause_resume.setEnabled(bool(enabled))
 
     @Slot()
     def _open_options_dialog(self) -> None:
@@ -3920,6 +4007,8 @@ class AppController(QObject):
         self._recipe_monitor_recipe: Optional[Recipe] = None
         self._recipe_monitor_step_idx = -1
         self._recipe_monitor_failed = False
+        self._recipe_monitor_error_paused = False
+        self._recipe_resume_after_clear_error = False
         self._recipe_monitor_plot_tags: List[str] = [TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM]
         self._current_recipe_run_record: Optional[Dict[str, Any]] = None
 
@@ -3999,6 +4088,7 @@ class AppController(QObject):
         self.hmi_settings.back_clicked.connect(self.on_back_settings)
         self.recipe_run.back_clicked.connect(self.on_back_home)
         self.recipe_run.stop_clicked.connect(self.on_stop)
+        self.recipe_run.pause_resume_clicked.connect(self.on_recipe_pause_resume)
         self.recipe_run.tags_changed.connect(self._on_recipe_run_tags_changed)
         self.recipe_run.generate_report_clicked.connect(self.on_generate_current_recipe_report)
         self.hmi_settings.fullscreen_changed.connect(self.on_hmi_fullscreen_changed)
@@ -4151,6 +4241,16 @@ class AppController(QObject):
             recipe_run_active=recipe_run_active,
         )
         self.dlog.set_running_ui(running=running, motor_controls_enabled=motor_controls_enabled)
+
+        recipe_pause_enabled = bool(self._recipe_monitor_recipe is not None and self._run_mode == "recipe")
+        if not recipe_pause_enabled:
+            self.recipe_run.set_pause_resume_action("pause", enabled=False)
+        elif self._recipe_monitor_error_paused:
+            self.recipe_run.set_pause_resume_action("clear_error_resume", enabled=True)
+        elif self.engine.is_paused():
+            self.recipe_run.set_pause_resume_action("resume", enabled=True)
+        else:
+            self.recipe_run.set_pause_resume_action("pause", enabled=True)
 
     def _adjust_time_from_home(self, delta_s: int) -> None:
         if self._run_mode != "single":
@@ -4337,11 +4437,13 @@ class AppController(QObject):
         msg = str(msg or "")
         self._calibration_busy = False
         if self._run_mode == "recipe" and self._recipe_monitor_recipe is not None:
-            self._recipe_monitor_failed = True
+            self._recipe_monitor_error_paused = True
             if self._recipe_monitor_step_idx >= 0:
                 self.recipe_run.set_step_error(self._recipe_monitor_step_idx, msg)
             self._recipe_run_audit(f"Error: {msg}")
-        if self.engine.is_running():
+            if self.engine.is_running():
+                self.engine.pause()
+        elif self.engine.is_running():
             self.engine.stop(user_initiated=True)
         self._show_odrive_error_with_clear(self.stack.currentWidget(), msg)
         self._refresh_status_all()
@@ -4673,9 +4775,21 @@ class AppController(QObject):
         if self.stack.currentWidget() is self.cfg:
             self.cfg.set_loading("Loaded")
         parent = self.cfg if self.stack.currentWidget() is self.cfg else self.stack.currentWidget()
+        auto_resume = bool(ok and self._recipe_resume_after_clear_error and self._recipe_monitor_error_paused and self._run_mode == "recipe")
         if ok:
-            QMessageBox.information(parent, "Clear Errors", str(message))
+            if self._recipe_monitor_error_paused and self._run_mode == "recipe":
+                self._recipe_monitor_error_paused = False
+            if auto_resume:
+                self._recipe_run_audit("ODrive errors cleared; resuming recipe")
+                self._recipe_resume_after_clear_error = False
+                self.engine.resume()
+                self._refresh_status_all()
+                self._apply_controls()
+            else:
+                self._apply_controls()
+                QMessageBox.information(parent, "Clear Errors", str(message))
         else:
+            self._recipe_resume_after_clear_error = False
             self._show_modal_error(parent, "Clear Errors", str(message))
 
     @Slot(int, object)
@@ -4720,8 +4834,19 @@ class AppController(QObject):
 
     @Slot(float)
     def _on_engine_rpm(self, rpm: float) -> None:
-        self._ui_rpm = float(rpm)
-        self._cmd_rpm = float(rpm)
+        new_rpm = float(rpm)
+        prev_rpm = float(self._cmd_rpm)
+        self._ui_rpm = new_rpm
+        if abs(new_rpm - prev_rpm) > 1e-9:
+            ts = epoch_s()
+            try:
+                # Record an explicit step edge in the historian: old command value and
+                # then the new command value at the same timestamp.
+                self.history_db.insert_force(ts=ts, tag=TAG_CMD_RPM, value=prev_rpm)
+                self.history_db.insert_force(ts=ts, tag=TAG_CMD_RPM, value=new_rpm)
+            except Exception:
+                pass
+        self._cmd_rpm = new_rpm
         self._log_cmd_rpm()
 
         # Only force the Home RPM entry to follow the engine while running.
@@ -4986,17 +5111,40 @@ class AppController(QObject):
         if len(recipe.steps) < 1:
             QMessageBox.warning(self.home, "Start", "Selected recipe has no steps.")
             return
+        self._recipe_monitor_error_paused = False
+        self._recipe_resume_after_clear_error = False
         self._recipe_monitor_begin(recipe)
         self.engine.start_recipe(recipe)
 
     @Slot()
     def on_stop(self) -> None:
+        self._recipe_resume_after_clear_error = False
         if self._run_mode == "recipe" and self._recipe_monitor_recipe is not None and not self._recipe_monitor_failed:
             self._recipe_run_audit("Recipe stopped by user")
             if self._recipe_monitor_step_idx >= 0:
                 self.recipe_run.set_step_error(self._recipe_monitor_step_idx, "Stopped by user")
             self._recipe_monitor_failed = True
+            self._recipe_monitor_error_paused = False
         self.engine.stop(user_initiated=True)
+
+    @Slot()
+    def on_recipe_pause_resume(self) -> None:
+        if self._run_mode != "recipe" or self._recipe_monitor_recipe is None:
+            return
+        if self._recipe_monitor_error_paused:
+            self._recipe_resume_after_clear_error = True
+            self._recipe_run_audit("Clear errors and resume requested")
+            self._clear_odrive_errors()
+            self._apply_controls()
+            return
+        if self.engine.is_paused():
+            self._recipe_run_audit("Recipe resumed")
+            self.engine.resume()
+        else:
+            self._recipe_run_audit("Recipe paused")
+            self.engine.pause()
+        self._refresh_status_all()
+        self._apply_controls()
 
     @Slot()
     def on_calibrate(self) -> None:
@@ -5322,6 +5470,8 @@ class AppController(QObject):
         self._recipe_monitor_recipe = recipe
         self._recipe_monitor_step_idx = -1
         self._recipe_monitor_failed = False
+        self._recipe_monitor_error_paused = False
+        self._recipe_resume_after_clear_error = False
         run_id = str(uuid.uuid4())
         self._current_recipe_run_record = {
             "run_id": run_id,
@@ -5341,6 +5491,8 @@ class AppController(QObject):
     def _recipe_monitor_finish(self, reason: str) -> None:
         if self._recipe_monitor_recipe is None:
             return
+        self._recipe_monitor_error_paused = False
+        self._recipe_resume_after_clear_error = False
         self._recipe_run_audit(reason)
         if self._current_recipe_run_record is not None:
             self._current_recipe_run_record["ended_ts"] = int(epoch_s())
