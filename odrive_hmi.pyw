@@ -41,6 +41,7 @@ import json
 import math
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
@@ -62,6 +63,11 @@ from PySide6.QtCore import (
     Qt,
     QThread,
     QTimer,
+    QPoint,
+    QRect,
+    QEasingCurve,
+    QPropertyAnimation,
+    QParallelAnimationGroup,
     QStandardPaths,
     Signal,
     Slot,
@@ -69,7 +75,7 @@ from PySide6.QtCore import (
     QDateTime,
     QSignalBlocker,
 )
-from PySide6.QtGui import QDoubleValidator, QFont, QIntValidator, QPainter
+from PySide6.QtGui import QCursor, QDoubleValidator, QFont, QIntValidator, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -78,11 +84,14 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
+    QMenu,
     QMessageBox,
+    QInputDialog,
     QPushButton,
     QScrollArea,
     QScroller,
@@ -2545,13 +2554,21 @@ class RecipeCard(QFrame):
 class StepRow(QFrame):
     remove_clicked = Signal(int)
     drag_reorder_requested = Signal(int, int)  # from_idx, drop_global_y
+    drag_started = Signal(int, int, int)   # idx, global_x, global_y
+    drag_moved = Signal(int, int, int)     # idx, global_x, global_y
+    drag_finished = Signal(int, int, int)  # idx, global_x, global_y
+    move_up_requested = Signal(int)
+    move_down_requested = Signal(int)
+    move_to_requested = Signal(int)
     text_field_focused = Signal(object)  # QWidget
 
     def __init__(self, index: int, step: Step) -> None:
         super().__init__()
         self._index = index
         self._drag_press_y: Optional[int] = None
+        self._drag_press_x: Optional[int] = None
         self._dragging = False
+        self._drag_start_threshold_px = max(4, ui(8))
         self.setObjectName("StepRow")
         self.setFrameShape(QFrame.StyledPanel)
 
@@ -2594,6 +2611,12 @@ class StepRow(QFrame):
         header.addWidget(self.name_edit, 2)
 
         btn_h, btn_w = ui(54), ui(120)
+        self.btn_more = QPushButton("⋯")
+        self.btn_more.setMinimumHeight(btn_h)
+        self.btn_more.setMinimumWidth(ui(58))
+        self.btn_more.setMaximumWidth(ui(70))
+        self.btn_more.clicked.connect(self._open_step_menu)
+        header.addWidget(self.btn_more)
         self.btn_remove = TouchButton("Remove", min_h=btn_h, min_w=btn_w)
         header.addWidget(self.btn_remove)
         root.addLayout(header)
@@ -2703,34 +2726,74 @@ class StepRow(QFrame):
             if event.button() == Qt.LeftButton:
                 try:
                     self.drag_handle.setCursor(Qt.ClosedHandCursor)
+                    self.drag_handle.grabMouse()
                 except Exception:
                     pass
+                self._drag_press_x = int(event.globalPosition().x())  # type: ignore[attr-defined]
                 self._drag_press_y = int(event.globalPosition().y())  # type: ignore[attr-defined]
                 self._dragging = False
         except Exception:
+            self._drag_press_x = None
             self._drag_press_y = None
             self._dragging = False
 
     def _handle_drag_move_event(self, event: Any) -> None:
         try:
             if self._drag_press_y is not None and (event.buttons() & Qt.LeftButton):
+                gx = int(event.globalPosition().x())  # type: ignore[attr-defined]
                 gy = int(event.globalPosition().y())  # type: ignore[attr-defined]
-                if abs(gy - int(self._drag_press_y)) >= QApplication.startDragDistance():
+                if (not self._dragging) and (
+                    abs(gy - int(self._drag_press_y)) >= int(self._drag_start_threshold_px)
+                    or (self._drag_press_x is not None and abs(gx - int(self._drag_press_x)) >= int(self._drag_start_threshold_px))
+                ):
                     self._dragging = True
+                    self.drag_started.emit(int(self._index), int(gx), int(gy))
+                if self._dragging:
+                    self.drag_moved.emit(int(self._index), int(gx), int(gy))
         except Exception:
             pass
 
     def _handle_drag_release_event(self, event: Any) -> None:
         try:
+            gx = int(event.globalPosition().x())  # type: ignore[attr-defined]
+            gy = int(event.globalPosition().y())  # type: ignore[attr-defined]
             if self._dragging and event.button() == Qt.LeftButton:
                 gy = int(event.globalPosition().y())  # type: ignore[attr-defined]
                 self.drag_reorder_requested.emit(int(self._index), int(gy))
+                self.drag_finished.emit(int(self._index), int(gx), int(gy))
         except Exception:
             pass
+        self._drag_press_x = None
         self._drag_press_y = None
         self._dragging = False
         try:
             self.drag_handle.setCursor(Qt.OpenHandCursor)
+            self.drag_handle.releaseMouse()
+        except Exception:
+            pass
+
+    def set_dragging_visual(self, active: bool) -> None:
+        self.setProperty("dragging", "true" if active else "false")
+        try:
+            self.style().unpolish(self)
+            self.style().polish(self)
+        except Exception:
+            pass
+
+    @Slot()
+    def _open_step_menu(self) -> None:
+        try:
+            menu = QMenu(self)
+            a_up = menu.addAction("Move Up")
+            a_down = menu.addAction("Move Down")
+            a_to = menu.addAction("Move to Step #")
+            chosen = menu.exec(self.btn_more.mapToGlobal(self.btn_more.rect().bottomLeft()))
+            if chosen is a_up:
+                self.move_up_requested.emit(int(self._index))
+            elif chosen is a_down:
+                self.move_down_requested.emit(int(self._index))
+            elif chosen is a_to:
+                self.move_to_requested.emit(int(self._index))
         except Exception:
             pass
 
@@ -2764,6 +2827,15 @@ class RecipeBuilderScreen(QWidget):
         super().__init__()
         self._editing_id: Optional[str] = None
         self._vel_max_rpm = float(HMI_MAX_VEL_DEFAULT_RPM)
+        self._drag_active = False
+        self._drag_row: Optional[StepRow] = None
+        self._drag_overlay: Optional[QLabel] = None
+        self._drag_cursor_offset = QPoint(0, 0)
+        self._drag_last_target_idx: Optional[int] = None
+        self._row_anims: List[QParallelAnimationGroup] = []
+        self._drag_autoscroll_timer = QTimer(self)
+        self._drag_autoscroll_timer.setInterval(16)
+        self._drag_autoscroll_timer.timeout.connect(self._drag_autoscroll_tick)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(ui(18), ui(16), ui(18), ui(16))
@@ -2847,6 +2919,12 @@ class RecipeBuilderScreen(QWidget):
         row.vel.set_range(VEL_MIN_RPM, self._vel_max_rpm)
         row.remove_clicked.connect(self._on_remove)
         row.drag_reorder_requested.connect(self._on_drag_reorder)
+        row.drag_started.connect(self._on_row_drag_started)
+        row.drag_moved.connect(self._on_row_drag_moved)
+        row.drag_finished.connect(self._on_row_drag_finished)
+        row.move_up_requested.connect(self._on_move_row_up)
+        row.move_down_requested.connect(self._on_move_row_down)
+        row.move_to_requested.connect(self._on_move_row_to_prompt)
         row.text_field_focused.connect(self._on_step_text_field_focused)
         # Keep the extra spacer below the final step (for keyboard room),
         # while preserving the stretch as the last layout item.
@@ -2900,6 +2978,9 @@ class RecipeBuilderScreen(QWidget):
 
     @Slot(int, int)
     def _on_drag_reorder(self, from_idx: int, drop_global_y: int) -> None:
+        # Legacy release-only path (kept as fallback). Live drag handles reordering now.
+        if self._drag_active:
+            return
         rows = self._rows()
         if not (0 <= int(from_idx) < len(rows)):
             return
@@ -2920,6 +3001,269 @@ class RecipeBuilderScreen(QWidget):
         self.steps_layout.removeWidget(w)
         self.steps_layout.insertWidget(int(target_idx), w)
         self._reindex()
+
+    def _move_row_to_index(self, from_idx: int, target_idx: int) -> None:
+        rows = self._rows()
+        if not (0 <= int(from_idx) < len(rows)):
+            return
+        target_idx = int(clamp(int(target_idx), 0, max(0, len(rows) - 1)))
+        if target_idx == int(from_idx):
+            return
+        w = rows[int(from_idx)]
+        self.steps_layout.removeWidget(w)
+        self.steps_layout.insertWidget(int(target_idx), w)
+        self._reindex()
+
+    @Slot(int)
+    def _on_move_row_up(self, idx: int) -> None:
+        if self._drag_active:
+            return
+        self._move_row_to_index(int(idx), int(idx) - 1)
+
+    @Slot(int)
+    def _on_move_row_down(self, idx: int) -> None:
+        if self._drag_active:
+            return
+        self._move_row_to_index(int(idx), int(idx) + 1)
+
+    @Slot(int)
+    def _on_move_row_to_prompt(self, idx: int) -> None:
+        if self._drag_active:
+            return
+        rows = self._rows()
+        if not rows:
+            return
+        current_step_num = int(idx) + 1
+        dest, ok = QInputDialog.getInt(
+            self,
+            "Move Step",
+            "Move to step number:",
+            current_step_num,
+            1,
+            len(rows),
+            1,
+        )
+        if not ok:
+            return
+        self._move_row_to_index(int(idx), int(dest) - 1)
+
+    @Slot(int, int, int)
+    def _on_row_drag_started(self, idx: int, gx: int, gy: int) -> None:
+        rows = self._rows()
+        if not (0 <= int(idx) < len(rows)):
+            return
+        row = rows[int(idx)]
+        self._drag_active = True
+        self._drag_row = row
+        self._drag_last_target_idx = int(idx)
+        row.set_dragging_visual(True)
+
+        vp = self.steps_area.viewport()
+        try:
+            row_pos_vp = row.mapTo(vp, QPoint(0, 0))
+        except Exception:
+            row_pos_vp = QPoint(0, 0)
+        cursor_vp = vp.mapFromGlobal(QPoint(int(gx), int(gy)))
+        self._drag_cursor_offset = QPoint(
+            int(cursor_vp.x() - row_pos_vp.x()),
+            int(cursor_vp.y() - row_pos_vp.y()),
+        )
+
+        overlay = QLabel(vp)
+        overlay.setObjectName("StepRowDragGhost")
+        try:
+            pm = row.grab()
+            overlay.setPixmap(pm)
+            overlay.resize(pm.size())
+        except Exception:
+            overlay.setText(row.lbl.text())
+            overlay.resize(row.size())
+        overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        try:
+            ghost_fx = QGraphicsOpacityEffect(overlay)
+            ghost_fx.setOpacity(0.88)
+            overlay.setGraphicsEffect(ghost_fx)
+        except Exception:
+            pass
+        overlay.show()
+        overlay.raise_()
+        self._drag_overlay = overlay
+        self._position_drag_overlay(int(gx), int(gy))
+        self._drag_autoscroll_timer.start()
+
+    @Slot(int, int, int)
+    def _on_row_drag_moved(self, idx: int, gx: int, gy: int) -> None:
+        if not self._drag_active or self._drag_row is None or int(idx) != int(self._drag_row._index):  # type: ignore[attr-defined]
+            return
+        self._position_drag_overlay(int(gx), int(gy))
+        self._drag_reorder_live(int(gx), int(gy))
+
+    @Slot(int, int, int)
+    def _on_row_drag_finished(self, idx: int, gx: int, gy: int) -> None:
+        if not self._drag_active:
+            return
+        self._position_drag_overlay(int(gx), int(gy))
+        self._drag_reorder_live(int(gx), int(gy))
+        self._drag_autoscroll_timer.stop()
+        row = self._drag_row
+        overlay = self._drag_overlay
+        if row is not None:
+            row.set_dragging_visual(False)
+        if overlay is not None:
+            try:
+                vp = self.steps_area.viewport()
+                target = row.mapTo(vp, QPoint(0, 0)) if row is not None else overlay.pos()
+                end_rect = QRect(target, overlay.size())
+                anim = QPropertyAnimation(overlay, b"geometry", self)
+                anim.setDuration(95)
+                anim.setStartValue(overlay.geometry())
+                anim.setEndValue(end_rect)
+                anim.setEasingCurve(QEasingCurve.OutCubic)
+                anim.finished.connect(overlay.deleteLater)
+                anim.start()
+            except Exception:
+                overlay.deleteLater()
+        self._drag_active = False
+        self._drag_row = None
+        self._drag_overlay = None
+        self._drag_last_target_idx = None
+        self._reindex()
+
+    def _position_drag_overlay(self, gx: int, gy: int) -> None:
+        overlay = self._drag_overlay
+        if overlay is None:
+            return
+        vp = self.steps_area.viewport()
+        p = vp.mapFromGlobal(QPoint(int(gx), int(gy))) - self._drag_cursor_offset
+        x = int(clamp(int(p.x()), ui(2), max(ui(2), int(vp.width() - overlay.width() - ui(2)))))
+        y = int(clamp(int(p.y()), -ui(8), max(-ui(8), int(vp.height() - ui(24)))))
+        overlay.move(x, y)
+        overlay.raise_()
+
+    def _drag_target_index(self, drop_global_y: int) -> Optional[int]:
+        rows = self._rows()
+        if not rows or self._drag_row is None:
+            return None
+        best_idx = None
+        best_dist = None
+        for i, row in enumerate(rows):
+            if row is self._drag_row:
+                continue
+            try:
+                cy = int(row.mapToGlobal(row.rect().center()).y())
+            except Exception:
+                continue
+            dist = abs(int(drop_global_y) - cy)
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_idx = i
+        if best_idx is None:
+            return int(rows.index(self._drag_row))
+        return int(best_idx)
+
+    def _drag_reorder_live(self, gx: int, gy: int) -> None:
+        if self._drag_row is None:
+            return
+        rows = self._rows()
+        if self._drag_row not in rows:
+            return
+        from_idx = int(rows.index(self._drag_row))
+        moved = False
+        hysteresis = max(ui(16), int(self._drag_row.height() * 0.20))
+
+        if from_idx > 0:
+            prev_row = rows[from_idx - 1]
+            try:
+                prev_cy = int(prev_row.mapToGlobal(prev_row.rect().center()).y())
+            except Exception:
+                prev_cy = None
+            if prev_cy is not None and int(gy) < int(prev_cy - hysteresis):
+                self._animate_layout_reorder(self._drag_row, from_idx - 1)
+                self._drag_last_target_idx = int(from_idx - 1)
+                moved = True
+
+        if (not moved) and from_idx < (len(rows) - 1):
+            # Re-read rows/from_idx in case we moved upward just above.
+            rows = self._rows()
+            if self._drag_row in rows:
+                from_idx = int(rows.index(self._drag_row))
+            if from_idx < (len(rows) - 1):
+                next_row = rows[from_idx + 1]
+                try:
+                    next_cy = int(next_row.mapToGlobal(next_row.rect().center()).y())
+                except Exception:
+                    next_cy = None
+                if next_cy is not None and int(gy) > int(next_cy + hysteresis):
+                    self._animate_layout_reorder(self._drag_row, from_idx + 1)
+                    self._drag_last_target_idx = int(from_idx + 1)
+                    moved = True
+
+        if not moved:
+            self._drag_last_target_idx = int(from_idx)
+        self._position_drag_overlay(int(gx), int(gy))
+
+    def _animate_layout_reorder(self, moving_row: StepRow, target_idx: int) -> None:
+        rows_before = self._rows()
+        old_rects: Dict[QWidget, QRect] = {}
+        for row in rows_before:
+            try:
+                old_rects[row] = row.geometry()
+            except Exception:
+                pass
+        self.steps_layout.removeWidget(moving_row)
+        self.steps_layout.insertWidget(int(target_idx), moving_row)
+        try:
+            self.steps_layout.activate()
+        except Exception:
+            pass
+        self._reindex()
+
+        group = QParallelAnimationGroup(self)
+        animated = False
+        for row in self._rows():
+            if row is moving_row:
+                continue
+            if row not in old_rects:
+                continue
+            old_r = old_rects[row]
+            new_r = row.geometry()
+            if old_r == new_r:
+                continue
+            anim = QPropertyAnimation(row, b"geometry", group)
+            anim.setDuration(110)
+            anim.setStartValue(old_r)
+            anim.setEndValue(new_r)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            group.addAnimation(anim)
+            animated = True
+        if animated:
+            self._row_anims.append(group)
+            group.finished.connect(lambda g=group: self._row_anims.remove(g) if g in self._row_anims else None)
+            group.start()
+
+    @Slot()
+    def _drag_autoscroll_tick(self) -> None:
+        if not self._drag_active or self._drag_row is None:
+            self._drag_autoscroll_timer.stop()
+            return
+        vp = self.steps_area.viewport()
+        local = vp.mapFromGlobal(QCursor.pos())
+        margin = ui(96)
+        base_speed = ui(4)
+        max_speed = ui(26)
+        sb = self.steps_area.verticalScrollBar()
+        delta = 0
+        if local.y() < margin:
+            frac = float(margin - local.y()) / max(1.0, float(margin))
+            delta = -int(clamp(float(base_speed) + frac * float(max_speed), float(base_speed), float(max_speed)))
+        elif local.y() > (vp.height() - margin):
+            frac = float(local.y() - (vp.height() - margin)) / max(1.0, float(margin))
+            delta = int(clamp(float(base_speed) + frac * float(max_speed), float(base_speed), float(max_speed)))
+        if delta:
+            sb.setValue(int(clamp(int(sb.value()) + int(delta), int(sb.minimum()), int(sb.maximum()))))
+            pos = QCursor.pos()
+            self._position_drag_overlay(int(pos.x()), int(pos.y()))
+            self._drag_reorder_live(int(pos.x()), int(pos.y()))
 
     @Slot()
     def _on_save(self) -> None:
@@ -4135,6 +4479,7 @@ class RecipeRunMonitorScreen(QWidget):
     skip_step_clicked = Signal(int)
     tags_changed = Signal(object)  # list[str]
     generate_report_clicked = Signal()
+    screenshot_clicked = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -4210,10 +4555,12 @@ class RecipeRunMonitorScreen(QWidget):
         footer_row = QHBoxLayout()
         footer_row.setSpacing(ui(12))
         footer_row.addStretch(1)
+        self.btn_screenshot = TouchButton("Screenshot", min_h=72, min_w=220)
         self.btn_report = TouchButton("Generate Report", min_h=72, min_w=260)
         self.btn_pause_resume = TouchButton("Pause", min_h=72, min_w=260)
         self.btn_stop = TouchButton("Stop", min_h=72, min_w=220)
         self.btn_stop.setObjectName("StopButton")
+        footer_row.addWidget(self.btn_screenshot)
         footer_row.addWidget(self.btn_report)
         footer_row.addWidget(self.btn_pause_resume)
         footer_row.addWidget(self.btn_stop)
@@ -4224,6 +4571,7 @@ class RecipeRunMonitorScreen(QWidget):
         self.btn_pause_resume.clicked.connect(self.pause_resume_clicked.emit)
         self.btn_options.clicked.connect(self._open_options_dialog)
         self.btn_report.clicked.connect(self.generate_report_clicked.emit)
+        self.btn_screenshot.clicked.connect(self.screenshot_clicked.emit)
         self.set_pause_resume_action("pause", enabled=False)
         self.set_stop_action("stop", enabled=True)
 
@@ -4705,6 +5053,7 @@ class AppController(QObject):
         self.recipe_run.skip_step_clicked.connect(self.on_recipe_skip_step)
         self.recipe_run.tags_changed.connect(self._on_recipe_run_tags_changed)
         self.recipe_run.generate_report_clicked.connect(self.on_generate_current_recipe_report)
+        self.recipe_run.screenshot_clicked.connect(self.on_recipe_run_screenshot)
         self.hmi_settings.fullscreen_changed.connect(self.on_hmi_fullscreen_changed)
 
         self.cfg.back_clicked.connect(self.on_back_home)
@@ -4787,6 +5136,39 @@ class AppController(QObject):
             pass
         box.setStandardButtons(QMessageBox.Ok)
         box.exec()
+
+    def _open_in_folder(self, path_obj: Any) -> None:
+        p = Path(path_obj)
+        try:
+            if os.name == "nt":
+                try:
+                    subprocess.Popen(["explorer", "/select,", str(p)])
+                    return
+                except Exception:
+                    pass
+            if hasattr(os, "startfile"):
+                target = p if p.is_dir() else p.parent
+                os.startfile(str(target))  # type: ignore[attr-defined]
+                return
+            raise RuntimeError("Opening file explorer is not supported on this platform build.")
+        except Exception as e:
+            self._show_modal_error(self.stack.currentWidget() or self.home, "View in Folder", f"Failed to open folder:\n{e}")
+
+    def _show_saved_file_dialog(self, parent: QWidget, title: str, message_prefix: str, out_path: Path) -> None:
+        box = QMessageBox(parent)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle(title)
+        box.setText(f"{message_prefix}\n{out_path}")
+        try:
+            box.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        except Exception:
+            pass
+        btn_view = box.addButton("View in Folder", QMessageBox.ActionRole)
+        btn_ok = box.addButton(QMessageBox.Ok)
+        box.setDefaultButton(btn_ok)
+        box.exec()
+        if box.clickedButton() is btn_view:
+            self._open_in_folder(out_path)
 
     def _show_odrive_error_with_clear(self, parent: QWidget, msg: str) -> None:
         now_m = time.monotonic()
@@ -6037,6 +6419,26 @@ class AppController(QObject):
         self._export_recipe_run_report(run)
 
     @Slot()
+    def on_recipe_run_screenshot(self) -> None:
+        try:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            recipe_name = "recipe_run"
+            if self._recipe_monitor_recipe is not None:
+                recipe_name = str(getattr(self._recipe_monitor_recipe, "name", "") or recipe_name)
+            safe_name = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in recipe_name).strip("_")
+            if not safe_name:
+                safe_name = "recipe_run"
+            out = downloads_dir() / f"recipe_run_screenshot_{safe_name}_{ts}.png"
+            pix = self.recipe_run.grab()
+            if pix.isNull():
+                raise RuntimeError("Screenshot capture returned an empty image.")
+            if not pix.save(str(out), "PNG"):
+                raise RuntimeError("Qt failed to save PNG screenshot.")
+            self._show_saved_file_dialog(self.recipe_run, "Screenshot", "Saved screenshot:", out)
+        except Exception as e:
+            self._show_modal_error(self.recipe_run, "Screenshot", f"Failed to save screenshot:\n{e}")
+
+    @Slot()
     def on_back_home(self) -> None:
         self.stack.setCurrentWidget(self.home)
         self._refresh_recipes()
@@ -6431,7 +6833,7 @@ class AppController(QObject):
         out = downloads_dir() / f"datalogger_{minutes}min_{time.strftime('%Y%m%d_%H%M%S')}.csv"
         try:
             n = self.history_db.export_window_csv_multi(out, epoch_s(), tags, minutes)
-            QMessageBox.information(self.dlog, "Export", f"Exported {n} row(s) to:\n{out}")
+            self._show_saved_file_dialog(self.dlog, "Export", f"Exported {n} row(s) to:", out)
         except Exception as e:
             self._show_modal_error(self.dlog, "Export", f"Failed to export CSV:\n{e}")
 
@@ -6603,6 +7005,8 @@ def apply_style(app: QApplication) -> None:
         QLabel#RecipeSummary {{ font-size: {ui(18)}px; color: #D0D7DE; }}
 
         QFrame#StepRow {{ background: #161B22; border: 2px solid #2A313A; border-radius: {border_r_btn}px; }}
+        QFrame#StepRow[dragging="true"] {{ background: #1A2230; border: 2px solid #4B8ACF; }}
+        QLabel#StepRowDragGhost {{ background: transparent; border: none; }}
         QLabel#StepIndex {{ font-size: {ui(20)}px; font-weight: 700; }}
 
         QFrame#ConfigRow {{ background: #161B22; border: 2px solid #2A313A; border-radius: {border_r_btn}px; }}
