@@ -133,6 +133,7 @@ TAG_PWR_W = "p_w"        # computed vbus*ibus
 TAG_CMD_RPM = "cmd_rpm"  # last commanded
 TAG_VEL_RPM = "vel_rpm"  # actual estimate
 TAG_TORQUE_NM = "torque_nm"  # actual/estimated torque
+TAG_MOTOR_TEMP_C = "motor_temp_c"  # motor thermistor temperature
 
 DEFAULT_ENABLED_TAGS = [TAG_PWR_W, TAG_CMD_RPM]
 
@@ -143,6 +144,7 @@ TAG_DEADBAND: Dict[str, float] = {
     TAG_CMD_RPM: 0.1,
     TAG_VEL_RPM: 0.1,
     TAG_TORQUE_NM: 0.01,
+    TAG_MOTOR_TEMP_C: 0.2,
 }
 TAG_HEARTBEAT_S: Dict[str, int] = {t: DB_HEARTBEAT_S_DEFAULT for t in TAG_DEADBAND}
 
@@ -153,6 +155,7 @@ TAG_LABELS: Dict[str, str] = {
     TAG_TORQUE_NM: "Actual torque (Nm)",
     TAG_VBUS_V: "Bus voltage (V)",
     TAG_IBUS_A: "Bus current (A)",
+    TAG_MOTOR_TEMP_C: "Motor thermistor temperature (C)",
 }
 TAG_UNITS: Dict[str, str] = {
     TAG_PWR_W: "W",
@@ -161,6 +164,7 @@ TAG_UNITS: Dict[str, str] = {
     TAG_TORQUE_NM: "Nm",
     TAG_VBUS_V: "V",
     TAG_IBUS_A: "A",
+    TAG_MOTOR_TEMP_C: "C",
 }
 PLOT_GROUP_RPM = "rpm"
 PLOT_GROUP_OTHER = "other"
@@ -171,6 +175,7 @@ TAG_PLOT_GROUP: Dict[str, str] = {
     TAG_PWR_W: PLOT_GROUP_OTHER,
     TAG_VBUS_V: PLOT_GROUP_OTHER,
     TAG_IBUS_A: PLOT_GROUP_OTHER,
+    TAG_MOTOR_TEMP_C: PLOT_GROUP_OTHER,
 }
 
 # DPI/UI scaling: keep fixed window size but scale fonts/margins so content remains touch-friendly
@@ -579,6 +584,7 @@ class SimulatedOdrive(OdriveInterface):
         rpm_mag = abs(self._actual_rpm)
         ibus = 0.2 + (rpm_mag / max(1.0, VEL_MAX_RPM)) * 2.0
         torque_nm = 0.02 * ibus + 0.0005 * rpm_mag
+        motor_temp_c = 25.0 + min(45.0, rpm_mag * 0.02 + ibus * 1.5)
         out: Dict[str, float] = {}
         for t in tags:
             if t == TAG_VBUS_V:
@@ -589,6 +595,8 @@ class SimulatedOdrive(OdriveInterface):
                 out[t] = float(self._actual_rpm)
             elif t == TAG_TORQUE_NM:
                 out[t] = float(torque_nm)
+            elif t == TAG_MOTOR_TEMP_C:
+                out[t] = float(motor_temp_c)
         return out
 
     def get_json(self) -> str:
@@ -1192,6 +1200,20 @@ class RealOdrive(OdriveInterface):
                                 torque_val = float(iq_val * kt)
                     if torque_val is not None and math.isfinite(torque_val):
                         out[t] = float(torque_val)
+                elif t == TAG_MOTOR_TEMP_C:
+                    temp_val = None
+                    for getter in (
+                        lambda: getattr(getattr(self._axis.motor, "motor_thermistor"), "temperature"),
+                        lambda: getattr(getattr(self._axis.motor, "motor_thermistor"), "temp"),
+                        lambda: getattr(getattr(self._axis.motor, "fet_thermistor"), "temperature"),
+                    ):
+                        try:
+                            temp_val = float(getter())
+                            break
+                        except Exception:
+                            continue
+                    if temp_val is not None and math.isfinite(temp_val):
+                        out[t] = float(temp_val)
             except Exception:
                 pass
         return out
@@ -3525,7 +3547,7 @@ class DataLoggerScreen(QWidget):
 
     def set_selected_tags(self, tags: List[str]) -> None:
         known = {
-            TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_VBUS_V, TAG_IBUS_A
+            TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_VBUS_V, TAG_IBUS_A
         }
         out = [t for t in (tags or []) if t in known]
         self._selected_tags = list(out or DEFAULT_ENABLED_TAGS)
@@ -3564,7 +3586,7 @@ class DataLoggerScreen(QWidget):
         root.addWidget(lbl_tags)
 
         tag_checks: Dict[str, QCheckBox] = {}
-        ordered_tags = [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_VBUS_V, TAG_IBUS_A]
+        ordered_tags = [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_VBUS_V, TAG_IBUS_A]
         wanted = set(self._selected_tags)
         for tag in ordered_tags:
             cb = QCheckBox(TAG_LABELS.get(tag, tag))
@@ -3746,7 +3768,7 @@ class RecipeRunMonitorScreen(QWidget):
         return list(getattr(self, "_selected_tags", [TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM]))
 
     def set_selected_tags(self, tags: List[str]) -> None:
-        known = {TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_VBUS_V, TAG_IBUS_A}
+        known = {TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_VBUS_V, TAG_IBUS_A}
         out = [t for t in (tags or []) if t in known]
         self._selected_tags = list(out or [TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM])
 
@@ -3823,7 +3845,7 @@ class RecipeRunMonitorScreen(QWidget):
         root.addWidget(lbl_tags)
 
         tag_checks: Dict[str, QCheckBox] = {}
-        ordered_tags = [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_VBUS_V, TAG_IBUS_A]
+        ordered_tags = [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_VBUS_V, TAG_IBUS_A]
         wanted = set(self.selected_tags())
         for tag in ordered_tags:
             cb = QCheckBox(TAG_LABELS.get(tag, tag))
@@ -4003,7 +4025,7 @@ class HomeScreen(QWidget):
         self.btn_calibrate.setText("Calibrating..." if calibrating else ("Recalibrate Motor" if calibrated else "Calibrate Motor"))
         self.btn_datalogger.setEnabled(True)
         self.btn_recipe_run.setEnabled(bool(recipe_run_active))
-        self.btn_previous_runs.setEnabled(True)
+        self.btn_previous_runs.setEnabled(not running)
         self.btn_add_recipe.setEnabled(not running)
         self.recipes_area.setEnabled(not running)
 
@@ -4339,7 +4361,7 @@ class AppController(QObject):
     # ---- UI state persistence ----
 
     def _known_tags(self) -> List[str]:
-        return [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_VBUS_V, TAG_IBUS_A]
+        return [TAG_PWR_W, TAG_CMD_RPM, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_VBUS_V, TAG_IBUS_A]
 
     def _load_ui_state(self) -> None:
         if not self._ui_state_path.exists():
@@ -4873,7 +4895,7 @@ class AppController(QObject):
         values[TAG_CMD_RPM] = float(self._cmd_rpm)
 
         samples: List[Tuple[str, float, float, int]] = []
-        for tag in [TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_PWR_W, TAG_CMD_RPM]:
+        for tag in [TAG_VBUS_V, TAG_IBUS_A, TAG_VEL_RPM, TAG_TORQUE_NM, TAG_MOTOR_TEMP_C, TAG_PWR_W, TAG_CMD_RPM]:
             if tag in values and math.isfinite(values[tag]):
                 samples.append(
                     (
