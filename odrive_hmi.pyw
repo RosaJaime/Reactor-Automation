@@ -5109,6 +5109,9 @@ class AppController(QObject):
         self._modal_error_cooldown_s = 8.0
         self._last_odrive_error_modal_mono = 0.0
         self._odrive_error_modal_cooldown_s = 1.0
+        self._last_watchdog_autoclear_mono = 0.0
+        self._watchdog_autoclear_cooldown_s = 1.5
+        self._watchdog_autoclear_pending = False
 
         self._ui_state_path = app_config_dir() / "ui_state.json"
         self._ui_state_saving = False
@@ -5505,6 +5508,10 @@ class AppController(QObject):
     @Slot(str)
     def _on_worker_error(self, msg: str) -> None:
         msg = str(msg or "")
+        is_watchdog_expired_fault = (
+            "odrive runtime fault:" in msg.lower()
+            and "watchdog_timer_expired" in msg.lower()
+        )
         if self._cfg_runtime_fault_popup_suppressed and msg.lower().startswith("odrive runtime fault:"):
             # Config apply/save/erase can transiently report INVALID_STATE while writes succeed.
             if self.stack.currentWidget() is self.cfg:
@@ -5520,7 +5527,18 @@ class AppController(QObject):
                 self.engine.pause()
         elif self.engine.is_running():
             self.engine.stop(user_initiated=True)
-        self._show_odrive_error_with_clear(self.stack.currentWidget(), msg)
+        if is_watchdog_expired_fault:
+            now_m = time.monotonic()
+            if (now_m - self._last_watchdog_autoclear_mono) >= self._watchdog_autoclear_cooldown_s:
+                self._last_watchdog_autoclear_mono = now_m
+                self._watchdog_autoclear_pending = True
+                try:
+                    self.request_clear_errors.emit()
+                except Exception:
+                    self._watchdog_autoclear_pending = False
+            # Skip the modal popup for watchdog timeout faults; auto-clear is attempted.
+        else:
+            self._show_odrive_error_with_clear(self.stack.currentWidget(), msg)
         self._refresh_status_all()
         self._apply_controls()
 
@@ -5862,6 +5880,8 @@ class AppController(QObject):
 
     @Slot(bool, str)
     def _on_errors_cleared(self, ok: bool, message: str) -> None:
+        watchdog_autoclear = bool(self._watchdog_autoclear_pending)
+        self._watchdog_autoclear_pending = False
         if self.stack.currentWidget() is self.cfg:
             self.cfg.set_loading("Loaded")
         parent = self.cfg if self.stack.currentWidget() is self.cfg else self.stack.currentWidget()
@@ -5877,7 +5897,11 @@ class AppController(QObject):
                 self._apply_controls()
             else:
                 self._apply_controls()
-                QMessageBox.information(parent, "Clear Errors", str(message))
+                if watchdog_autoclear:
+                    if self._run_mode == "recipe" and self._recipe_monitor_recipe is not None:
+                        self._recipe_run_audit("ODrive watchdog timeout cleared automatically")
+                else:
+                    QMessageBox.information(parent, "Clear Errors", str(message))
         else:
             self._recipe_resume_after_clear_error = False
             self._show_modal_error(parent, "Clear Errors", str(message))
