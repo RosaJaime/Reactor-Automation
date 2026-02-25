@@ -7,18 +7,20 @@ This module keeps the project defaults in one place so they can be:
 
 from __future__ import annotations
 
-import math
 from typing import Any, Dict
 
 
 # Settings represented as ODrive attribute paths used by the HMI config page.
 HMI_DEFAULT_CONFIG_VALUES: Dict[str, Any] = {
+    # Power source
     "config.dc_bus_overvoltage_trip_level": 25.0,
     "config.dc_bus_undervoltage_trip_level": 10.5,
     "config.dc_max_positive_current": 120.0,
     "config.dc_max_negative_current": -120.0,
     "config.brake_resistor0.enable": True,
     "config.brake_resistor0.resistance": 2.0,
+
+    # Motor
     "axis0.config.startup_motor_calibration": False,
     "axis0.config.startup_encoder_offset_calibration": False,
     "axis0.config.startup_encoder_index_search": False,
@@ -30,11 +32,26 @@ HMI_DEFAULT_CONFIG_VALUES: Dict[str, Any] = {
     "axis0.config.motor.calibration_current": 10.0,
     "axis0.config.motor.resistance_calib_max_voltage": 2.0,
     "axis0.config.calibration_lockin.current": 10.0,
+
+    # Control mode
     "axis0.controller.config.vel_limit": 10.0,
     "axis0.controller.config.vel_limit_tolerance": 1.2,
     "axis0.controller.config.vel_ramp_rate": 10.0,
+
+    # Interface
+    "can.config.protocol": "Protocol.NONE",
+    "can.config.baud_rate": 250000,
+    "axis0.config.can.node_id": 63,
+    "axis0.config.can.heartbeat_msg_rate_ms": 100,
+    "axis0.config.can.encoder_msg_rate_ms": 0,
+    "axis0.config.can.iq_msg_rate_ms": 0,
+    "axis0.config.can.torques_msg_rate_ms": 0,
+    "axis0.config.can.error_msg_rate_ms": 0,
+    "axis0.config.can.temperature_msg_rate_ms": 0,
+    "axis0.config.can.bus_voltage_msg_rate_ms": 0,
     "axis0.config.enable_watchdog": False,
     "axis0.config.watchdog_timeout": 1.0,
+    "config.enable_uart_a": False,
 }
 
 
@@ -130,12 +147,13 @@ ODRIVE_MOTOR_PRESETS: Dict[str, Dict[str, Any]] = {
 
 # Script-style defaults represented as literal assignments (for reuse by setup scripts).
 SCRIPT_DEFAULT_ASSIGNMENTS = [
+    # Power source
     ("config.dc_bus_overvoltage_trip_level", 25.0),
     ("config.dc_bus_undervoltage_trip_level", 10.5),
-    ("config.dc_max_positive_current", math.inf),
-    ("config.dc_max_negative_current", -math.inf),
     ("config.brake_resistor0.enable", True),
     ("config.brake_resistor0.resistance", 2.0),
+
+    # Motor
     ("axis0.config.motor.motor_type", "MotorType.PMSM_CURRENT_CONTROL"),
     ("axis0.config.motor.pole_pairs", 20),
     ("axis0.config.motor.torque_constant", 0.0827),
@@ -144,16 +162,36 @@ SCRIPT_DEFAULT_ASSIGNMENTS = [
     ("axis0.config.motor.calibration_current", 10.0),
     ("axis0.config.motor.resistance_calib_max_voltage", 2.0),
     ("axis0.config.calibration_lockin.current", 10.0),
-    ("axis0.motor.motor_thermistor.config.enabled", False),
+    ("axis0.motor.motor_thermistor.config.enabled", True),
+    ("axis0.motor.motor_thermistor.config.r_ref", 10000.0),
+    ("axis0.motor.motor_thermistor.config.beta", 3435.0),
+    ("axis0.motor.motor_thermistor.config.temp_limit_lower", 110.0),
+    ("axis0.motor.motor_thermistor.config.temp_limit_upper", 130.0),
+
+    # Encoder
+    ("axis0.config.load_encoder", "EncoderId.ONBOARD_ENCODER0"),
+    ("axis0.config.commutation_encoder", "EncoderId.ONBOARD_ENCODER0"),
+
+    # Control mode
     ("axis0.controller.config.control_mode", "ControlMode.VELOCITY_CONTROL"),
     ("axis0.controller.config.input_mode", "InputMode.VEL_RAMP"),
-    ("axis0.config.enable_watchdog", False),
     ("axis0.controller.config.vel_limit", 10.0),
     ("axis0.controller.config.vel_limit_tolerance", 1.2),
     ("axis0.controller.config.vel_ramp_rate", 10.0),
-    ("axis0.config.load_encoder", "EncoderId.ONBOARD_ENCODER0"),
-    ("axis0.config.commutation_encoder", "EncoderId.ONBOARD_ENCODER0"),
+
+    # Interface
     ("can.config.protocol", "Protocol.NONE"),
+    ("can.config.baud_rate", 250000),
+    ("axis0.config.can.node_id", 63),
+    ("axis0.config.can.heartbeat_msg_rate_ms", 100),
+    ("axis0.config.can.encoder_msg_rate_ms", 0),
+    ("axis0.config.can.iq_msg_rate_ms", 0),
+    ("axis0.config.can.torques_msg_rate_ms", 0),
+    ("axis0.config.can.error_msg_rate_ms", 0),
+    ("axis0.config.can.temperature_msg_rate_ms", 0),
+    ("axis0.config.can.bus_voltage_msg_rate_ms", 0),
+    ("axis0.config.enable_watchdog", False),
+    ("axis0.config.watchdog_timeout", 1.0),
     ("config.enable_uart_a", False),
 ]
 

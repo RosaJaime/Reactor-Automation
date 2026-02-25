@@ -400,7 +400,7 @@ class RecipeRunStore:
 class SettingSpec:
     key: str
     label: str
-    kind: str  # "bool" or "float" or "int"
+    kind: str  # "bool", "float", "int", or "protocol"
     default: Any
     min_value: Optional[float] = None
     max_value: Optional[float] = None
@@ -443,8 +443,19 @@ ODRIVE_CONFIG_FIELDS: List[SettingSpec] = [
     SettingSpec("inc_encoder0.config.enabled", "Encoder: incremental enabled", "bool", True),
     SettingSpec("inc_encoder0.config.cpr", "Encoder: incremental CPR", "int", 8192, 1, 200000),
 
-    SettingSpec("axis0.config.enable_watchdog", "Safety: enable watchdog", "bool", False),
-    SettingSpec("axis0.config.watchdog_timeout", "Safety: watchdog timeout (s)", "float", 1.0, 0.1, 10.0),
+    SettingSpec("axis0.config.enable_watchdog", "Interface: enable watchdog", "bool", False),
+    SettingSpec("axis0.config.watchdog_timeout", "Interface: watchdog timeout (s)", "float", 1.0, 0.1, 10.0),
+    SettingSpec("can.config.protocol", "CAN: protocol", "protocol", "Protocol.NONE"),
+    SettingSpec("can.config.baud_rate", "CAN: baud rate", "int", 250000, 10000, 1000000),
+    SettingSpec("axis0.config.can.node_id", "CAN: node ID", "int", 63, 0, 63),
+    SettingSpec("axis0.config.can.heartbeat_msg_rate_ms", "CAN: heartbeat msg rate (ms)", "int", 100, 0, 10000),
+    SettingSpec("axis0.config.can.encoder_msg_rate_ms", "CAN: encoder msg rate (ms)", "int", 0, 0, 10000),
+    SettingSpec("axis0.config.can.iq_msg_rate_ms", "CAN: iq msg rate (ms)", "int", 0, 0, 10000),
+    SettingSpec("axis0.config.can.torques_msg_rate_ms", "CAN: torques msg rate (ms)", "int", 0, 0, 10000),
+    SettingSpec("axis0.config.can.error_msg_rate_ms", "CAN: error msg rate (ms)", "int", 0, 0, 10000),
+    SettingSpec("axis0.config.can.temperature_msg_rate_ms", "CAN: temperature msg rate (ms)", "int", 0, 0, 10000),
+    SettingSpec("axis0.config.can.bus_voltage_msg_rate_ms", "CAN: bus voltage msg rate (ms)", "int", 0, 0, 10000),
+    SettingSpec("config.enable_uart_a", "UART A: enable", "bool", False),
 ]
 ODRIVE_CONFIG_FIELDS = [
     replace(_spec, default=HMI_DEFAULT_CONFIG_VALUES.get(_spec.key, _spec.default))
@@ -460,6 +471,7 @@ DEFAULT_CONFIG_MAP: Dict[str, Any] = {s.key: s.default for s in ODRIVE_CONFIG_FI
 class OdriveInterface:
     def connect(self) -> bool: raise NotImplementedError
     def is_connected(self) -> bool: raise NotImplementedError
+    def feed_watchdog(self) -> str: raise NotImplementedError
     def set_velocity_rpm(self, rpm: float) -> None: raise NotImplementedError
     def stop(self) -> None: raise NotImplementedError
     def is_calibrated(self) -> Tuple[bool, str]: raise NotImplementedError
@@ -494,6 +506,10 @@ class SimulatedOdrive(OdriveInterface):
 
     def is_connected(self) -> bool:
         return self._connected
+
+    def feed_watchdog(self) -> str:
+        # Simulation backend has no watchdog; no-op for API compatibility.
+        return "Simulation"
 
     def set_velocity_rpm(self, rpm: float) -> None:
         self._target_rpm = float(rpm)
@@ -646,6 +662,25 @@ class RealOdrive(OdriveInterface):
 
     def is_connected(self) -> bool:
         return self._connected
+
+    def feed_watchdog(self) -> str:
+        if not self._connected or self._axis is None:
+            return "Disconnected"
+        try:
+            if not bool(getattr(self._axis.config, "enable_watchdog")):
+                return "Disabled"
+        except Exception:
+            return "Unknown"
+        try:
+            feed = getattr(self._axis, "watchdog_feed", None)
+            if callable(feed):
+                feed()
+                return "Fed"
+            return "Unsupported"
+        except Exception:
+            # Avoid interrupting normal operation on firmware variants that do not
+            # expose watchdog feed in the same way.
+            return "Feed error"
 
     def set_velocity_rpm(self, rpm: float) -> None:
         if not self._connected or self._axis is None or self._AxisState is None:
@@ -1129,6 +1164,7 @@ class OdriveWorker(QObject):
     tags_sample = Signal(int, object)             # ts, dict
     calibration_checked = Signal(bool, str)       # calibrated, detail
     calibration_done = Signal(bool, str)          # calibrated, detail
+    watchdog_status_changed = Signal(str)         # watchdog feed/runtime status
 
     def __init__(self, backend: OdriveInterface) -> None:
         super().__init__()
@@ -1144,6 +1180,7 @@ class OdriveWorker(QObject):
 
         self._last_poll_error_mono = 0.0
         self._poll_error_cooldown_s = 5.0
+        self._watchdog_status_cache = "Unknown"
 
     @Slot()
     def on_thread_started(self) -> None:
@@ -1186,6 +1223,12 @@ class OdriveWorker(QObject):
             self.connected_changed.emit(connected, state)
         self._emit_state(state)
 
+    def _emit_watchdog_status(self, status: str) -> None:
+        status = str(status or "Unknown")
+        if status != self._watchdog_status_cache:
+            self._watchdog_status_cache = status
+            self.watchdog_status_changed.emit(status)
+
     def _mark_disconnected(self, reason: str) -> None:
         try:
             self.stop_tag_polling()
@@ -1197,11 +1240,16 @@ class OdriveWorker(QObject):
         except Exception:
             pass
         self._set_connected(False, reason)
+        self._emit_watchdog_status("Disconnected")
 
     @Slot()
     def _supervise_connection(self) -> None:
         try:
             if self._backend.is_connected():
+                try:
+                    self._emit_watchdog_status(self._backend.feed_watchdog())
+                except Exception:
+                    pass
                 self._set_connected(True, self._backend.get_state())
                 return
         except Exception:
@@ -1433,8 +1481,13 @@ class OdriveWorker(QObject):
     @Slot()
     def _poll_tags(self) -> None:
         if not self._backend.is_connected():
+            self._emit_watchdog_status("Disconnected")
             return
         try:
+            try:
+                self._emit_watchdog_status(self._backend.feed_watchdog())
+            except Exception:
+                pass
             values = self._backend.get_tags(self._polled_tags)
             self.tags_sample.emit(epoch_s(), values)
         except Exception as e:
@@ -2434,6 +2487,13 @@ class SettingRowWidget(QFrame):
             assert isinstance(cb, QComboBox)
             cb.setMinimumHeight(ui(58))
             cb.addItems(["False", "True"])
+        elif spec.kind == "protocol":
+            self.editor = QComboBox()
+            cb = self.editor  # type: ignore[assignment]
+            assert isinstance(cb, QComboBox)
+            cb.setMinimumHeight(ui(58))
+            cb.addItem("Disabled (NONE)", "Protocol.NONE")
+            cb.addItem("Simple", "Protocol.SIMPLE")
         elif spec.kind == "int":
             self.editor = QLineEdit()
             le = self.editor  # type: ignore[assignment]
@@ -2476,6 +2536,28 @@ class SettingRowWidget(QFrame):
             cb = self.editor  # type: ignore[assignment]
             assert isinstance(cb, QComboBox)
             cb.setCurrentIndex(1 if bool(value) else 0)
+        elif self.spec.kind == "protocol":
+            cb = self.editor  # type: ignore[assignment]
+            assert isinstance(cb, QComboBox)
+            current_name = None
+            try:
+                current_name = str(getattr(value, "name"))
+            except Exception:
+                current_name = None
+            if current_name:
+                target = f"Protocol.{current_name}"
+            else:
+                raw = str(value)
+                if raw in ("Protocol.NONE", "Protocol.SIMPLE"):
+                    target = raw
+                elif raw == "0":
+                    target = "Protocol.NONE"
+                elif raw == "1":
+                    target = "Protocol.SIMPLE"
+                else:
+                    target = str(self.spec.default)
+            idx = cb.findData(target)
+            cb.setCurrentIndex(idx if idx >= 0 else 0)
         elif self.spec.kind == "int":
             le = self.editor  # type: ignore[assignment]
             assert isinstance(le, QLineEdit)
@@ -2505,6 +2587,10 @@ class SettingRowWidget(QFrame):
             cb = self.editor  # type: ignore[assignment]
             assert isinstance(cb, QComboBox)
             return bool(cb.currentIndex() == 1)
+        if self.spec.kind == "protocol":
+            cb = self.editor  # type: ignore[assignment]
+            assert isinstance(cb, QComboBox)
+            return str(cb.currentData() or self.spec.default)
 
         le = self.editor  # type: ignore[assignment]
         assert isinstance(le, QLineEdit)
@@ -2559,6 +2645,9 @@ class ODriveConfigScreen(QWidget):
         self.status = QLabel("Loading…")
         self.status.setObjectName("InfoLabel")
         root.addWidget(self.status)
+        self.watchdog_status = QLabel("Watchdog: Unknown")
+        self.watchdog_status.setObjectName("InfoLabel")
+        root.addWidget(self.watchdog_status)
 
         preset_row = QHBoxLayout()
         preset_row.setSpacing(ui(12))
@@ -2634,6 +2723,9 @@ class ODriveConfigScreen(QWidget):
 
     def set_loading(self, text: str) -> None:
         self.status.setText(text)
+
+    def set_watchdog_status(self, status: str) -> None:
+        self.watchdog_status.setText(f"Watchdog: {status}")
 
     def apply_values(self, values: Dict[str, Any], missing: List[str]) -> None:
         missing_set = set(missing)
@@ -3720,6 +3812,7 @@ class AppController(QObject):
         self.worker.tags_sample.connect(self._on_tags_sample)
         self.worker.calibration_checked.connect(self._on_calibration_checked)
         self.worker.calibration_done.connect(self._on_calibration_done)
+        self.worker.watchdog_status_changed.connect(self.cfg.set_watchdog_status)
 
         self.engine.status_changed.connect(lambda s: self._set_ui(status=s))
         self.engine.run_mode_changed.connect(lambda m: setattr(self, "_run_mode", m))
@@ -5394,3 +5487,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
