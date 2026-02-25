@@ -3774,7 +3774,7 @@ class RecipeRunMonitorScreen(QWidget):
 
     def set_recipe(self, recipe: Recipe) -> None:
         self.lbl_recipe.setText(f"Recipe: {recipe.name} ({format_mmss(recipe_total_seconds(recipe))})")
-        self._plot_minutes = max(1, int(math.ceil(recipe_total_seconds(recipe) / 60.0)))
+        self._plot_minutes = int(clamp(int(math.ceil(recipe_total_seconds(recipe) / 60.0)), 1, 30))
         self._active_step_idx = -1
         self.audit_list.clear()
         while self.steps_layout.count() > 1:
@@ -3817,6 +3817,9 @@ class RecipeRunMonitorScreen(QWidget):
 
     def append_points(self, points: List[Tuple[str, int, float]], tags: List[str]) -> None:
         self.plot.append_points(points, tags, self._plot_minutes)  # type: ignore[attr-defined]
+
+    def set_plot_minutes(self, minutes: int) -> None:
+        self._plot_minutes = int(clamp(int(minutes), 1, 30))
 
     def set_pause_resume_action(self, mode: str, enabled: bool = True) -> None:
         m = str(mode or "pause").strip().lower()
@@ -5550,10 +5553,21 @@ class AppController(QObject):
         if self._recipe_monitor_recipe is None:
             self.recipe_run.set_series_data({t: [] for t in self._recipe_monitor_plot_tags}, self._recipe_monitor_plot_tags)
             return
-        minutes = max(1, int(math.ceil(recipe_total_seconds(self._recipe_monitor_recipe) / 60.0)))
         now_ts = epoch_s()
+        started_ts = 0
+        if self._current_recipe_run_record is not None:
+            started_ts = int(safe_float(self._current_recipe_run_record.get("started_ts", 0), 0))
+        if started_ts <= 0:
+            started_ts = max(0, now_ts - int(recipe_total_seconds(self._recipe_monitor_recipe)))
+
+        recipe_minutes = max(1, int(math.ceil(recipe_total_seconds(self._recipe_monitor_recipe) / 60.0)))
+        elapsed_minutes = max(1, int(math.ceil(max(0, now_ts - started_ts) / 60.0)))
+        minutes = int(clamp(max(recipe_minutes, elapsed_minutes), 1, 30))
+        self.recipe_run.set_plot_minutes(minutes)
+
+        window_start_ts = max(int(started_ts), int(now_ts - minutes * 60))
         try:
-            data = self.history_db.query_window_multi(now_ts, self._recipe_monitor_plot_tags, minutes)
+            data = self.history_db.query_range_multi(window_start_ts, now_ts, self._recipe_monitor_plot_tags)
         except Exception as e:
             self._show_modal_error(self.recipe_run, "Data Logger DB", f"Failed to load recipe run window:\n{e}")
             data = {t: [] for t in self._recipe_monitor_plot_tags}
