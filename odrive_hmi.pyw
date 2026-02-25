@@ -2842,6 +2842,9 @@ class ODriveConfigScreen(QWidget):
         super().__init__()
         self._rows: Dict[str, SettingRowWidget] = {}
         self._motor_presets: Dict[str, Dict[str, Any]] = dict(ODRIVE_MOTOR_PRESETS)
+        self._search_last_query = ""
+        self._search_match_keys: List[str] = []
+        self._search_match_idx = -1
 
         root = QVBoxLayout(self)
         root.setContentsMargins(ui(18), ui(16), ui(18), ui(16))
@@ -2855,8 +2858,18 @@ class ODriveConfigScreen(QWidget):
         self.btn_refresh = TouchButton("Refresh", min_h=66, min_w=170)
         self.btn_export = TouchButton("Export JSON", min_h=66, min_w=190)
         self.btn_clear_errors = TouchButton("Clear Errors", min_h=66, min_w=190)
+        self.edit_search = QLineEdit()
+        self.edit_search.setMinimumHeight(ui(58))
+        self.edit_search.setPlaceholderText("Search label or odrivetool property")
+        self._search_w_collapsed = ui(180)
+        self._search_w_expanded = ui(520)
+        self.edit_search.setMinimumWidth(self._search_w_collapsed)
+        self.edit_search.setMaximumWidth(self._search_w_collapsed)
+        self.btn_search = TouchButton("Search", min_h=66, min_w=140)
         top.addWidget(self.btn_back)
         top.addWidget(self.title, 1)
+        top.addWidget(self.edit_search)
+        top.addWidget(self.btn_search)
         top.addWidget(self.btn_clear_errors)
         top.addWidget(self.btn_refresh)
         top.addWidget(self.btn_export)
@@ -2937,6 +2950,10 @@ class ODriveConfigScreen(QWidget):
         self.btn_clear_errors.clicked.connect(self.clear_errors_clicked.emit)
         self.btn_refresh.clicked.connect(self.request_refresh.emit)
         self.btn_export.clicked.connect(self.export_json_clicked.emit)
+        self.btn_search.clicked.connect(self._on_search_trigger)
+        self.edit_search.returnPressed.connect(self._on_search_trigger)
+        self.edit_search.textEdited.connect(self._on_search_text_edited)
+        self.edit_search.installEventFilter(self)
         self.cmb_motor_preset.currentIndexChanged.connect(self._on_motor_preset_changed)
         self.btn_apply_hmi_max_vel.clicked.connect(self._emit_hmi_max_velocity)
         self.edit_hmi_max_vel.editingFinished.connect(self._emit_hmi_max_velocity)
@@ -2968,7 +2985,12 @@ class ODriveConfigScreen(QWidget):
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         try:
-            if event.type() == QEvent.FocusIn:
+            if watched is self.edit_search:
+                if event.type() == QEvent.FocusIn:
+                    self._set_search_expanded(True)
+                elif event.type() == QEvent.FocusOut:
+                    self._set_search_expanded(False)
+            elif event.type() == QEvent.FocusIn:
                 for row in self._rows.values():
                     if watched is row.editor:
                         QTimer.singleShot(0, lambda r=row: self._scroll_row_near_top(r))
@@ -2985,6 +3007,55 @@ class ODriveConfigScreen(QWidget):
             sb.setValue(max(0, int(y - top_margin)))
         except Exception:
             pass
+
+    def _set_search_expanded(self, expanded: bool) -> None:
+        w = int(self._search_w_expanded if expanded else self._search_w_collapsed)
+        try:
+            self.edit_search.setMinimumWidth(w)
+            self.edit_search.setMaximumWidth(w)
+        except Exception:
+            pass
+
+    @Slot(str)
+    def _on_search_text_edited(self, _text: str) -> None:
+        self._search_last_query = ""
+        self._search_match_keys = []
+        self._search_match_idx = -1
+
+    @Slot()
+    def _on_search_trigger(self) -> None:
+        query = str(self.edit_search.text() or "").strip().lower()
+        if not query:
+            self.status.setText("Enter search text (label or property path)")
+            return
+
+        if query != self._search_last_query:
+            self._search_last_query = query
+            self._search_match_idx = -1
+            self._search_match_keys = [
+                spec.key
+                for spec in ODRIVE_CONFIG_FIELDS
+                if (query in str(spec.label).lower()) or (query in str(spec.key).lower())
+            ]
+
+        if not self._search_match_keys:
+            self.status.setText(f"No config fields match '{query}'")
+            return
+
+        self._search_match_idx = (self._search_match_idx + 1) % len(self._search_match_keys)
+        key = self._search_match_keys[self._search_match_idx]
+        row = self._rows.get(key)
+        if row is None:
+            self.status.setText(f"Search match missing row: {key}")
+            return
+        QTimer.singleShot(0, lambda r=row: self._scroll_row_near_top(r))
+        try:
+            row.editor.setFocus()
+        except Exception:
+            pass
+        self.status.setText(
+            f"Search {self._search_match_idx + 1}/{len(self._search_match_keys)}: {row.spec.label} [{row.spec.key}]"
+        )
 
     def set_hmi_max_velocity(self, rpm: float, emit_signal: bool = False) -> None:
         rpm = float(clamp(float(rpm), VEL_MIN_RPM, VEL_MAX_RPM))
