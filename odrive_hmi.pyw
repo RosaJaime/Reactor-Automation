@@ -644,15 +644,6 @@ class RealOdrive(OdriveInterface):
                     pass
 
             try:
-                self._axis.config.motor.current_soft_max = 5.0
-            except Exception:
-                pass
-            try:
-                self._axis.config.motor.current_hard_max = 8.0
-            except Exception:
-                pass
-
-            try:
                 self._axis.controller.config.control_mode = ControlMode.VELOCITY_CONTROL
             except Exception:
                 pass
@@ -2887,11 +2878,9 @@ class ODriveConfigScreen(QWidget):
         self._search_w_expanded = ui(520)
         self.edit_search.setMinimumWidth(self._search_w_collapsed)
         self.edit_search.setMaximumWidth(self._search_w_collapsed)
-        self.btn_search = TouchButton("Search", min_h=66, min_w=140)
         top.addWidget(self.btn_back)
         top.addWidget(self.title, 1)
         top.addWidget(self.edit_search)
-        top.addWidget(self.btn_search)
         top.addWidget(self.btn_clear_errors)
         top.addWidget(self.btn_refresh)
         top.addWidget(self.btn_export)
@@ -2972,7 +2961,6 @@ class ODriveConfigScreen(QWidget):
         self.btn_clear_errors.clicked.connect(self.clear_errors_clicked.emit)
         self.btn_refresh.clicked.connect(self.request_refresh.emit)
         self.btn_export.clicked.connect(self.export_json_clicked.emit)
-        self.btn_search.clicked.connect(self._on_search_trigger)
         self.edit_search.returnPressed.connect(self._on_search_trigger)
         self.edit_search.textEdited.connect(self._on_search_text_edited)
         self.edit_search.installEventFilter(self)
@@ -3038,7 +3026,6 @@ class ODriveConfigScreen(QWidget):
             if expanded:
                 # Keep the expanded search bar visible above adjacent top-row buttons.
                 self.edit_search.raise_()
-                self.btn_search.raise_()
         except Exception:
             pass
 
