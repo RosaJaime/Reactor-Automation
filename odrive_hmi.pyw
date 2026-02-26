@@ -1235,6 +1235,8 @@ class RealOdrive(OdriveInterface):
                 elif t == TAG_ODRIVE_TEMP_C:
                     temp_val = None
                     for getter in (
+                        lambda: getattr(getattr(self._odrv, "thermistor0"), "temperature"),
+                        lambda: getattr(getattr(self._odrv, "thermistor0"), "temp"),
                         lambda: getattr(getattr(self._odrv, "fet_thermistor"), "temperature"),
                         lambda: getattr(getattr(self._odrv, "fet_thermistor"), "temp"),
                         lambda: getattr(getattr(self._axis.motor, "fet_thermistor"), "temperature"),
